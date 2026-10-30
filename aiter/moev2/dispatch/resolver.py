@@ -235,7 +235,11 @@ def resolve(problem, segments) -> Resolution:
         best = ranking.best(problem, ranking.rankable(plans))
         if best is None:
             return declined("no default ranking entry applies")
-        region, structure = best
+        region, structure, legacy = best
+        if legacy is not None:
+            return declined(f"ranking {region}: {legacy} is not ported")
+        if structure is None:
+            return declined(f"ranking {region}: no listed structure is feasible")
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""

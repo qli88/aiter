@@ -6,6 +6,7 @@ The checks over the whole dispatch snapshot key grid run in a subprocess
 (tests/moe_dispatch/ranking_checks.py); the rest are unit tests on the CPU.
 """
 
+import functools
 import pathlib
 import subprocess
 import sys
@@ -35,21 +36,40 @@ def _gfx950():
         yield
 
 
+def _paths():
+    from aiter.moev2.migration import a8w8_pt, a16w16
+
+    return [a8w8_pt.PATH, a16w16.PATH]
+
+
 def _segments():
     from aiter.moev2.migration import a8w8_pt
 
     return a8w8_pt.SEGMENTS
 
 
-def _problem(token=64, quant=QuantType.per_Tensor, inter_dim=256):
-    fp8 = dtypes.fp8
-    args = (token, 7168, inter_dim, 256, 8, dtypes.bf16, fp8, fp8, quant, True)
+def _problem(
+    token=64,
+    quant=QuantType.per_Tensor,
+    inter_dim=256,
+    w_dtype=None,
+    out=dtypes.bf16,
+    g1u1=True,
+    arch="gfx950",
+):
+    w = dtypes.fp8 if w_dtype is None else w_dtype
+    args = (token, 7168, inter_dim, 256, 8, out, w, w, quant, g1u1)
     args += (ActivationType.Silu, False, 0, 0)
-    return MoeProblem.from_legacy_key(*args, arch="gfx950", cu_num=256)
+    return MoeProblem.from_legacy_key(*args, arch=arch, cu_num=256)
+
+
+def _bf16(**kwargs):
+    return _problem(quant=QuantType.No, w_dtype=dtypes.bf16, **kwargs)
 
 
 def test_the_shipped_table_passes_the_static_checks():
-    assert ranking.check_table(ranking.RANKING, _segments()) == []
+    segments = [s for path in _paths() for s in path.segments]
+    assert ranking.check_table(ranking.RANKING, segments) == []
 
 
 def test_the_shipped_table_passes_over_the_key_grid():
@@ -67,10 +87,47 @@ def test_per_tensor_fp8_without_a_tuned_row_ranks_ck_2stage():
     from aiter.moev2.dispatch.resolver import feasible_plans
 
     plans = ranking.rankable(feasible_plans(_problem(), _segments())[0])
-    label, plan = ranking.best(_problem(), plans)
-    assert label == "fp8_per_tensor[otherwise]"
+    label, plan, legacy = ranking.best(_problem(), plans)
+    assert label == "fp8_per_tensor[otherwise]" and legacy is None
     assert " | ".join(s.name for s in plan) == CK
     assert ranking.best(_problem(quant=QuantType.per_Token), plans) is None
+    assert ranking.best(_problem(), []) == ("fp8_per_tensor[otherwise]", None, None)
+
+
+def test_bf16_and_fp16_without_a_tuned_row_rank_ck_2stage():
+    from aiter.moev2.dispatch.resolver import feasible_plans
+    from aiter.moev2.migration import a16w16
+
+    for p in (
+        _bf16(),
+        _problem(quant=QuantType.No, w_dtype=dtypes.fp16, out=dtypes.fp16),
+    ):
+        plans = ranking.rankable(feasible_plans(p, a16w16.SEGMENTS)[0])
+        label, plan, _ = ranking.best(p, plans)
+        assert label == "a16w16[otherwise]"
+        assert " | ".join(s.name for s in plan) == CK
+
+
+def test_the_1stage_keys_copy_the_legacy_table():
+    import aiter.fused_moe as legacy
+
+    assert ranking.FMOE_1STAGE_KEYS == {
+        arch: frozenset(keys) for arch, keys in legacy.fused_moe_1stage_dict.items()
+    }
+
+
+def test_predicates_are_booleans_in_when():
+    w = when(fmoe_1stage=True, m__lt=256)
+    assert str(w) == "fmoe_1stage, m<256"
+    assert w.holds(_bf16(g1u1=False, arch="gfx942"))
+    assert not w.holds(_bf16(g1u1=False, arch="gfx950"))
+    assert not w.holds(_bf16(g1u1=False, arch="gfx942", token=256))
+    assert not w.holds(_bf16(arch="gfx942"))
+    assert str(when(fmoe_1stage=False)) == "not fmoe_1stage"
+    assert when(fmoe_1stage=True).disjoint(when(fmoe_1stage=False))
+    assert not when(fmoe_1stage=True).disjoint(when(m__lt=256))
+    with pytest.raises(TypeError):
+        when(fmoe_1stage=1)
 
 
 def test_when_thresholds_are_integer_intervals():
@@ -88,6 +145,34 @@ def test_when_thresholds_are_integer_intervals():
             when(**bad)
     with pytest.raises(ValueError):
         match(q_type=QuantType.per_Tensor)
+
+
+def test_a_legacy_region_hands_its_problems_back(monkeypatch):
+    from aiter.moev2.dispatch import resolver
+    from aiter.moev2.migration import a8w8_pt
+
+    with pytest.raises(ValueError):
+        Region(when(m__le=8))
+    with pytest.raises(ValueError):
+        Region(when(m__le=8), prefer=[CK], legacy="1-stage ASM")
+    table = (
+        Entry(
+            "a",
+            PER_TENSOR,
+            regions=[Region(when(m__le=64), legacy="1-stage ASM")],
+            otherwise=[CK],
+        ),
+    )
+    assert ranking.check_table(table, _segments()) == []
+    assert ranking.best(_problem(), [], table) == ("a[m<=64]", None, "1-stage ASM")
+    problems = [("m64", _problem(token=64)), ("m4096", _problem(token=4096))]
+    errors, hits = ranking.check_problems(problems, [a8w8_pt.PATH], table)
+    assert errors == [] and hits == {"a[m<=64]": 1, "a[otherwise]": 1}
+
+    monkeypatch.setattr(ranking, "best", functools.partial(ranking.best, table=table))
+    res = resolver.resolve(_problem(token=64), _segments())
+    assert res.plan is None
+    assert res.declined == "ranking a[m<=64]: 1-stage ASM is not ported"
 
 
 def test_overlapping_entries_fail():
@@ -156,10 +241,14 @@ def test_a_last_structure_with_shape_conditions_fails():
 
 
 def test_grid_checks_find_unranked_keys_and_dead_regions():
+    from aiter.moev2.migration import a8w8_pt
+
     problems = [("m64", _problem(token=64)), ("m4096", _problem(token=4096))]
-    sets = [_segments()]
+    sets = [a8w8_pt.PATH]
     errors, hits = ranking.check_problems(problems, sets)
     assert errors == [] and hits == {"fp8_per_tensor[otherwise]": 2}
+    # Keys a path does not take are not checked against its segments.
+    assert ranking.check_problems([("bf16", _bf16())], sets) == ([], {})
 
     table = (
         Entry(

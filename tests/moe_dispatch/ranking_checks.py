@@ -5,8 +5,9 @@
 Static: entries and regions are disjoint, no region contradicts itself, every structure
 names known, adjacent segments, and the last structure of every list is always feasible.
 Over the dispatch snapshot key grid, on every simulated arch: every key some registered
-path can rank lands in exactly one entry and one region whose last structure is
-feasible, and every region is reached by some key.
+path takes and can rank lands in exactly one entry and one region whose last structure
+is feasible (or that hands it to the legacy code), and every region is reached by some
+key.
 
     python tests/moe_dispatch/ranking_checks.py --check [--arch gfx950]
 """
@@ -19,10 +20,13 @@ from collections import Counter
 _HERE = pathlib.Path(__file__).resolve().parent
 
 
-def segment_sets():
+def ranked_paths():
+    """The registered paths the ranking serves: those with `segments` and `takes`."""
     from aiter.moev2 import paths
 
-    return [p.segments for p in paths.registered().values() if p.segments]
+    return [
+        p for p in paths.registered().values() if p.segments and p.takes is not None
+    ]
 
 
 def grid_problems(arch):
@@ -54,13 +58,14 @@ def main(argv=None):
     from moe_dispatch import arch_sim
     from moe_dispatch.differential import captured_logs
 
-    sets = segment_sets()
-    errors = ranking.check_table(ranking.RANKING, [s for ss in sets for s in ss])
+    served = ranked_paths()
+    segments = [s for p in served for s in p.segments]
+    errors = ranking.check_table(ranking.RANKING, segments)
     print(f"static: {len(ranking.RANKING)} entries, {len(errors)} problems")
     hits = Counter()
     for arch in args.arch or list(arch_sim.ARCHS):
         with arch_sim.simulated_arch(arch), captured_logs():
-            grid_errors, arch_hits = ranking.check_problems(grid_problems(arch), sets)
+            grid_errors, arch_hits = ranking.check_problems(grid_problems(arch), served)
         print(
             f"{arch}: {sum(arch_hits.values())} ranked keys, {len(grid_errors)} problems"
         )

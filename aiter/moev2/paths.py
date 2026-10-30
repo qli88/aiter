@@ -5,8 +5,9 @@
 A path claims a subset of `fused_moe` calls through a predicate over the call arguments.
 The legacy entry points ask `route_to_v2(call, entry)` which path, if any, takes a call;
 with no path active this costs one cached boolean check. A claimed call may still be
-handed back: `run` returns `DECLINED` when the plan it resolves needs a kernel family the
-path has not ported, and the legacy code then runs the call as before.
+handed back: `run` returns `DECLINED` when the resolver finds no plan it may run (a tuned
+row naming a kernel family the path has not ported, a ranking region marked legacy, no
+feasible listed structure), and the legacy code then runs the call as before.
 
 Predicates run on every call, including during graph capture: they may read dtypes,
 shapes and Python values, never tensor contents.
@@ -71,7 +72,9 @@ class Path:
     the v2 plan in the legacy snapshot record format, or None if the path does not take
     the key (not claimed, or declined). Used by the CPU differential test; the GPU cases
     of each path are in tests/moe_dispatch/gpu_differential.py.
-    `segments`: the segments the path resolves plans from; the ranking checks use them.
+    `segments`: the segments the path resolves plans from. `takes(problem)`: the
+    `MoeProblem`s the path runs (its segments may accept more). The ranking checks use
+    both.
     """
 
     name: str
@@ -81,6 +84,7 @@ class Path:
     dispatch_record: Callable[[tuple, dict], object] | None = None
     entry: str = "api"
     segments: tuple = ()
+    takes: Callable[[object], bool] | None = None
 
     def __post_init__(self):
         if self.entry not in ENTRIES:
@@ -96,7 +100,10 @@ class Path:
 
 
 # Modules that register the built-in paths; imported on first use, not at import time.
-_BUILTIN_MODULES: tuple = ("aiter.moev2.migration.a8w8_pt",)
+_BUILTIN_MODULES: tuple = (
+    "aiter.moev2.migration.a8w8_pt",
+    "aiter.moev2.migration.a16w16",
+)
 
 _REGISTRY: dict[str, Path] = {}
 _builtin_loaded = False
