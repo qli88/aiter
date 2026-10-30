@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Activation quantization policy: the activation dtype fused_moe quantizes to.
 
-Fixed before dispatch (design doc §13, D2).
+Fixed before dispatch.
 """
 
 import os
@@ -109,3 +109,22 @@ def resolve_activation_dtype(
             q_dtype_a = dtypes.fp4x2
 
     return q_dtype_a
+
+
+def _normalize_mxfp4_activation_params(
+    activation,
+    beta: float | None,
+    linear_beta: float | None,
+    swiglu_limit: float | None,
+) -> tuple[float, float, float | None]:
+    situ_beta = 1.0
+    situ_linear_beta = 1.0
+    if activation == ActivationType.Situv2:
+        situ_beta = 1.0 if beta is None else float(beta)
+        situ_linear_beta = 1.0 if linear_beta is None else float(linear_beta)
+    normalized_swiglu_limit = (
+        swiglu_limit
+        if activation in (ActivationType.Silu, ActivationType.Swiglu)
+        else None
+    )
+    return situ_beta, situ_linear_beta, normalized_swiglu_limit

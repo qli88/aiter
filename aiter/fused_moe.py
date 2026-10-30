@@ -5,7 +5,7 @@ import functools
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import torch
 
@@ -26,24 +26,34 @@ from aiter.fhmoe_contract import (
     FHMOE_BUFFER_MAX_BYTES,
     fhmoe_reduce_output_nbytes,
 )
-from aiter.fused_moe_registry import (
+from aiter.fused_moe_registry import (  # noqa: F401
     BoundFusedMoeImpl,
     FusedMoeImplResolutionError,
     FusedMoeRequest,
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
-from aiter.jit.utils.chip_info import (
+from aiter.jit.utils.chip_info import (  # noqa: F401
     get_cu_num,
     get_gfx,
     get_gfx_runtime,
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.moev2 import hooks as moev2_hooks
 from aiter.moev2 import paths as moev2_paths
+from aiter.moev2.dispatch import tuned as moev2_tuned
+from aiter.moev2.dispatch.tuned import _ACT_TYPE_DISABLED_KEY
+from aiter.moev2.execute.metadata import MOEMetadata
+from aiter.moev2.execute.output import (
+    _return_output,
+    _validate_output_buffer_metadata,
+    _validate_output_buffer_no_overlap,
+)
 from aiter.moev2.policy import (  # noqa: F401
     _SWIGLU_MXFP4_BF16_BOUND,
     _bound_split,
+    _normalize_mxfp4_activation_params,
     quant_remap,
     resolve_activation_dtype,
 )
@@ -58,7 +68,20 @@ from aiter.moev2.reference.torch_moe import (  # noqa: F401
     torch_moe_stage2,
 )
 from aiter.moev2.routing.topk import fused_topk  # noqa: F401
-from aiter.moev2.shapes import get_inter_dim
+from aiter.moev2.segments.asm import asm_stage1
+from aiter.moev2.segments.ck import ck_moe_stage1
+from aiter.moev2.segments.defaults import (
+    BLOCK_SIZE_M,
+    get_block_size_M,
+    get_ksplit,
+    use_nt,
+)
+from aiter.moev2.shapes import (  # noqa: F401
+    _PADDED_M_TIERS,
+    get_inter_dim,
+    get_padded_M,
+    nextPow2,
+)
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
@@ -87,8 +110,6 @@ def _get_flydsl_moe_kernels():
 
     return moe_kernels
 
-
-BLOCK_SIZE_M = 32
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
@@ -125,7 +146,6 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
     return 3 * routed_rows >= 4 * num_experts  # crossover ~1.3 rows per expert
 
 
-_ACT_TYPE_DISABLED_KEY = "__ignore__"
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 # (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
@@ -387,55 +407,6 @@ def _adaptive_moe_sort(
     if emit_aux:
         return (*std, m_indices, reverse_sorted)
     return std
-
-
-# `output`: caller-provided [M, model_dim] destination.
-#
-#     path                                      in-place?  why?
-#     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
-#     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
-#     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
-#     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
-#
-# Not in-place => _return_output copies, so the contract holds either way;
-# only the saving is lost.
-def _validate_output_buffer_metadata(output, shape, dtype, device):
-    if output is None:
-        return
-    # The buffer has to stand in for the tensor fused_moe would have allocated.
-    if (
-        output.shape != shape
-        or output.dtype != dtype
-        or output.device != device
-        or not output.is_contiguous()
-    ):
-        raise RuntimeError(
-            f"output mismatch: got shape={tuple(output.shape)} dtype={output.dtype} "
-            f"device={output.device} contiguous={output.is_contiguous()}, expected a "
-            f"contiguous {tuple(shape)} {dtype} tensor on {device}"
-        )
-
-
-def _validate_output_buffer_no_overlap(output, hidden_states):
-    if output is None:
-        return
-    # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if (
-        output.data_ptr() < hidden_states.data_ptr() + hidden_states.nbytes
-        and hidden_states.data_ptr() < output.data_ptr() + output.nbytes
-    ):
-        raise RuntimeError(
-            "output overlaps hidden_states, which moe_sorting zeroes before stage1 "
-            "reads it"
-        )
-
-
-def _return_output(ret, output):
-    # Paths that already wrote output return it directly; others copy here.
-    if output is None or ret is output:
-        return ret
-    return output.copy_(ret)
 
 
 def _padded_scale_cols(size, group_size=32):
@@ -1054,11 +1025,13 @@ def fused_moe(
     FlyDSL AOT cache.
 
     """
-    if moev2_paths.any_active():
+    if not torch.compiler.is_compiling() and moev2_paths.any_active():
         call = dict(locals())
-        v2_path = moev2_paths.route_to_v2(call)
+        v2_path = moev2_paths.route_to_v2(call, "api")
         if v2_path is not None:
-            return v2_path.run(call)
+            out = v2_path.run(call)
+            if out is not moev2_paths.DECLINED:
+                return out
     has_shared_expert = (
         any(
             tensor is not None
@@ -1290,6 +1263,14 @@ def fused_moe_(
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
 ) -> torch.Tensor:
+    if moev2_paths.any_active():
+        call = dict(locals())
+        v2_path = moev2_paths.route_to_v2(call, "op")
+        if v2_path is not None:
+            with moev2_hooks.legacy_kernel_bench(kernel_bench_callable):
+                out = v2_path.run(call)
+            if out is not moev2_paths.DECLINED:
+                return out
     stage2_scatter = None
     if ep_source_token_map is not None:
         stage2_scatter = Stage2ScatterContext(
@@ -2074,58 +2055,6 @@ def fused_moe_1stage(
     return moe_buf
 
 
-@functools.lru_cache(maxsize=2048)
-def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = get_cu_num()
-    tileN = 128
-    tgN = (inter_dim + tileN - 1) // tileN
-    support_list = [32, 64, 128]
-
-    tmp = []
-    for el in support_list:
-        max_num_tokens = token * topk + expert * el - topk
-        tg_num = tgN * (max_num_tokens + el - 1) // el
-        rnd = (tg_num + cu_num - 1) // cu_num
-        empty = cu_num - tg_num % cu_num
-        tmp.append((rnd, empty, el))
-    return min(tmp, key=lambda x: x[:2])[-1]
-
-
-@functools.lru_cache(maxsize=2048)
-def use_nt(token, topk, e):
-    use_nt = int(os.environ.get("AITER_USE_NT", "-1"))
-    if use_nt != -1:
-        return bool(use_nt)
-    return (token * topk // e) < 64
-
-
-@functools.lru_cache(maxsize=2048)
-def get_ksplit(token, topk, expert, inter_dim, model_dim):
-    aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
-    if aiter_ksplit != 0:
-        return aiter_ksplit
-    # only for moe_blk gemm1 a8w8 decode scenario
-    if token * topk > expert:
-        return 0
-    cu_num = get_cu_num()
-    tileN = 128
-
-    tgM = token * topk  # decode tile num
-    tgN = (inter_dim + tileN - 1) // tileN
-
-    tg_num = tgN * tgM
-    # if all cu already active
-    if tg_num >= cu_num:
-        return 0
-    tilek = 256
-    split_max = (cu_num + tg_num - 1) // tg_num
-    # at least split = 2
-    for i in reversed(range(2, split_max + 1)):
-        if (model_dim % i == 0) and ((model_dim // i) % tilek == 0):
-            return i
-    return 0
-
-
 cfg_2stages = None
 cfg_2stages_by_file = {}
 # fmt: off
@@ -2160,73 +2089,8 @@ fused_moe_1stage_dict = {
 # fmt: on
 
 
-def nextPow2(n):
-    if n <= 1:
-        return 1
-    return 1 << (n - 1).bit_length()
-
-
-_PADDED_M_TIERS = [32768, 131072]
-
-
-def get_padded_M(M):
-    """Map runtime M to a tuning bucket.
-
-    Values below 32768 use the next power of two, 32768..131071 use the 32768
-    tier, and values from 131072 upward use the 131072 tier. Individual model
-    contracts may impose a stricter maximum before lookup.
-    """
-    if M < _PADDED_M_TIERS[0]:
-        return nextPow2(M)
-    for tier in reversed(_PADDED_M_TIERS):
-        if M >= tier:
-            return tier
-    return _PADDED_M_TIERS[0]
-
-
-@dataclass
-class MOEMetadata:
-    stage1: Callable | None
-    stage2: Callable | None
-    block_m: int
-    ksplit: int
-    run_1stage: bool = False
-    has_bias: bool = False
-    use_non_temporal_load: bool = True
-    fuse_quant: str = ""
-    stage2_has_bias: bool = False
-    flat: bool = False
-    output_aux: bool | str = False
-    prequant: bool = True
-    skip_inter_quant: bool = False
-    route_bucket: str = ""
-    expected_sorted_blocks: int | None = None
-    min_sorted_blocks: int | None = None
-    max_sorted_blocks: int | None = None
-    full_impl: BoundFusedMoeImpl | None = None
-
-
 def _needs_swiglu_bias_support(dtype, quant_type):
     return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
-
-
-def _normalize_mxfp4_activation_params(
-    activation,
-    beta: float | None,
-    linear_beta: float | None,
-    swiglu_limit: float | None,
-) -> tuple[float, float, float | None]:
-    situ_beta = 1.0
-    situ_linear_beta = 1.0
-    if activation == ActivationType.Situv2:
-        situ_beta = 1.0 if beta is None else float(beta)
-        situ_linear_beta = 1.0 if linear_beta is None else float(linear_beta)
-    normalized_swiglu_limit = (
-        swiglu_limit
-        if activation in (ActivationType.Silu, ActivationType.Swiglu)
-        else None
-    )
-    return situ_beta, situ_linear_beta, normalized_swiglu_limit
 
 
 def _normalize_bias_for_kernel(
@@ -3345,70 +3209,8 @@ def get_2stage_cfgs(
             ["shared_expert_id", "hidden_pad", "intermediate_pad", "gate_mode"]
         )
 
-    def _ensure_gfx_column(df):
-        """Guarantee a usable `gfx` column, migrating legacy cu_num-only CSVs."""
-        if "gfx" not in df.columns:
-            df = df.copy()
-            df["gfx"] = df["cu_num"].map(gfx_from_cu_num)
-            return df
-        # Backfill placeholder/missing gfx (e.g. 0 filled when merging a config
-        # that lacks the column against ones that have it).
-        bad = df["gfx"].isna() | df["gfx"].astype(str).isin(["0", "", "nan", "None"])
-        if bad.any():
-            df = df.copy()
-            df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
-        return df
-
     def get_cfg_2stages(tune_file):
-        import pandas as pd
-
-        df = pd.read_csv(tune_file)
-        df = _ensure_gfx_column(df)
-        if "_tag" in df.columns:
-            df = df[df["_tag"].fillna("") != "flydsl_fallback"]
-
-        # Primary dict: keep original act_type for exact-match lookup.
-        df_primary = df.copy()
-        dup_mask = df_primary.duplicated(subset=_INDEX_COLS, keep="first")
-        if dup_mask.any():
-            if config_file is not None:
-                raise ValueError(f"Duplicate dedicated FHMoE rows in {tune_file}")
-            logger.warning(
-                f"[fused_moe] duplicate tuned rows (primary) in {tune_file}; "
-                f"keeping first match for {int(dup_mask.sum())} rows"
-            )
-            df_primary = df_primary.loc[~dup_mask]
-        primary = df_primary.set_index(_INDEX_COLS).to_dict("index")
-
-        if config_file is not None:
-            return primary, {}
-
-        # Fallback dict: disable act_type so any activation can match.
-        df_fallback = df.copy()
-        if "kernelName1" in df_fallback.columns:
-            is_ck2stages = (
-                df_fallback["kernelName1"]
-                .fillna("")
-                .astype(str)
-                .str.contains("moe_ck2stages")
-            )
-            df_fallback = df_fallback.loc[~is_ck2stages]
-        for column in ("kernelName1", "kernelName2"):
-            if column in df_fallback.columns:
-                is_mxfp4 = df_fallback[column].map(_is_mxfp4_kname)
-                df_fallback = df_fallback.loc[~is_mxfp4]
-        if "act_type" in df_fallback.columns:
-            df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
-        dup_mask = df_fallback.duplicated(subset=_INDEX_COLS, keep="first")
-        if dup_mask.any():
-            logger.warning(
-                f"[fused_moe] duplicate tuned rows after disabling act_type in {tune_file}; "
-                f"keeping first match for {int(dup_mask.sum())} rows"
-            )
-            df_fallback = df_fallback.loc[~dup_mask]
-        fallback = df_fallback.set_index(_INDEX_COLS).to_dict("index")
-
-        return primary, fallback
+        return moev2_tuned.read_table(tune_file, _INDEX_COLS, config_file is not None)
 
     global cfg_2stages
     tune_file = config_file or AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
@@ -4458,6 +4260,30 @@ def get_2stage_cfgs(
     )
 
 
+def _default_cfg_2stages():
+    global cfg_2stages
+    if cfg_2stages is None:
+        cfg_2stages = moev2_tuned.read_table(
+            AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
+            moev2_tuned.index_columns(False),
+            False,
+        )
+    return cfg_2stages
+
+
+moev2_tuned.share_default_table(_default_cfg_2stages)
+_get_2stage_cfgs_cache_clear = get_2stage_cfgs.cache_clear
+
+
+def _clear_dispatch_caches():
+    # aiter.moev2 caches the same decisions for the calls it runs.
+    _get_2stage_cfgs_cache_clear()
+    moev2_tuned.clear_cache()
+
+
+get_2stage_cfgs.cache_clear = _clear_dispatch_caches
+
+
 def fused_moe_2stages(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -4944,139 +4770,6 @@ def fused_moe_2stages(
         kernel_bench_callable.append(("stage2", _stage2_call))
     stage2_output = _stage2_call()
     return moe_out if _stage2_override is None else stage2_output
-
-
-def asm_stage1(
-    input,
-    w1,
-    w2,
-    sorted_ids,
-    sorted_expert_ids,
-    num_valid_ids,
-    out,  # [token_num, topk, inter_dim]
-    topk,
-    block_m: int,
-    kernelName: str = "",
-    ksplit: int = 0,
-    activation=ActivationType.Silu,
-    quant_type=QuantType.No,
-    a1_scale=None,
-    w1_scale=None,
-    sorted_weights=None,
-):
-    dtype = dtypes.bf16  # out.dtype, asm only support bf16
-    if quant_type != QuantType.per_1x128:
-        out = out.view(dtype)
-    device = out.device
-    token_num, _, _ = out.shape
-    E, _model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-
-    if quant_type == QuantType.per_Tensor:
-        a1_scale = a1_scale.view(1, 1).repeat(token_num, 1)
-        w1_scale = w1_scale.view(E, 1).repeat(1, w1.shape[1])
-        quant_type = QuantType.per_Token
-
-    tmp_out = out
-    if ksplit > 0:
-        tmp_out = torch.zeros(
-            (token_num, topk, w1.shape[1]),
-            dtype=dtypes.fp32,
-            device=device,
-        ).view(dtype)
-
-    aiter.moe_stage1_g1u1(
-        input,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        tmp_out,
-        inter_dim,
-        kernelName,
-        block_m,
-        ksplit=ksplit,
-        activation=activation,
-        quant_type=quant_type,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
-        sorted_weights=sorted_weights,
-    )
-    if ksplit > 0:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
-        elif activation == ActivationType.Swiglu:
-            aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
-        elif activation == ActivationType.Gelu:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
-        else:
-            raise ValueError(
-                f"Unsupported activation for split-k post-activation: {activation}"
-            )
-    return out
-
-
-def ck_moe_stage1(
-    hidden_states,
-    w1,  # [E, inter_dim*2, model_dim]
-    w2,  # [E, model_dim, inter_dim]
-    sorted_token_ids,  # [max_num_tokens_padded]
-    sorted_expert_ids,  # [max_num_m_blocks]
-    num_valid_ids,  # [1]
-    out,
-    topk,
-    block_m,
-    a1_scale,
-    w1_scale,
-    kernelName="",
-    sorted_weights=None,
-    quant_type=aiter.QuantType.No,
-    activation=ActivationType.Gelu,
-    splitk=1,
-    use_non_temporal_load=False,
-    dtype=None,
-):
-    token_num = hidden_states.shape[0]
-    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
-    if is_splitk:
-        # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
-        sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
-        tmp_out = torch.empty(
-            (sorted_size, w1.shape[1]), dtype=dtypes.fp32, device=out.device
-        )
-    else:
-        tmp_out = out
-    aiter.ck_moe_stage1_fwd(
-        hidden_states,
-        w1,
-        w2,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        tmp_out,
-        topk,
-        kernelName,
-        w1_scale,
-        a1_scale,
-        block_m,
-        sorted_weights,
-        quant_type,
-        activation,
-        splitk if is_splitk else 0,
-        use_non_temporal_load,
-        out.dtype,
-    )
-    if is_splitk:
-        valid_out = tmp_out[: token_num * topk, :]
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
-        elif activation == ActivationType.Gelu:
-            aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
-        else:
-            raise ValueError(
-                f"Unsupported activation for split-k post-activation: {activation}"
-            )
-    return out
 
 
 def cktile_moe_stage1(

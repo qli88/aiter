@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""GPU test suites per MoE migration path (steps doc 0.3).
+"""GPU test suites per MoE migration path.
 
-A path is the unit that moves from the legacy code to aiter.moev2 (design doc §3.10).
+A path is the unit that moves from the legacy code to aiter.moev2.
 Before a path graduates, its suites must pass with `AITER_MOEV2=<path>`; `SHARED`
 suites run for every path.
 
