@@ -47,7 +47,28 @@ def mxfp4():
     return scale_spec(QuantType.per_1x32, dtypes.fp4x2)
 
 
-def a4w4_caps():
+def a16w4():
+    """bf16 activations into MXFP4 weights: not quantized, `bf16/1x32` as `scale_spec`
+    gives it."""
+    return scale_spec(QuantType.per_1x32, dtypes.bf16)
+
+
+def mxfp8():
+    """fp8 values with one E8M0 scale per 32 (`QuantType.per_1x32`)."""
+    return scale_spec(QuantType.per_1x32, dtypes.fp8)
+
+
+A16W4_ARCHS = frozenset({"gfx942", "gfx950"})
+
+
+def wi4():
+    """int4 weights with one bf16 scale per 32 (`QuantType.per_1x32`, a16wi4)."""
+    return scale_spec(QuantType.per_1x32, dtypes.i4x2)
+
+
+def a4w4_caps(pads=False):
+    """`pads`: the kernels take the hidden/intermediate padding (FlyDSL does, MXMOE
+    does not)."""
     return (
         Cap(
             arch=frozenset({"gfx950"}),
@@ -55,10 +76,101 @@ def a4w4_caps():
             w1=frozenset({mxfp4()}),
             w2=frozenset({mxfp4()}),
             out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
-            activation=frozenset({"silu", "gelu"}),
+            activation=frozenset({"silu", "gelu", "swiglu", "situv2"}),
             gate_mode=frozenset({"separated"}),
             g1u1=frozenset({True}),
-            features=frozenset({"ep_mask"}),
+            features=frozenset({"ep_mask", "bias1", "bias2"}),
+            pads=pads,
+            extras=frozenset({"disable_inline_sort"}),
+        ),
+    )
+
+
+def a8w4_caps(pads=False):
+    """mxfp8 activations into MXFP4 weights. The FlyDSL heuristic runs them with gate
+    and up interleaved; tuned rows run on either layout. `pads`: as `a4w4_caps`."""
+    return (
+        Cap(
+            arch=frozenset({"gfx950"}),
+            act_in=frozenset({mxfp8()}),
+            w1=frozenset({mxfp4()}),
+            w2=frozenset({mxfp4()}),
+            out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
+            activation=frozenset({"silu", "swiglu", "situv2"}),
+            gate_mode=frozenset({"separated", "interleave"}),
+            g1u1=frozenset({True}),
+            features=frozenset({"ep_mask", "bias1", "bias2"}),
+            pads=pads,
+            extras=frozenset({"disable_inline_sort"}),
+        ),
+    )
+
+
+def a16w4_caps():
+    """The FlyDSL a16w4 (`abf16_wfp4`) kernels: SiTUv2, and Swiglu off CK-Tile."""
+    return (
+        Cap(
+            arch=A16W4_ARCHS,
+            act_in=frozenset({a16w4()}),
+            w1=frozenset({mxfp4()}),
+            w2=frozenset({mxfp4()}),
+            out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
+            activation=frozenset({"swiglu", "situv2"}),
+            gate_mode=frozenset({"separated"}),
+            g1u1=frozenset({True}),
+            features=frozenset({"ep_mask", "bias1", "bias2"}),
+            pads=True,
+            extras=frozenset({"disable_inline_sort"}),
+        ),
+    )
+
+
+def a16wi4_caps():
+    """The FlyDSL a16wi4 (`abf16_wint4`) kernels: Silu and SiTUv2."""
+    return (
+        Cap(
+            arch=A16W4_ARCHS,
+            act_in=frozenset({a16w4()}),
+            w1=frozenset({wi4()}),
+            w2=frozenset({wi4()}),
+            out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
+            activation=frozenset({"silu", "situv2"}),
+            gate_mode=frozenset({"separated"}),
+            g1u1=frozenset({True}),
+            features=frozenset({"ep_mask", "bias1", "bias2"}),
+            pads=True,
+            extras=frozenset({"disable_inline_sort"}),
+        ),
+    )
+
+
+def swiglu_bias(p, tuned=True) -> bool:
+    """The legacy `enable_bias`: FlyDSL stages add the bias for Swiglu with a 16-bit
+    output only, and ignore it otherwise. For a tuned row legacy also requires fp4
+    weights; its heuristic does not."""
+    return (
+        p.activation.activation == ActivationType.Swiglu
+        and p.out_dtype in (dtypes.bf16, dtypes.fp16)
+        and p.quant_type == QuantType.per_1x32
+        and (not tuned or p.w1.dtype == dtypes.fp4x2)
+    )
+
+
+def mxfp8_caps(pads=False):
+    """mxfp8 activations and weights: the FlyDSL kernels on gfx950, Silu and Swiglu.
+    `pads`: as `a4w4_caps`."""
+    return (
+        Cap(
+            arch=frozenset({"gfx950"}),
+            act_in=frozenset({mxfp8()}),
+            w1=frozenset({mxfp8()}),
+            w2=frozenset({mxfp8()}),
+            out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
+            activation=frozenset({"silu", "swiglu"}),
+            gate_mode=frozenset({"separated", "interleave"}),
+            g1u1=frozenset({True}),
+            features=frozenset({"ep_mask", "bias1", "bias2"}),
+            pads=pads,
             extras=frozenset({"disable_inline_sort"}),
         ),
     )
@@ -72,12 +184,27 @@ def _row_names(row):
 
 
 def mxfp4_row_rejection(p, row) -> RowRejection | None:
-    """The legacy `get_2stage_cfgs` checks, in its order, that discard a tuned row with a
-    FlyDSL or MXMOE kernel. (Its Opus and CK-Tile checks concern rows no segment here
-    runs.)"""
+    """The legacy `get_2stage_cfgs` checks, in its order, that discard a tuned row with
+    an Opus, FlyDSL or MXMOE kernel. (Its stage 2 checks are with `cktile.gemm2` and
+    `opus.gemm2`.)"""
     kn1, kn2 = _row_names(row)
     activation = p.activation.activation
     inline = _is_inline_sort_cfg(kn1, kn2)
+    if (kn1.startswith("opus_") or kn2.startswith("opus_")) and not p.fully_shuffled:
+        return RowRejection(
+            f"[fused_moe] discarding Opus tuned config for {p.log_keys()}: "
+            "both w1 and w2 must be marked is_shuffled=True; using default "
+            "heuristics"
+        )
+    if kn1.startswith("opus_") and activation not in (
+        ActivationType.Silu,
+        ActivationType.Swiglu,
+        ActivationType.Situv2,
+    ):
+        return RowRejection(
+            f"[fused_moe] discarding Opus tuned config for unsupported "
+            f"activation {activation}; using default heuristics"
+        )
     if (kn1.startswith("flydsl_") or kn2.startswith("flydsl_")) and activation not in (
         ActivationType.Silu,
         ActivationType.Swiglu,
@@ -161,8 +288,11 @@ def flydsl_default_kernels(p) -> DefaultKernels:
     )
 
     token = p.shape.m
+    if p.w1.dtype == dtypes.i4x2:
+        return _a16wi4_default_kernels(p)
     out_type = "bf16" if p.out_dtype == dtypes.bf16 else "f16"
-    a_type = "fp4" if p.act_in.dtype == dtypes.fp4x2 else "fp8"
+    act = p.act_in.dtype
+    a_type = "bf16" if act == dtypes.bf16 else "fp4" if act == dtypes.fp4x2 else "fp8"
     w_type = "fp8" if p.w1.dtype == dtypes.fp8 else "fp4"
     s2_tk = pick_flydsl_stage2_tile_k(p.shape.inter_dim)
     # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
@@ -195,6 +325,22 @@ def flydsl_default_kernels(p) -> DefaultKernels:
     return DefaultKernels(kn1, kn2, tile_m, -1, warning)
 
 
+def _a16wi4_default_kernels(p) -> DefaultKernels:
+    """The legacy untuned a16wi4 fallback: one tile per token tier, bf16 output names
+    whatever the output dtype, no split-K (the kernels split K inside a block)."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+    token = p.shape.m
+    tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+    kn1 = flydsl_kernel_name(1, "bf16", "int4", "bf16", tile_m, 128, 128)
+    kn2 = flydsl_kernel_name(2, "bf16", "int4", "bf16", tile_m, 128, 128, "atomic")
+    warning = (
+        f"[fused_moe] no tuned FlyDSL config for {p.log_keys()}, "
+        f"using untuned a16wi4 fallback ({kn1=}, {kn2=})"
+    )
+    return DefaultKernels(kn1, kn2, tile_m, 0, warning)
+
+
 def _stage1_fused_quant(kernel_name) -> str:
     """What a FlyDSL stage 1 quantizes its output to, from its name ("" for none)."""
     options = kernel_name.split("_t")[-1]
@@ -206,13 +352,16 @@ class _FlydslStage1(Segment):
 
     @property
     def capabilities(self):
-        return a4w4_caps()
+        return a4w4_caps(pads=True) + a8w4_caps(pads=True) + mxfp8_caps(pads=True)
 
     def reads(self, p):
         return (Buf("sorted", None), Buf("tokens", p.act_in))
 
     def check_row(self, p, row, kernel_name1=""):
         return mxfp4_row_rejection(p, row)
+
+    def row_params(self, p, row):
+        return {"tuned": True}
 
     def build(self, p, params):
         return functools.partial(
@@ -223,12 +372,25 @@ class _FlydslStage1(Segment):
             model_dim_pad=p.layout.hidden_pad,
         )
 
+    def metadata_fields(self, p, params):
+        return {"has_bias": swiglu_bias(p, tuned=params.get("tuned", False))}
+
 
 class FlydslGemm1(_FlydslStage1):
     """A FlyDSL stage 1 writing the unquantized intermediate."""
 
     name = "flydsl.gemm1"
     covers = (Op.GEMM1, Op.ACT)
+
+    @property
+    def capabilities(self):
+        return (
+            a4w4_caps(pads=True)
+            + a8w4_caps(pads=True)
+            + mxfp8_caps(pads=True)
+            + a16w4_caps()
+            + a16wi4_caps()
+        )
 
     def owns(self, kernel) -> bool:
         return (
@@ -246,7 +408,8 @@ class FlydslGemm1(_FlydslStage1):
 
 
 class FlydslGemm1Quant(_FlydslStage1):
-    """A FlyDSL stage 1 that quantizes its output to MXFP4 (`_fp4` in its options)."""
+    """A FlyDSL stage 1 that quantizes its output to MXFP4 or mxfp8 (`_fp4` or `_fp8`
+    in its options)."""
 
     name = "flydsl.gemm1_q"
     covers = (Op.GEMM1, Op.QUANT_INTER)
@@ -256,14 +419,24 @@ class FlydslGemm1Quant(_FlydslStage1):
             kernel is not None
             and kernel.family == kernel_names.FLYDSL
             and kernel.stage == 1
-            and _stage1_fused_quant(kernel.format()) == "fp4"
+            and _stage1_fused_quant(kernel.format()) != ""
         )
 
+    def declines_row(self, p, row):
+        kn1, _ = _row_names(row)
+        fused = dtypes.fp8 if _stage1_fused_quant(kn1) == "fp8" else dtypes.fp4x2
+        if kn1.startswith("flydsl_moe1_") and fused != p.act_in.dtype:
+            return "FlyDSL stage 1 quantizes to another dtype than the activations"
+        return None
+
     def produces(self, p, params):
-        return Buf("inter", mxfp4())
+        return Buf("inter", p.act_in)
 
     def metadata_fields(self, p, params):
-        return {"fuse_quant": "fp4"}
+        return {
+            **super().metadata_fields(p, params),
+            "fuse_quant": _stage1_fused_quant(params.kernel),
+        }
 
 
 class FlydslGemm1Layout(_FlydslStage1):
@@ -292,7 +465,10 @@ class FlydslGemm1Layout(_FlydslStage1):
         return stage1
 
     def metadata_fields(self, p, params):
-        return {"fuse_quant": self._a_dtype(params)}
+        return {
+            **super().metadata_fields(p, params),
+            "fuse_quant": self._a_dtype(params),
+        }
 
     @staticmethod
     def _a_dtype(params):
@@ -306,7 +482,13 @@ class FlydslGemm2(Segment):
 
     @property
     def capabilities(self):
-        return a4w4_caps()
+        return (
+            a4w4_caps(pads=True)
+            + a8w4_caps(pads=True)
+            + mxfp8_caps(pads=True)
+            + a16w4_caps()
+            + a16wi4_caps()
+        )
 
     def owns(self, kernel) -> bool:
         return (
@@ -332,6 +514,12 @@ class FlydslGemm2(Segment):
             model_dim_pad=p.layout.hidden_pad,
         )
 
+    def row_params(self, p, row):
+        return {"tuned": True}
+
+    def metadata_fields(self, p, params):
+        return {"stage2_has_bias": swiglu_bias(p, tuned=params.get("tuned", False))}
+
 
 class FlydslLayoutGemm2(Segment):
     """A FlyDSL v2 GEMM2 (`flydsl_moe2_layout_*`) with the atomic or reduce epilog."""
@@ -343,7 +531,7 @@ class FlydslLayoutGemm2(Segment):
 
     @property
     def capabilities(self):
-        return a4w4_caps()
+        return a4w4_caps() + a8w4_caps() + mxfp8_caps()
 
     def owns(self, kernel) -> bool:
         if kernel is None or kernel.family != kernel_names.FLYDSL_LAYOUT:
@@ -391,6 +579,7 @@ class FlydslLayoutGemm2(Segment):
         return {
             "skip_inter_quant": True,
             "output_aux": AUX_SORT_OPUS if self.scatter else False,
+            "stage2_has_bias": swiglu_bias(p),
         }
 
 
@@ -439,6 +628,22 @@ class MxmoeGemm1(Segment):
             interleave=(p.gate_mode == GateMode.INTERLEAVE),
         )
 
+    def default_kernels(self, p):
+        """The legacy heuristic MXMOE fallback (SiTUv2 without a tuned row)."""
+        s = p.shape
+        token, topk, expert = s.m, s.topk, s.experts
+        bm = 64 if token < 512 else 128
+        rows_per_expert = -(-token * topk // expert)
+        g1_swz = min(6, max(1, -(-rows_per_expert // bm)))
+        g1_sfx = f"_xcd{g1_swz}" if g1_swz > 1 else ""
+        kn1 = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256_situv2{g1_sfx}"
+        kn2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{bm}x256x128_reduce_sbm{bm}"
+        warning = (
+            f"[fused_moe] no tuned FlyDSL config for {p.log_keys()}, "
+            f"using heuristic MXMOE fallback (kn1={kn1!r}, kn2={kn2!r})"
+        )
+        return DefaultKernels(kn1, kn2, bm, 0, warning)
+
     def metadata_fields(self, p, params):
         p1 = _parse_mxfp4_g1_kname(params.kernel)
         return {
@@ -446,6 +651,7 @@ class MxmoeGemm1(Segment):
             "fuse_quant": p1["out_dtype"],
             "output_aux": AUX_SORT_OPUS,
             "prequant": p1["a_dtype"] == "fp8" and not p1["inline_quant"],
+            "has_bias": "bias1" in p.features and p1.get("enable_bias", False),
         }
 
 
@@ -481,3 +687,7 @@ class MxmoeGemm2(Segment):
 
     def build(self, p, params):
         return functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=params.kernel)
+
+    def metadata_fields(self, p, params):
+        is_layout_gemm2 = parse_flydsl_v2_gemm2_kernel(params.kernel) is not None
+        return {"stage2_has_bias": "bias2" in p.features and is_layout_gemm2}

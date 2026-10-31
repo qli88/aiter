@@ -14,14 +14,14 @@ import sys
 import pytest
 
 from aiter import ActivationType, QuantType, dtypes
-from aiter.moev2.dispatch import ranking
+from aiter.moev2.dispatch import ranking, ranking_table
 from aiter.moev2.dispatch.ranking import Entry, Region, match, when
 from aiter.moev2.problem import MoeProblem
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
-CK = ranking.CK_2STAGE
+CK = ranking_table.CK_2STAGE
 ASM = "sort | quant.a1 | asm.stage1 | quant.inter | ck.gemm2"
 PER_TENSOR = match(quant_type=QuantType.per_Tensor)
 
@@ -35,9 +35,29 @@ def _gfx950():
 
 
 def _paths():
-    from aiter.moev2.migration import a4w4, a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
+    from aiter.moev2.migration import (
+        a4w4,
+        a8w4,
+        a8w8_blockscale,
+        a8w8_pt,
+        a8w8_ptok,
+        a16w4,
+        a16w16,
+        a16wi4,
+        mxfp8,
+    )
 
-    modules = (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale, a4w4)
+    modules = (
+        a8w8_pt,
+        a16w16,
+        a8w8_ptok,
+        a8w8_blockscale,
+        a4w4,
+        a16w4,
+        a16wi4,
+        a8w4,
+        mxfp8,
+    )
     return [m.PATH for m in modules]
 
 
@@ -68,7 +88,7 @@ def _bf16(**kwargs):
 
 def test_the_shipped_table_passes_the_static_checks():
     segments = [s for path in _paths() for s in path.segments]
-    assert ranking.check_table(ranking.RANKING, segments) == []
+    assert ranking.check_table(ranking_table.RANKING, segments) == []
 
 
 def test_the_shipped_table_passes_over_the_key_grid():
@@ -89,7 +109,8 @@ def test_per_tensor_fp8_without_a_tuned_row_ranks_ck_2stage():
     label, plan, legacy = ranking.best(_problem(), plans)
     assert label == "fp8_per_tensor[otherwise]" and legacy is None
     assert " | ".join(s.name for s in plan) == CK
-    assert ranking.best(_problem(quant=QuantType.per_1x32), plans) is None
+    unranked = _problem(quant=QuantType.per_1x32, w_dtype=dtypes.i8)
+    assert ranking.best(unranked, plans) is None
     assert ranking.best(_problem(), []) == ("fp8_per_tensor[otherwise]", None, None)
 
 

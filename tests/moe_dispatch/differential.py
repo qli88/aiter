@@ -9,6 +9,11 @@ is no allowlist: the revamp keeps today's behavior, and a bug
 fix lands in the legacy code first, with the snapshot regenerated.
 
     python tests/moe_dispatch/differential.py --check [--arch gfx950]
+    python tests/moe_dispatch/differential.py --check --env AITER_FLYDSL_FORCE=0
+
+`--env NAME=VALUE` sets a dispatch-affecting variable for legacy and v2 alike; the legacy
+records are then generated live rather than read from the golden files (which hold the
+default environment).
 
 GPU: `run_differential(path_name, call)` runs one call through AITER_MOEV2=off and
 AITER_MOEV2=<path> and compares the kernel launches and outputs (see
@@ -61,13 +66,24 @@ def _legacy_logs(key):
     return logs
 
 
-# The stage-1 function of the legacy 2-stage branches a ranking region hands back.
-_LEGACY_2STAGE = {"CK-Tile split-K MXFP4": "fused_moe.cktile_moe_stage1"}
+# The stage-1 functions of the legacy 2-stage branches a ranking region hands back.
+_CKTILE = "fused_moe.cktile_moe_stage1"
+_LEGACY_2STAGE = {
+    "CK-Tile split-K MXFP4 or CK 2-stage SiTUv2": (_CKTILE, "fused_moe.ck_moe_stage1"),
+    "CK 2-stage, padding ignored": ("fused_moe.ck_moe_stage1",),
+    "CK 2-stage a16w4": ("fused_moe.ck_moe_stage1",),
+    # A bypassed tuned row turns the MXMOE fallback off (AITER_BYPASS_TUNE_CONFIG).
+    "the next branch (a tuned row is bypassed)": (
+        "fused_moe._flydsl_stage1_wrapper",
+        _CKTILE,
+        "fused_moe.ck_moe_stage1",
+    ),
+}
 
 
 def legacy_decline(path, key):
-    """`(reason, stage-1 function)` when `path` hands `key` back to a named legacy
-    branch, else None; the function is None for a 1-stage branch.
+    """`(reason, stage-1 functions)` when `path` hands `key` back to a named legacy
+    branch, else None; the functions are None for a 1-stage branch.
 
     A 1-stage tuned row and a ranking region marked `legacy=` name the branch.
     """
@@ -87,13 +103,16 @@ def legacy_decline(path, key):
         return reason, None
     if reason.startswith("ranking ") and reason.endswith(" is not ported"):
         legacy = reason.split(": ", 1)[1].removesuffix(" is not ported")
-        return reason, _LEGACY_2STAGE.get(legacy)
+        if legacy.startswith("1-stage "):
+            return reason, None
+        # An unlisted branch matches no stage 1: compare() reports it.
+        return reason, _LEGACY_2STAGE.get(legacy, ())
     return None
 
 
-def compare(arch, check_logs=True):
+def compare(arch, check_logs=True, live=False):
     """`(claimed, one_stage, two_stage, problems)`: `{label: path name}` three times and
-    a list of strings.
+    a list of strings. `live`: generate the legacy records instead of reading golden/.
 
     `one_stage`: keys a path hands back as legacy 1-stage keys, which must be 1-stage
     in the legacy record. `two_stage`: keys a ranking region hands back to a named legacy
@@ -103,7 +122,18 @@ def compare(arch, check_logs=True):
     from aiter.moev2.dispatch import tuned
     from moe_dispatch import arch_sim, record, snapshot
 
-    golden = snapshot.read(arch)
+    if live:
+        import logging
+
+        import aiter.fused_moe as fm
+
+        logger = logging.getLogger("aiter")
+        level = logger.level
+        golden = snapshot.generate(arch)
+        logger.setLevel(level)
+        fm.get_2stage_cfgs.cache_clear()
+    else:
+        golden = snapshot.read(arch)
     checkers = [p for p in paths.registered().values() if p.dispatch_record is not None]
     claimed, one_stage, two_stage, problems = {}, {}, {}, []
     with arch_sim.simulated_arch(arch) as (gfx, cu_num):
@@ -141,7 +171,7 @@ def compare(arch, check_logs=True):
                     two_stage[label] = path.name
                     got = expected.get("stage1")
                     got = got.get("fn") if isinstance(got, dict) else got
-                    if expected.get("run_1stage") or got != stage1:
+                    if expected.get("run_1stage") or got not in stage1:
                         problems.append(
                             f"{label} [{path.name}] declined ({reason}) but legacy "
                             f"does not run {stage1}: {json.dumps(expected, sort_keys=True)}"
@@ -179,18 +209,29 @@ def main(argv=None):
     parser.add_argument(
         "--no-logs", action="store_true", help="skip the log comparison"
     )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="set for legacy and v2; compares with live legacy records",
+    )
     args = parser.parse_args(argv)
 
     sys.path.insert(0, str(_HERE.parent))
     from moe_dispatch import snapshot
 
     snapshot._setup()
+    # After _setup, which drops the dispatch-affecting variables of the caller.
+    for item in args.env:
+        name, _, value = item.partition("=")
+        os.environ[name] = value
     from moe_dispatch import arch_sim
 
     failed = False
     for arch in args.arch or list(arch_sim.ARCHS):
         claimed, one_stage, two_stage, problems = compare(
-            arch, check_logs=not args.no_logs
+            arch, check_logs=not args.no_logs, live=bool(args.env)
         )
 
         def summary(by_label):
@@ -260,8 +301,10 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
     over what the kernels define: the sort buffers up to `num_valid_ids` (the rest is
     `torch.empty`), MX scales in sorted order at the routed rows and the `K / 32` groups
     (`_sorted_scale_defined`), other buffers in sorted order at the routed rows (stage 1
-    skips block padding), `[token, topk, inter]` buffers at the routed slots that are
-    local (stage 1 skips the others), and nothing for the output buffer.
+    skips block padding), `[token, topk, inter]` buffers at the routed slots that
+    are local (stage 1 skips the others), and nothing for the output buffer, for the
+    `out` argument of a stage 1 that writes a buffer of its own (`_own_stage1_buffer`),
+    nor for the output of a split-K stage 1 (accumulated with atomics).
     """
     import torch
 
@@ -304,6 +347,10 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
             continue
         pairs = [(i, x, y) for i, (x, y) in enumerate(zip(a.args, b.args))]
         pairs += [(k, a.keywords[k], b.keywords[k]) for k in a.keywords]
+        if name == "stage1" and _own_stage1_buffer(a):
+            pairs = [pair for pair in pairs if pair[0] != 6]
+        if name == "stage1" and (a.keywords.get("split_k") or 1) > 1:
+            skip |= {a.args[6].data_ptr(), b.args[6].data_ptr()}
         for where, x, y in pairs:
             if not isinstance(x, torch.Tensor) or not isinstance(y, torch.Tensor):
                 if x != y:
@@ -342,6 +389,22 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
     return problems
 
 
+def _own_stage1_buffer(launch) -> bool:
+    """The FlyDSL a16w-mix stage 1 (bf16 into fp4 or int4 weights) writes a sorted
+    intermediate it allocates and returns, and leaves its `out` argument unwritten."""
+    from aiter.moev2.segments.flydsl import _flydsl_stage1_wrapper
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    if launch.func is not _flydsl_stage1_wrapper:
+        return False
+    parsed = get_flydsl_kernel_params(launch.keywords.get("kernelName", ""))
+    return (
+        parsed is not None
+        and parsed.get("a_dtype") == "bf16"
+        and parsed.get("b_dtype") in ("fp4", "int4")
+    )
+
+
 def _ulp(t):
     import torch
 
@@ -359,8 +422,8 @@ def run_differential(path_name, call, *, bitwise=False):
     The path must claim and run the call (not decline it), launch the same kernels on the
     same inputs (`compare_launches`), and produce the same output: bitwise with
     `bitwise=True`, else within the larger of 4 ulps of the output's peak and twice the
-    difference between two legacy runs (atomic accumulation in GEMM2 is not
-    deterministic).
+    difference between two legacy runs (atomic accumulation in GEMM2 and in a split-K
+    stage 1 is not deterministic).
     """
     import dataclasses
     import inspect

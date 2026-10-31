@@ -66,6 +66,11 @@ from aiter.moev2.reference.torch_moe import (  # noqa: F401
 from aiter.moev2.routing.topk import fused_topk  # noqa: F401
 from aiter.moev2.segments.asm import asm_stage1
 from aiter.moev2.segments.ck import ck_moe_stage1
+from aiter.moev2.segments.ck_tile import (
+    _is_cktile_mxfp4_stage2_name,
+    cktile_moe_stage1,
+    cktile_moe_stage2,
+)
 from aiter.moev2.segments.defaults import (
     BLOCK_SIZE_M,
     get_block_size_M,
@@ -73,6 +78,7 @@ from aiter.moev2.segments.defaults import (
     use_nt,
 )
 from aiter.moev2.segments.flydsl import (  # noqa: F401
+    _can_reroute_mxfp4_to_flydsl,
     _empty_bf16,
     _empty_u8,
     _flydsl_mxfp4_layout_is_compatible,
@@ -86,6 +92,7 @@ from aiter.moev2.segments.flydsl import (  # noqa: F401
     _is_flydsl_stage2,
     _mxfp4_intermediate_enabled,
     _mxfp4_scale_u8,
+    _needs_swiglu_bias_support,
     _normalize_bias_for_kernel,
     _stage2_honors_runtime_reduce_override,
     _stage2_runtime_uses_route_reduce,
@@ -105,6 +112,7 @@ from aiter.moev2.segments.mxmoe import (  # noqa: F401
     _mxfp4_inline_sort_unsupported,
     _padded_scale_cols,
 )
+from aiter.moev2.segments.opus import _opus_stage2_fp8_enabled
 from aiter.moev2.segments.sort import (
     _FUSED_DECODE_SORT_QUANT_MAX_M,
     _FUSED_DECODE_SORT_QUANT_ROUTES,
@@ -1657,51 +1665,6 @@ fused_moe_1stage_dict = {
     }
 }
 # fmt: on
-
-
-def _needs_swiglu_bias_support(dtype, quant_type):
-    return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
-
-
-def _opus_stage2_fp8_enabled():
-    return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
-
-
-def _is_cktile_mxfp4_stage2_name(kernel_name):
-    return kernel_name.startswith("cktile_") or (
-        kernel_name == "swiglu_mxfp4_bf16_cktile"
-    )
-
-
-def _can_reroute_mxfp4_to_flydsl(
-    *,
-    model_dim,
-    inter_dim,
-    dtype,
-    q_dtype_a,
-    q_dtype_w,
-    q_type,
-    activation,
-    is_shuffled,
-    use_g1u1,
-    doweight_stage1,
-    gate_mode,
-    gate_up_interleave=None,
-):
-    """Whether the heuristic FlyDSL path accepts this MXFP4 shape and layout."""
-    return (
-        dtype == dtypes.bf16
-        and q_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.fp4x2
-        and q_dtype_a == dtypes.bf16
-        and activation == ActivationType.Swiglu
-        and inter_dim % 128 == 0
-        and model_dim % 256 == 0
-        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave)
-        and is_shuffled
-        and use_g1u1
-        and not doweight_stage1
-    )
 
 
 @functools.lru_cache(maxsize=2048)
@@ -3365,209 +3328,3 @@ def fused_moe_2stages(
         kernel_bench_callable.append(("stage2", _stage2_call))
     stage2_output = _stage2_call()
     return moe_out if _stage2_override is None else stage2_output
-
-
-def cktile_moe_stage1(
-    hidden_states,
-    w1,
-    w2,
-    sorted_token_ids,
-    sorted_expert_ids,
-    num_valid_ids,
-    out,
-    topk,
-    block_m,
-    a1_scale,
-    w1_scale,
-    sorted_weights=None,
-    n_pad_zeros=0,
-    k_pad_zeros=0,
-    bias1=None,
-    topk_ids=None,
-    activation=ActivationType.Silu,
-    split_k=1,
-    dtype=torch.bfloat16,
-    kernel_name="",
-    post_activation_layout="auto",
-):
-    token_num = hidden_states.shape[0]
-    _, _n1, k1 = w1.shape
-    _, k2, n2 = w2.shape
-    D = n2 if k2 == k1 else n2 * 2  # bit4 format
-    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
-
-    if w1.dtype is torch.uint32:
-        D = D * 8
-
-    expected_out_shape = (token_num, topk, D)
-    if (
-        out is None
-        or tuple(out.shape) != expected_out_shape
-        or out.dtype != dtype
-        or out.device != hidden_states.device
-    ):
-        out = torch.empty(expected_out_shape, dtype=dtype, device=hidden_states.device)
-    needs_post_activation = split_k > 1
-    # Split-k reduces into a token-topk workspace and applies activation after
-    # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
-    workspace_rows = token_num * topk
-    if needs_post_activation:
-        tmp_out = torch.zeros(
-            (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
-        )
-    else:
-        tmp_out = out
-    bias1 = _normalize_bias_for_kernel(bias1)
-    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
-    aiter.moe_cktile2stages_gemm1(
-        hidden_states,
-        w1,
-        tmp_out,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        topk,
-        n_pad_zeros,
-        k_pad_zeros,
-        sorted_weights,
-        a1_scale,
-        w1_scale,
-        None if needs_post_activation else bias1,
-        activation,
-        block_m,
-        split_k,
-        kernel_name,
-    )
-
-    if needs_post_activation:
-        valid_out = tmp_out[: token_num * topk, :]
-        if post_activation_layout == "auto":
-            is_interleaved = (
-                hasattr(torch, "float4_e2m1fn_x2")
-                and w1.dtype == torch.float4_e2m1fn_x2
-            )
-        elif post_activation_layout == "interleaved":
-            is_interleaved = True
-        elif post_activation_layout == "standard":
-            is_interleaved = False
-        else:
-            raise ValueError(
-                f"Unsupported CK-Tile post activation layout: {post_activation_layout}"
-            )
-
-        if is_interleaved:
-            if bias1 is not None:
-                raise ValueError("CK-Tile interleaved split-k bias is not supported")
-            inter_dim = out.shape[-1]
-            if activation == ActivationType.Swiglu:
-                from aiter.ops.flydsl.moe_kernels import (
-                    flydsl_swiglu_and_mul_interleaved,
-                )
-
-                flydsl_swiglu_and_mul_interleaved(
-                    valid_out.view(-1, inter_dim * 2),
-                    out.view(-1, inter_dim),
-                )
-            elif activation == ActivationType.Silu:
-                from aiter.ops.flydsl.moe_kernels import (
-                    flydsl_silu_and_mul_interleaved,
-                )
-
-                flydsl_silu_and_mul_interleaved(
-                    valid_out.view(-1, inter_dim * 2),
-                    out.view(-1, inter_dim),
-                    sorted_token_ids,
-                    num_valid_ids,
-                    token_num,
-                    topk,
-                )
-            elif activation == ActivationType.Gelu:
-                NLane = 16
-                N0 = inter_dim // NLane
-                flat = valid_out.view(-1, N0, 2, NLane)
-                gate = flat[:, :, 0, :].reshape(-1, inter_dim)
-                up = flat[:, :, 1, :].reshape(-1, inter_dim)
-                out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
-            else:
-                raise ValueError(
-                    f"Unsupported activation for interleaved split-k "
-                    f"post-activation: {activation}"
-                )
-        else:
-            if bias1 is not None and topk_ids is None:
-                raise ValueError(
-                    "topk_ids are required for CK-Tile split-k bias handling"
-                )
-            expert_ids = topk_ids.view(-1) if topk_ids is not None else None
-            if bias1 is not None and activation == ActivationType.Silu:
-                aiter.silu_and_mul_bias(out, valid_out, expert_ids, bias1)
-            elif bias1 is not None and activation == ActivationType.Swiglu:
-                aiter.swiglu_and_mul_bias(out, valid_out, expert_ids, bias1)
-            elif bias1 is not None and activation == ActivationType.Gelu:
-                aiter.gelu_and_mul_bias(out, valid_out, expert_ids, bias1)
-            elif bias1 is not None:
-                raise ValueError(
-                    f"Unsupported activation for split-k post-activation "
-                    f"with bias: {activation}"
-                )
-            elif activation == ActivationType.Silu:
-                aiter.silu_and_mul(out, valid_out)
-            elif activation == ActivationType.Swiglu:
-                aiter.swiglu_and_mul(out, valid_out)
-            elif activation == ActivationType.Gelu:
-                aiter.gelu_and_mul(out, valid_out)
-            else:
-                raise ValueError(
-                    f"Unsupported activation for split-k post-activation: {activation}"
-                )
-    return out
-
-
-def cktile_moe_stage2(
-    a2,
-    w1,
-    w2,
-    sorted_token_ids,
-    sorted_expert_ids,
-    num_valid_ids,
-    out,
-    topk,
-    w2_scale,
-    a2_scale,
-    block_m,
-    activation=ActivationType.Swiglu,
-    sorted_weights=None,
-    zeros_out=False,
-    n_pad_zeros=0,
-    k_pad_zeros=0,
-    bias2=None,
-    kernel_name="",
-):
-    _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    # Defense in depth for direct callers and tuned metadata.
-    if w2.dtype == dtypes.fp4x2 and inter_dim % 256 != 0:
-        raise NotImplementedError(
-            "CK-Tile MXFP4 stage2 requires inter_dim to be a multiple of 256; "
-            f"got {inter_dim}"
-        )
-    bias2 = _normalize_bias_for_kernel(bias2)
-    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
-    aiter.moe_cktile2stages_gemm2(
-        a2,
-        w2,
-        out,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        topk,
-        n_pad_zeros,
-        k_pad_zeros,
-        sorted_weights,
-        a2_scale,
-        w2_scale,
-        bias2,
-        activation,
-        block_m,
-        kernel_name=kernel_name,
-    )
-    return out

@@ -94,7 +94,7 @@ _OPUS = re.compile(
 )
 _GROUPED = re.compile(r"grouped_gemm(?P<stage>[12])(?P<opts>(?:_[A-Za-z0-9]+)+)")
 _CKTILE = re.compile(r"cktile(?P<opts>(?:_[A-Za-z0-9]+)+)")
-_CKTILE_ALIAS = "swiglu_mxfp4_bf16_cktile"
+CKTILE_ALIAS = "swiglu_mxfp4_bf16_cktile"
 _IMPL_PREFIX = "impl__"
 
 
@@ -193,7 +193,7 @@ def _format_grouped(k):
 
 def _format_cktile(k):
     if k.fields["alias"]:
-        return _CKTILE_ALIAS
+        return CKTILE_ALIAS
     return f"cktile{_join_opts(k.fields['opts'])}"
 
 
@@ -232,7 +232,7 @@ def parse(name) -> KernelName | None:
         raise KernelNameError(f"kernel name is not a string: {name!r}")
     if name == "Null":
         return KernelName(NULL, None, FrozenMap())
-    if name == _CKTILE_ALIAS:
+    if name == CKTILE_ALIAS:
         return KernelName(CKTILE, 2, FrozenMap({"alias": True, "opts": ()}))
     if name.startswith(_IMPL_PREFIX):
         impl, sep, config = name[len(_IMPL_PREFIX) :].partition("__")

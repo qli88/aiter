@@ -7,6 +7,7 @@ Per-key equality with the legacy code over the whole snapshot runs in a subproce
 """
 
 import dataclasses
+import functools
 import inspect
 import logging
 import pathlib
@@ -416,6 +417,7 @@ def test_a_declined_call_runs_on_legacy(monkeypatch):
 
     monkeypatch.setattr(a8w8_pt.LOCAL, "dispatch", lambda *a: None)
     monkeypatch.setattr(local.executor, "prologue", lambda call, remap: None)
+    monkeypatch.setattr(local.executor, "a16w4_unsupported", lambda c, q: None)
     monkeypatch.setattr(api, "dispatch_key", lambda c: ((), {}, None))
     assert a8w8_pt.PATH.run({}) is paths.DECLINED
 
@@ -574,7 +576,17 @@ def test_claims_only_unquantized_16_bit(monkeypatch):
     assert not a16w16.claims(call)
 
 
-_LOCAL_PATHS = ("a8w8_pt", "a16w16", "a8w8_ptok", "a8w8_blockscale", "a4w4")
+_LOCAL_PATHS = (
+    "a8w8_pt",
+    "a16w16",
+    "a8w8_ptok",
+    "a8w8_blockscale",
+    "a4w4",
+    "a16w4",
+    "a16wi4",
+    "a8w4",
+    "mxfp8",
+)
 
 
 def _local_path_modules():
@@ -615,6 +627,57 @@ def _a4w4_op_call():
     return call
 
 
+def _a16w4_problem(
+    activation=ActivationType.Situv2,
+    g1u1=True,
+    token=64,
+    shape=(7168, 256, 256, 8),
+    arch="gfx950",
+    **kwargs,
+):
+    args = (token, *shape, dtypes.bf16, dtypes.bf16, dtypes.fp4x2)
+    args += (QuantType.per_1x32, g1u1, activation, False, 0, 0)
+    kwargs.setdefault("is_shuffled", True)
+    return MoeProblem.from_legacy_key(*args, **kwargs, arch=arch, cu_num=256)
+
+
+def _a16wi4_op_call():
+    """bf16 activations into int4 weights: two to a byte (K / 2 columns)."""
+    return {
+        **_a4w4_op_call(),
+        "w1": torch.empty(4, 32, 32, dtype=dtypes.i4x2),
+        "w2": torch.empty(4, 64, 8, dtype=dtypes.i4x2),
+    }
+
+
+def _a16wi4_problem(activation=ActivationType.Silu, token=64, **kwargs):
+    args = (token, 7168, 256, 384, 8, dtypes.bf16, dtypes.bf16, dtypes.i4x2)
+    args += (QuantType.per_1x32, True, activation, False, 0, 0)
+    kwargs.setdefault("is_shuffled", True)
+    return MoeProblem.from_legacy_key(*args, **kwargs, arch="gfx950", cu_num=256)
+
+
+def _a8w4_problem(activation=ActivationType.Silu, token=64, **kwargs):
+    args = (token, 7168, 256, 256, 8, dtypes.bf16, dtypes.fp8, dtypes.fp4x2)
+    args += (QuantType.per_1x32, True, activation, False, 0, 0)
+    kwargs.setdefault("is_shuffled", True)
+    return MoeProblem.from_legacy_key(*args, **kwargs, arch="gfx950", cu_num=256)
+
+
+def _mxfp8_problem(activation=ActivationType.Silu, token=64, **kwargs):
+    args = (token, 6144, 512, 256, 8, dtypes.bf16, dtypes.fp8, dtypes.fp8)
+    args += (QuantType.per_1x32, True, activation, False, 0, 0)
+    kwargs.setdefault("is_shuffled", True)
+    return MoeProblem.from_legacy_key(*args, **kwargs, arch="gfx950", cu_num=256)
+
+
+def _a16w4_resolve(monkeypatch, problem, row=None):
+    from aiter.moev2.migration import a16w4
+
+    monkeypatch.setattr(tuned, "lookup", lambda p: row)
+    return resolver.resolve(problem, a16w4.SEGMENTS)
+
+
 def test_the_paths_take_disjoint_keys():
     i8, u32 = dtypes.i8, torch.uint32
     owners = (
@@ -626,6 +689,15 @@ def test_the_paths_take_disjoint_keys():
         ("a8w8_ptok", _problem(quant=QuantType.per_Token, w=u32)),
         ("a8w8_blockscale", _problem(quant=QuantType.per_1x128)),
         ("a4w4", _problem(quant=QuantType.per_1x32, fp8=dtypes.fp4x2)),
+        ("a16w4", _a16w4_problem()),
+        ("a16w4", _a16w4_problem(activation=ActivationType.Swiglu)),
+        ("a16w4", _a16w4_problem(activation=ActivationType.Relu2, g1u1=False)),
+        ("a16wi4", _a16wi4_problem()),
+        ("a16wi4", _a16wi4_problem(activation=ActivationType.Situv2)),
+        ("a8w4", _a8w4_problem()),
+        ("a8w4", _a8w4_problem(activation=ActivationType.Swiglu)),
+        ("mxfp8", _mxfp8_problem()),
+        ("mxfp8", _mxfp8_problem(activation=ActivationType.Swiglu)),
     )
     modules = _local_path_modules()
     for owner, p in owners:
@@ -719,6 +791,10 @@ def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
         "a8w8_ptok_i8": lambda: _int_op_call(QuantType.per_Token, "i8"),
         "a8w8_ptok_i4": lambda: _int_op_call(QuantType.per_Token, "i4"),
         "a4w4": _a4w4_op_call,
+        "a16w4": lambda: {**_a4w4_op_call(), "activation": ActivationType.Situv2.value},
+        "a16wi4": _a16wi4_op_call,
+        "a8w4": lambda: {**_a4w4_op_call(), "quant_dtype_a": dtypes.fp8},
+        "mxfp8": lambda: _fp8_op_call(QuantType.per_1x32),
     }[base]()
     w1 = call["w1"]
     for change in (
@@ -726,6 +802,16 @@ def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
         *({"quant_type": q.value} for q in QuantType.__members__.values()),
         {"w1": torch.empty(4, 16, w1.shape[2], dtype=w1.dtype)},  # g1u0
         {"activation": ActivationType.Gelu.value},
+        {"activation": ActivationType.Swiglu.value},
+        {"activation": ActivationType.Situv2.value},
+        {"activation": ActivationType.Situv2.value, "quant_dtype_a": w1.dtype},
+        {"activation": ActivationType.Swiglu.value, "quant_dtype_a": dtypes.bf16},
+        {"activation": ActivationType.Swiglu.value, "quant_dtype_a": dtypes.fp8},
+        {"activation": ActivationType.Relu2.value},
+        {
+            "activation": ActivationType.Relu2.value,
+            "w1": torch.empty(4, 16, w1.shape[2], dtype=w1.dtype),
+        },
         {"dtype": dtypes.fp16},
     ):
         changed = {**call, **change}
@@ -948,9 +1034,15 @@ def test_the_relookup_buckets_the_hidden_states_rows(monkeypatch):
     assert tokens == [2, 4]
 
 
-def _a4w4_problem(token=64, shape=(7168, 256, 256, 8), doweight=False, **kwargs):
+def _a4w4_problem(
+    token=64,
+    shape=(7168, 256, 256, 8),
+    doweight=False,
+    activation=ActivationType.Silu,
+    **kwargs,
+):
     args = (token, *shape, dtypes.bf16, dtypes.fp4x2, dtypes.fp4x2)
-    args += (QuantType.per_1x32, True, ActivationType.Silu, doweight, 0, 0)
+    args += (QuantType.per_1x32, True, activation, doweight, 0, 0)
     return MoeProblem.from_legacy_key(*args, **kwargs, arch="gfx950", cu_num=256)
 
 
@@ -983,11 +1075,332 @@ def test_a4w4_defaults_follow_the_legacy_branches(monkeypatch):
     # doweight_stage1 rules FlyDSL out: CK-Tile split-K at decode sizes, else CK.
     dw = _a4w4_problem(token=1, doweight=True, is_shuffled=True)
     res = _a4w4_resolve(monkeypatch, dw)
-    assert res.plan is None and "CK-Tile split-K MXFP4 is not ported" in res.declined
+    assert res.plan.structure()[0] == (
+        "sort", "quant.a1", "cktile.gemm1", "quant.inter", "cktile.gemm2"
+    )  # fmt: skip
+    stage1 = res.metadata.stage1
+    assert stage1.func.__name__ == "cktile_moe_stage1"
+    assert stage1.keywords["post_activation_layout"] == "auto"
+    assert res.metadata.block_m == 16
+    assert stage1.keywords["split_k"] == res.metadata.ksplit > 1
+    assert res.metadata.stage2.func.__name__ == "cktile_moe_stage2"
+    assert not res.logs or "CK-Tile" not in res.logs[-1][1]
     dw = _a4w4_problem(token=4096, doweight=True, is_shuffled=True)
     res = _a4w4_resolve(monkeypatch, dw)
     assert res.plan.structure()[0][2] == "ck.gemm1"
     assert res.metadata.stage1.func.__name__ == "ck_moe_stage1"
+
+
+def test_a4w4_situv2_and_swiglu_defaults_follow_the_legacy_branches(monkeypatch):
+    from aiter.moev2.dispatch import overrides
+
+    situv2 = functools.partial(_a4w4_problem, activation=ActivationType.Situv2)
+    res = _a4w4_resolve(monkeypatch, situv2(is_shuffled=True))
+    assert res.plan.structure()[0] == (
+        "sort.aux", "quant.a1", "mxmoe.gemm1", "mxmoe.gemm2"
+    )  # fmt: skip
+    assert (res.metadata.block_m, res.metadata.ksplit) == (64, 0)
+    assert res.metadata.stage1.keywords["kernelName1"] == (
+        "flydsl_mxmoe_g1_a4w4_64x256x256_situv2"
+    )
+    assert "using heuristic MXMOE fallback" in res.logs[-1][1]
+    # Bias rules the MXMOE fallback out: the FlyDSL heuristic, which ignores it.
+    res = _a4w4_resolve(monkeypatch, situv2(is_shuffled=True, has_stage1_bias=True))
+    assert res.plan.structure()[0][2] == "flydsl.gemm1"
+    assert not (res.metadata.has_bias or res.metadata.stage2_has_bias)
+    res = _a4w4_resolve(monkeypatch, situv2(is_shuffled=False))
+    assert "CK-Tile split-K MXFP4 or CK 2-stage SiTUv2 is not ported" in res.declined
+    # The legacy MXMOE fallback needs `cfg is None`: a bypassed tuned row skips it.
+    monkeypatch.setattr(overrides, "bypass_tuned", lambda: 1)
+    row = {"block_m": 32, "ksplit": 0, "run_1stage": 0}
+    row.update(
+        kernelName1="flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2",
+        kernelName2="flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2",
+    )
+    res = _a4w4_resolve(monkeypatch, situv2(is_shuffled=True), row)
+    assert res.plan is None and "a tuned row is bypassed" in res.declined
+
+    swiglu = functools.partial(_a4w4_problem, activation=ActivationType.Swiglu)
+    res = _a4w4_resolve(monkeypatch, swiglu(is_shuffled=True))
+    assert res.plan.structure()[0][2] == "flydsl.gemm1"
+    # The legacy `enable_bias`: on for Swiglu with a 16-bit output, bias or not.
+    assert res.metadata.has_bias and res.metadata.stage2_has_bias
+    # Unshuffled: CK-Tile with a split-K of 2 or more, the key's bias, no layout option.
+    res = _a4w4_resolve(
+        monkeypatch,
+        swiglu(is_shuffled=False, has_stage1_bias=True, has_stage2_bias=True),
+    )
+    assert res.plan.structure()[0][2] == "cktile.gemm1"
+    stage1 = res.metadata.stage1
+    assert stage1.keywords["split_k"] == res.metadata.ksplit >= 2
+    assert "post_activation_layout" not in stage1.keywords
+    assert res.metadata.has_bias and res.metadata.stage2_has_bias
+    assert "routing to CK-Tile (ROCM-25478)" in res.logs[-1][1]
+
+
+def test_a4w4_tuned_cktile_stage2_rows(monkeypatch):
+    swiglu = functools.partial(
+        _a4w4_problem, activation=ActivationType.Swiglu, is_shuffled=True
+    )
+    row = {"block_m": 32, "ksplit": 0, "run_1stage": 0}
+    row.update(
+        kernelName1="flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2",
+        kernelName2="cktile_moe2_bm32",
+    )
+    res = _a4w4_resolve(monkeypatch, swiglu(), row)
+    assert res.plan.structure()[0][-1] == "cktile.gemm2"
+    assert res.metadata.stage2.func.__name__ == "cktile_moe_stage2"
+    # The legacy tuned FlyDSL branch: `enable_bias` on both stages.
+    assert res.metadata.has_bias and res.metadata.stage2_has_bias
+    # CK-Tile's MXFP4 stage 2 is unsafe when inter_dim % 256: the row is discarded.
+    res = _a4w4_resolve(monkeypatch, swiglu(shape=(7168, 384, 256, 8)), row)
+    assert any(
+        "discarding unsafe CK-Tile MXFP4 stage2 config for inter_dim=384" in m
+        for _, m in res.logs
+    )
+    assert res.plan.structure()[0][-1] == "flydsl.gemm2"
+    # Legacy builds the alias as a CK stage 2 name in its tuned branches.
+    row["kernelName2"] = "swiglu_mxfp4_bf16_cktile"
+    assert _a4w4_resolve(monkeypatch, swiglu(), row).plan is None
+
+
+_ALIAS = "swiglu_mxfp4_bf16_cktile"
+
+
+def test_a16w4_cktile_alias_rows(monkeypatch):
+    swiglu = functools.partial(
+        _a16w4_problem,
+        activation=ActivationType.Swiglu,
+        token=1,
+        shape=(3072, 512, 128, 4),
+    )
+    row = {"block_m": 64, "ksplit": 4, "run_1stage": 0}
+    row.update(kernelName1=_ALIAS, kernelName2=_ALIAS)
+    # Legacy reads the alias as "a tuned row exists" and runs its CK-Tile branches with
+    # the row's ksplit.
+    res = _a16w4_resolve(monkeypatch, swiglu(), row)
+    assert " | ".join(res.plan.structure()[0]) == (
+        "sort | quant.a1 | cktile.gemm1 | quant.inter | cktile.gemm2"
+    )
+    stage1 = res.metadata.stage1
+    assert stage1.func.__name__ == "cktile_moe_stage1"
+    assert stage1.keywords["split_k"] == res.metadata.ksplit == 4
+    assert stage1.keywords["post_activation_layout"] == "standard"
+    # Not preshuffled, legacy builds ASM stage 1 with a CK stage 2 named after the alias.
+    res = _a16w4_resolve(monkeypatch, swiglu(is_shuffled=False), row)
+    assert "alias tuned row outside the CK-Tile branches" in res.declined
+    row["kernelName1"] = "flydsl_moe1_abf16_wfp4_bf16_t16x128x256_w2"
+    res = _a16w4_resolve(monkeypatch, swiglu(), row)
+    assert res.plan is None
+
+
+def test_a16w4_defaults(monkeypatch):
+    # SiTUv2: the FlyDSL a16w4 heuristic.
+    res = _a16w4_resolve(monkeypatch, _a16w4_problem())
+    assert res.plan.structure()[0][2] == "flydsl.gemm1"
+    assert "abf16_wfp4" in res.metadata.stage1.keywords["kernelName"]
+    # Swiglu: CK-Tile, unless its stage 2 is unsafe (inter_dim % 256) and FlyDSL takes
+    # the shape; gate and up interleaved, the CK-Tile gate-up kernel.
+    swiglu = functools.partial(_a16w4_problem, activation=ActivationType.Swiglu)
+    res = _a16w4_resolve(monkeypatch, swiglu())
+    assert res.metadata.stage1.func.__name__ == "cktile_moe_stage1"
+    assert res.metadata.stage1.keywords["split_k"] >= 2
+    res = _a16w4_resolve(monkeypatch, swiglu(shape=(4096, 384, 128, 8)))
+    assert res.plan.structure()[0][2] == "flydsl.gemm1"
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    interleaved = swiglu(gate_mode=GateMode.INTERLEAVE, gate_up_interleave=True)
+    res = _a16w4_resolve(monkeypatch, interleaved)
+    assert res.metadata.stage1.func.__name__ == "cktile_moe_stage1"
+    assert res.metadata.stage1.keywords["split_k"] == 1
+    # Relu2 with a gate-only w1: CK-Tile on gfx950, legacy CK on gfx942.
+    relu2 = functools.partial(
+        _a16w4_problem, activation=ActivationType.Relu2, g1u1=False
+    )
+    res = _a16w4_resolve(monkeypatch, relu2())
+    assert res.metadata.stage1.func.__name__ == "cktile_moe_stage1"
+    assert res.metadata.stage1.keywords["split_k"] == 1
+    res = _a16w4_resolve(monkeypatch, relu2(arch="gfx942"))
+    assert "CK 2-stage a16w4 is not ported" in res.declined
+
+
+def test_a8w4_defaults_and_tuned_rows(monkeypatch):
+    from aiter.moev2.migration import a8w4
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    def resolve(problem, row=None):
+        monkeypatch.setattr(tuned, "lookup", lambda p: row)
+        return resolver.resolve(problem, a8w4.SEGMENTS)
+
+    # Gate and up interleaved: the FlyDSL heuristic with fp8 names (Silu, SiTUv2) and
+    # the CK-Tile gate-up kernel (Swiglu); separated, CK and CK-Tile.
+    interleaved = {"gate_mode": GateMode.INTERLEAVE, "gate_up_interleave": True}
+    for activation in (ActivationType.Silu, ActivationType.Situv2):
+        res = resolve(_a8w4_problem(activation, **interleaved))
+        assert res.plan.structure()[0][2] == "flydsl.gemm1"
+        kn1 = res.metadata.stage1.keywords["kernelName"]
+        assert kn1.startswith("flydsl_moe1_afp8_wfp4") and kn1.endswith("_gui")
+    res = resolve(_a8w4_problem(ActivationType.Swiglu, **interleaved))
+    assert res.metadata.stage1.func.__name__ == "cktile_moe_stage1"
+    assert res.metadata.stage1.keywords["split_k"] == 1 and res.metadata.block_m == 32
+    res = resolve(_a8w4_problem())
+    assert res.plan.structure()[0][2] == "ck.gemm1"
+    res = resolve(_a8w4_problem(ActivationType.Swiglu))
+    assert res.metadata.stage1.func.__name__ == "cktile_moe_stage1"
+    # Tuned FlyDSL rows: a stage 1 quantizing to fp8, a layout GEMM2.
+    row = {
+        "kernelName1": "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8",
+        "kernelName2": "flydsl_moe2_afp8_wfp4_bf16_t32x128x128_atomic_bnt2",
+        "block_m": 32,
+        "ksplit": 0,
+    }
+    res = resolve(_a8w4_problem(), row)
+    assert res.plan.structure()[0][2] == "flydsl.gemm1_q"
+    assert res.metadata.fuse_quant == "fp8"
+    layout = {
+        **row,
+        "kernelName2": "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x256_reduce_nt_sbm32",
+    }
+    res = resolve(_a8w4_problem(), layout)
+    assert res.plan.structure()[0][-1] == "flydsl_layout.gemm2"
+    assert res.metadata.stage1.keywords["out_dtype"] == "fp8"
+    # Opus rows: the stage 2 launch from the row's sort block_m; legacy discards them for
+    # weights not both preshuffled or with expert_mask.
+    opus = {
+        "kernelName1": "opus_moe1_afp8_wfp4_bf16_t64x384_gs_qgb3_aff32_p2_fp8",
+        "kernelName2": "opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584",
+        "block_m": 64,
+        "ksplit": 0,
+    }
+    res = resolve(_a8w4_problem(), opus)
+    assert res.plan.structure()[0][2:] == ("opus.gemm1", "opus.gemm2")
+    assert res.metadata.stage1.keywords["block_m"] == 64
+    assert res.metadata.stage2.keywords["launch"].sort_block_m == 64
+    assert res.metadata.fuse_quant == "fp8" and not res.metadata.skip_inter_quant
+    for kwargs in ({"opus_weights_shuffled": False}, {"is_ep": True}):
+        res = resolve(_a8w4_problem(**kwargs), opus)
+        assert res.plan.source != "tuned"
+        assert any("Opus" in m for _, m in res.logs), kwargs
+    # A `cktile_*` kernelName1: ASM stage 1 under that name, unless a default MXFP4
+    # branch takes the row (CK-Tile with the row's split-K).
+    asm = {**opus, "kernelName1": "cktile_a8w4_bm64"}
+    res = resolve(_a8w4_problem(), asm)
+    assert res.plan.structure()[0][2] == "asm.stage1_cktile"
+    assert res.metadata.stage1.keywords["kernelName"] == "cktile_a8w4_bm64"
+    assert (
+        "default MXFP4 branch"
+        in resolve(_a8w4_problem(), {**asm, "ksplit": 2}).declined
+    )
+
+
+def test_mxfp8_defaults_and_tuned_rows(monkeypatch):
+    from aiter.moev2.migration import mxfp8
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    def resolve(problem, row=None):
+        monkeypatch.setattr(tuned, "lookup", lambda p: row)
+        return resolver.resolve(problem, mxfp8.SEGMENTS)
+
+    # The FlyDSL heuristic (gate/up interleaved, or w1 tagged as not interleaved) adds
+    # the Swiglu bias with fp8 weights too; gate and up separated otherwise, CK.
+    for layout in (
+        {"gate_mode": GateMode.INTERLEAVE, "gate_up_interleave": True},
+        {"gate_up_interleave": False},
+    ):
+        for activation in (ActivationType.Silu, ActivationType.Swiglu):
+            res = resolve(_mxfp8_problem(activation, **layout))
+            assert res.plan.structure()[0][2] == "flydsl.gemm1", layout
+            kn1 = res.metadata.stage1.keywords["kernelName"]
+            assert kn1.startswith("flydsl_moe1_afp8_wfp8") and kn1.endswith("_gui")
+            swiglu = activation == ActivationType.Swiglu
+            assert res.metadata.has_bias == res.metadata.stage2_has_bias == swiglu
+    for activation in (ActivationType.Silu, ActivationType.Swiglu):
+        res = resolve(_mxfp8_problem(activation))
+        assert res.plan.structure()[0][2:] == ("ck.gemm1", "quant.inter", "ck.gemm2")
+    # Tuned rows (GLM5, MiniMax-M3): a stage 1 quantizing to fp8 into a layout GEMM2 or
+    # a FlyDSL stage 2; the tuned rule adds no Swiglu bias with fp8 weights.
+    row = {
+        "kernelName1": "flydsl_moe1_afp8_wfp8_bf16_t32x64x256_w4_gui_kw2_fp8",
+        "kernelName2": "flydsl_moe2_layout_afp8_wfp8_bf16_t32x128x256_atomic_nt_sbm32",
+        "block_m": 32,
+        "ksplit": 0,
+    }
+    res = resolve(_mxfp8_problem(ActivationType.Swiglu), row)
+    assert res.plan.source == "tuned"
+    assert res.plan.structure()[0][-1] == "flydsl_layout.gemm2"
+    assert res.metadata.stage1.keywords["out_dtype"] == "fp8"
+    assert not res.metadata.has_bias and not res.metadata.stage2_has_bias
+    row = {
+        **row,
+        "kernelName1": "flydsl_moe1_afp8_wfp8_bf16_t32x64x256_w2_gui_fp8",
+        "kernelName2": "flydsl_moe2_afp8_wfp8_bf16_t32x128x128_atomic_bnt2",
+    }
+    res = resolve(_mxfp8_problem(ActivationType.Swiglu), row)
+    assert res.plan.structure()[0][2:] == ("flydsl.gemm1_q", "flydsl.gemm2")
+    assert res.metadata.fuse_quant == "fp8"
+    assert not res.metadata.has_bias and not res.metadata.stage2_has_bias
+
+
+def test_a16wi4_fallback_and_tuned_rows(monkeypatch):
+    from aiter.moev2.migration import a16wi4
+
+    def resolve(problem, row=None):
+        monkeypatch.setattr(tuned, "lookup", lambda p: row)
+        return resolver.resolve(problem, a16wi4.SEGMENTS)
+
+    # The untuned fallback: one tile per token tier, no split-K, a warning.
+    for token, tile_m in ((64, 16), (4096, 32), (16384, 64)):
+        res = resolve(_a16wi4_problem(token=token))
+        assert " | ".join(res.plan.structure()[0]) == (
+            "sort | quant.a1 | flydsl.gemm1 | quant.inter | flydsl.gemm2"
+        )
+        kn1 = res.metadata.stage1.keywords["kernelName"]
+        assert kn1.startswith(f"flydsl_moe1_abf16_wint4_bf16_t{tile_m}x128x128")
+        assert res.metadata.block_m == tile_m and res.metadata.ksplit == 0
+        assert any("untuned a16wi4 fallback" in m for _, m in res.logs)
+    row = {"block_m": 16, "ksplit": 0, "run_1stage": 0}
+    row.update(
+        kernelName1="flydsl_moe1_abf16_wint4_bf16_t16x64x128",
+        kernelName2="flydsl_moe2_abf16_wint4_bf16_t16x128x128_reduce",
+    )
+    res = resolve(_a16wi4_problem(activation=ActivationType.Situv2), row)
+    assert res.metadata.stage2.keywords["kernelName"] == row["kernelName2"]
+    assert not res.metadata.has_bias and not res.metadata.stage2_has_bias
+
+
+def test_mxmoe_bias_flags_follow_the_kernel_names(monkeypatch):
+    p = _a4w4_problem(
+        token=8, shape=_MXMOE_SHAPE, is_shuffled=True, has_stage2_bias=True
+    )
+    res = _a4w4_resolve(monkeypatch, p, _MXMOE_ROW)
+    assert res.plan.structure()[0][2] == "mxmoe.gemm1"
+    assert res.metadata.stage2_has_bias and not res.metadata.has_bias
+
+
+def test_claims_split_mxfp4_weights_by_activation_format(monkeypatch):
+    from aiter.moev2.migration import a4w4, local
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    call = _a4w4_op_call()
+    assert a4w4.claims(call)
+    fp4 = {"quant_dtype_a": dtypes.fp4x2}
+    for change, claimed in (
+        # SiTUv2 defaults to bf16 activations, Swiglu at decode sizes too.
+        ({"activation": ActivationType.Situv2.value}, False),
+        ({"activation": ActivationType.Situv2.value, **fp4}, True),
+        ({"activation": ActivationType.Swiglu.value}, False),
+        ({"activation": ActivationType.Swiglu.value, **fp4}, True),
+        ({"quant_dtype_a": dtypes.fp8}, False),
+        ({"bias1": torch.empty(1), "bias2": torch.empty(1)}, True),
+        ({"hidden_pad": 64, "intermediate_pad": 64}, True),
+        ({"swiglu_limit": 7.0, "beta": 2.0, "linear_beta": 2.0}, True),
+        ({"quant_dtype_a2": dtypes.fp8}, False),
+        ({"gate_mode": GateMode.INTERLEAVE.value}, False),
+        ({"activation": ActivationType.Relu2.value, **fp4}, False),
+    ):
+        assert a4w4.claims({**call, **change}) == claimed, change
 
 
 def test_a4w4_tuned_rows_pick_the_mxmoe_and_layout_v2_segments(monkeypatch):

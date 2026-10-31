@@ -110,6 +110,10 @@ _BUILTIN_MODULES: tuple = (
     "aiter.moev2.migration.a8w8_ptok",
     "aiter.moev2.migration.a8w8_blockscale",
     "aiter.moev2.migration.a4w4",
+    "aiter.moev2.migration.a16w4",
+    "aiter.moev2.migration.a16wi4",
+    "aiter.moev2.migration.a8w4",
+    "aiter.moev2.migration.mxfp8",
 )
 
 _REGISTRY: dict[str, Path] = {}

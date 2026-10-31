@@ -19,7 +19,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 from .. import api, paths
 from ..dispatch import overrides, resolver, tuned
 from ..execute import executor
-from ..policy import quant_remap
+from ..policy import quant_remap, resolve_activation_dtype
 from ..problem import FrozenMap
 from ..segments.mxmoe import _is_mxfp4_inline_sort, _mxfp4_inline_sort_unsupported
 from ..shapes import get_inter_dim, get_padded_M
@@ -30,25 +30,58 @@ _RELOOKUP_DROPS = frozenset({"act_scales", "num_local_tokens", "scatter"})
 _RELOOKUP_DROPS_EXTRAS = frozenset({"disable_inline_sort"})
 
 # `fused_moe_` arguments no local path supports yet.
-_UNSUPPORTED_ARGS = (
-    "quant_dtype_a",
-    "quant_dtype_a2",
-    "ep_source_token_map",
-    "bias1",
-    "bias2",
-    "swiglu_limit",
-    "beta",
-    "linear_beta",
-)
+_UNSUPPORTED_ARGS = ("quant_dtype_a2", "ep_source_token_map")
+_BIAS_ARGS = ("bias1", "bias2")
+_ACT_PARAM_ARGS = ("swiglu_limit", "beta", "linear_beta")
+SILU_GELU = (ActivationType.Silu, ActivationType.Gelu)
+SEPARATED = (GateMode.SEPARATED,)
 
 
-def claims(call, quant_types, archs, weight_dtypes) -> bool:
+def activation_dtype(call):
+    """`q_dtype_a` as `_fused_moe_impl` picks it for the call: `quant_dtype_a`, else the
+    `policy.py` choice."""
+    if call["quant_dtype_a"] is not None:
+        return call["quant_dtype_a"]
+    quant_type = QuantType(call["quant_type"])
+    w1 = call["w1"]
+    return resolve_activation_dtype(
+        quant_remap.get(quant_type, quant_type),
+        w1.dtype,
+        activation=ActivationType(call["activation"]),
+        gate_mode=GateMode(call["gate_mode"]),
+        M=call["topk_ids"].shape[0],
+        hidden_dtype=call["hidden_states"].dtype,
+        has_a1_scale=call["a1_scale"] is not None,
+        gfx=get_gfx_runtime(),
+        gate_up_interleave=getattr(w1, "gate_up_interleave", None),
+    )
+
+
+def claims(
+    call,
+    quant_types,
+    archs,
+    weight_dtypes,
+    *,
+    act_dtypes=None,
+    act_dtype_arg=False,
+    activations=SILU_GELU,
+    gate_modes=SEPARATED,
+    bias=False,
+    act_params=False,
+    pads=False,
+    g1u0=False,
+) -> bool:
     """Cheap checks on the `fused_moe_` arguments; `run` may still decline.
 
-    A quant type in `quant_types` (and the same `quant_type_a`, if given), Silu or Gelu,
-    separated gate/up, no bias, padding or caller-chosen activation dtypes, outside
-    AITER_ONLINE_TUNE, on `archs`, with 3D `w1`/`w2` of one of `weight_dtypes` and `w1`
-    holding gate and up (g1u1).
+    A quant type in `quant_types` (and the same `quant_type_a`, if given), an activation
+    in `activations` and a gate mode in `gate_modes`, no `quant_dtype_a2` or scatter,
+    outside AITER_ONLINE_TUNE, on `archs`, with 3D `w1`/`w2` of one of `weight_dtypes`
+    and, unless `g1u0`, `w1` holding gate and up (g1u1). A caller-chosen
+    `quant_dtype_a`, bias tensors, `swiglu_limit`/`beta`/`linear_beta` and padding only
+    where allowed. With `act_dtypes`, the activation format of the call
+    (`activation_dtype`) must be one of them (paths that share a weight format split it
+    by activation format).
     """
     if overrides.online_tune():
         return False
@@ -58,16 +91,20 @@ def claims(call, quant_types, archs, weight_dtypes) -> bool:
     quant_type_a = call["quant_type_a"]
     if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
         return False
-    if any(call[name] is not None for name in _UNSUPPORTED_ARGS):
+    unsupported = _UNSUPPORTED_ARGS
+    if not act_dtype_arg:
+        unsupported += ("quant_dtype_a",)
+    if not bias:
+        unsupported += _BIAS_ARGS
+    if not act_params:
+        unsupported += _ACT_PARAM_ARGS
+    if any(call[name] is not None for name in unsupported):
         return False
-    if call["hidden_pad"] or call["intermediate_pad"]:
+    if not pads and (call["hidden_pad"] or call["intermediate_pad"]):
         return False
-    if GateMode(call["gate_mode"]) != GateMode.SEPARATED:
+    if GateMode(call["gate_mode"]) not in gate_modes:
         return False
-    if ActivationType(call["activation"]) not in (
-        ActivationType.Silu,
-        ActivationType.Gelu,
-    ):
+    if ActivationType(call["activation"]) not in activations:
         return False
     if get_gfx() not in archs or get_gfx_runtime() not in archs:
         return False
@@ -79,25 +116,42 @@ def claims(call, quant_types, archs, weight_dtypes) -> bool:
         or w2.dim() != 3
     ):
         return False
-    # g1u0 stays on legacy: CK stage 1 always reads w1 as gate and up, and the 1-stage
-    # ASM `fmoe` that legacy runs for some g1u0 keys is not ported.
+    # g1u0 stays on legacy unless the path runs it: CK stage 1 always reads w1 as gate
+    # and up, and the 1-stage ASM `fmoe` that legacy runs for some g1u0 keys is not
+    # ported.
     _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if w1.shape[1] != 2 * inter_dim:
+    if not g1u0 and w1.shape[1] != 2 * inter_dim:
         return False
     hidden_states = call["hidden_states"]
     dtype = hidden_states.dtype if call["dtype"] is None else call["dtype"]
-    return dtype in (dtypes.bf16, dtypes.fp16) and call["topk_ids"].dim() == 2
+    if dtype not in (dtypes.bf16, dtypes.fp16) or call["topk_ids"].dim() != 2:
+        return False
+    return act_dtypes is None or activation_dtype(call) in act_dtypes
 
 
-def key_args_supported(problem) -> bool:
-    """False for keys with arguments or a layout no local path supports yet (see `claims`)."""
+def key_args_supported(
+    problem,
+    *,
+    activations=("silu", "gelu"),
+    gate_modes=SEPARATED,
+    act_params=False,
+    g1u0=False,
+) -> bool:
+    """False for keys with arguments or a layout the path does not support (see
+    `claims`; bias and padding are left to the segments' `Cap`s)."""
     activation = problem.activation
     return (
-        problem.layout.g1u1
-        and activation.kind in ("silu", "gelu")
-        and activation.swiglu_limit is None
+        (g1u0 or problem.layout.g1u1)
+        and activation.kind in activations
+        and problem.gate_mode in gate_modes
         and problem.inter is None
-        and (activation.situ_beta, activation.situ_linear_beta) == (1.0, 1.0)
+        and (
+            act_params
+            or (
+                activation.swiglu_limit is None
+                and (activation.situ_beta, activation.situ_linear_beta) == (1.0, 1.0)
+            )
+        )
     )
 
 
@@ -143,6 +197,9 @@ class LocalDispatch:
     def run(self, call):
         c = executor.prologue(call, quant_remap)
         args, kwargs, q_dtype_a = api.dispatch_key(c)
+        if executor.a16w4_unsupported(c, q_dtype_a) is not None:
+            # Legacy raises NotImplementedError before its dispatch.
+            return paths.DECLINED
         dispatched = self.dispatch(
             args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num()
         )

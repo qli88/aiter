@@ -19,7 +19,7 @@ from aiter import logger
 
 from ..execute.metadata import MOEMetadata
 from ..segments.asm import stage2_block_m
-from ..segments.base import Params
+from ..segments.base import NO_OPTIONS, Params
 from ..segments.defaults import (
     BLOCK_SIZE_M,
     default_block_m,
@@ -156,7 +156,10 @@ def _two_stage_plan(
     ksplit,
     nt,
     run_1stage,
+    options,
+    row,
 ):
+    """`row`: the tuned row the plan runs, None for a default."""
     gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
     is_asm = kernel_names.ASM in gemm1.prefixes
     if is_asm:
@@ -165,17 +168,20 @@ def _two_stage_plan(
     for segment in structure:
         if segment.covers[0] == Op.GEMM1:
             params = Params(
-                kernel=kernelName1, kernel2=kernelName2, ksplit=ksplit, nt=nt
+                options, kernel=kernelName1, kernel2=kernelName2, ksplit=ksplit, nt=nt
             )
         elif segment.covers[0] == Op.GEMM2:
-            params = Params(kernel=kernelName2, nt=nt)
+            params = Params(kernel=kernelName2, kernel1=kernelName1, nt=nt)
         else:
             params = Params()
+        if row is not None:
+            params = params.replace(**segment.row_params(problem, row))
         choices.append(SegmentChoice(segment, params))
     fields = {}
     for choice in choices:
         fields.update(choice.segment.metadata_fields(problem, choice.params))
     block_m = fields.pop("block_m", block_m)
+    ksplit = fields.pop("ksplit", ksplit)
     plan = MoePlan(
         tuple(choices),
         source,
@@ -283,7 +289,7 @@ def resolve(problem, segments) -> Resolution:
     s = problem.shape
     q_type = problem.quant_type
     if cfg is None or bypass_tuned_config:
-        best = ranking.best(problem, ranking.rankable(plans))
+        best = ranking.best(problem, ranking.rankable(plans), tuned_row=cfg is not None)
         if best is None:
             return declined("no default ranking entry applies")
         region, structure, legacy = best
@@ -343,10 +349,13 @@ def resolve(problem, segments) -> Resolution:
         )
     )
     default = gemm1.default_kernels(problem) if source != "tuned" else None
+    options = NO_OPTIONS
     if default is not None:
         kernelName1, kernelName2 = default.kernel1, default.kernel2
         block_m, ksplit = default.block_m, default.ksplit
-        logs.append((WARNING, default.warning))
+        options = default.options
+        if default.warning is not None:
+            logs.append((WARNING, default.warning))
     plan, metadata = _two_stage_plan(
         problem,
         structure,
@@ -357,6 +366,8 @@ def resolve(problem, segments) -> Resolution:
         ksplit,
         use_non_temporal_load,
         run_1stage,
+        options,
+        cfg if source == "tuned" else None,
     )
     note(f"selected {plan.describe()}")
     return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))

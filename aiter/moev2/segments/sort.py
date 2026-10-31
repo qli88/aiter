@@ -364,6 +364,7 @@ def _moe_sorting_impl(
     num_local_tokens,
     dispatch_policy,
     use_opus,
+    return_local_topk_ids=False,
     accumulate=True,
     output_aux=False,
     output=None,
@@ -407,6 +408,11 @@ def _moe_sorting_impl(
         output,
         output_aux,
     )
+    local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
+    if return_local_topk_ids:
+        # CK sorting does not emit local ids; use Opus so callers do not need a slow
+        # Python-side remap or a hard failure when local expert ids are required.
+        use_opus = True
     aux = (None, None)
     if output_aux:
         use_opus = True
@@ -436,7 +442,7 @@ def _moe_sorting_impl(
             num_local_tokens,
             workspace,
             dispatch_policy,
-            None,
+            local_topk_ids,
             *aux,
         )
     else:
@@ -451,7 +457,9 @@ def _moe_sorting_impl(
             dispatch_policy,
         )
     if output_aux:
-        return (*ret, *aux)
+        ret = (*ret, *aux)
+    if return_local_topk_ids:
+        return (*ret, local_topk_ids)
     return ret
 
 
@@ -465,15 +473,18 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
+    return_local_topk_ids=False,
     accumulate=True,
     output_aux=False,
     output=None,
 ):
     """`(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)`, then
-    `m_indices` and `reverse_sorted` with `output_aux`."""
+    `m_indices` and `reverse_sorted` with `output_aux`, then the local topk ids with
+    `return_local_topk_ids`."""
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
+        and not return_local_topk_ids
         and not output_aux
         and dispatch_policy == 0
     ):
@@ -501,6 +512,7 @@ def moe_sorting(
             num_local_tokens,
             dispatch_policy,
             use_opus=not _USE_CK_MOE_SORTING,
+            return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
             output_aux=output_aux,
             output=output,
@@ -524,8 +536,16 @@ class Sort(Segment):
     capabilities = (
         Cap(
             features=frozenset(
-                {"ep_mask", "num_local_tokens", "doweight_stage1", "act_scales"}
+                {
+                    "ep_mask",
+                    "num_local_tokens",
+                    "doweight_stage1",
+                    "act_scales",
+                    "bias1",
+                    "bias2",
+                }
             ),
+            pads=True,
             extras=frozenset({"disable_inline_sort"}),
         ),
     )
@@ -549,7 +569,9 @@ class Sort(Segment):
         dispatch_policy,
         output,
         accumulate=True,
+        return_local_topk_ids=False,
     ):
+        kwargs = {"return_local_topk_ids": True} if return_local_topk_ids else {}
         return hooks.sort_impl(moe_sorting)(
             topk_ids,
             topk_weights,
@@ -562,6 +584,7 @@ class Sort(Segment):
             dispatch_policy,
             accumulate=accumulate,
             output=output,
+            **kwargs,
         )
 
 
@@ -586,7 +609,9 @@ class SortAux(Sort):
         output_aux,
         accumulate,
         output,
+        return_local_topk_ids=False,
     ):
+        kwargs = {"return_local_topk_ids": True} if return_local_topk_ids else {}
         return hooks.sort_impl(moe_sorting)(
             topk_ids,
             topk_weights,
@@ -599,4 +624,5 @@ class SortAux(Sort):
             accumulate=accumulate,
             output_aux=output_aux,
             output=output,
+            **kwargs,
         )

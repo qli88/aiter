@@ -104,15 +104,20 @@ class RowRejection:
     warning: str | None
 
 
+NO_OPTIONS = FrozenMap()
+
+
 @dataclass(frozen=True)
 class DefaultKernels:
-    """The kernels a segment picks when no tuned row applies, and the warning logged."""
+    """The kernels a segment picks when no tuned row applies, and the warning logged
+    (None: none). `options`: extra stage 1 parameters (`Params`) of the choice."""
 
     kernel1: str
     kernel2: str
     block_m: int
     ksplit: int
-    warning: str
+    warning: str | None
+    options: FrozenMap = NO_OPTIONS
 
 
 class Segment:
@@ -187,6 +192,10 @@ class Segment:
     def stage2_kernel(self, p: MoeProblem, kernel_name1, kernel_name2) -> str:
         """For a stage 2: the kernel name it runs for these tuned names."""
         return kernel_name2
+
+    def row_params(self, p: MoeProblem, row) -> dict:
+        """Parameters tuned `row` gives this segment beyond the kernel names."""
+        return {}
 
     def metadata_fields(self, p: MoeProblem, params: Params) -> dict:
         """`MOEMetadata` fields this segment sets (`block_m` replaces the plan's)."""

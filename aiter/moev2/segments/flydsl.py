@@ -13,7 +13,7 @@ from collections.abc import Callable
 import torch
 
 import aiter
-from aiter import ActivationType, dtypes
+from aiter import ActivationType, QuantType, dtypes
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES, fhmoe_reduce_output_nbytes
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
@@ -582,3 +582,38 @@ def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=
     return (
         q_dtype_a in (dtypes.bf16, dtypes.fp4x2) and gate_mode == GateMode.SEPARATED
     ) or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
+
+
+def _needs_swiglu_bias_support(dtype, quant_type):
+    return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
+
+
+def _can_reroute_mxfp4_to_flydsl(
+    *,
+    model_dim,
+    inter_dim,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    activation,
+    is_shuffled,
+    use_g1u1,
+    doweight_stage1,
+    gate_mode,
+    gate_up_interleave=None,
+):
+    """Whether the heuristic FlyDSL path accepts this MXFP4 shape and layout."""
+    return (
+        dtype == dtypes.bf16
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and activation == ActivationType.Swiglu
+        and inter_dim % 128 == 0
+        and model_dim % 256 == 0
+        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave)
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+    )

@@ -54,14 +54,14 @@ def main(argv=None):
     from moe_dispatch import snapshot
 
     snapshot._setup()
-    from aiter.moev2.dispatch import ranking
+    from aiter.moev2.dispatch import ranking, ranking_table
     from moe_dispatch import arch_sim
     from moe_dispatch.differential import captured_logs
 
     served = ranked_paths()
     segments = [s for p in served for s in p.segments]
-    errors = ranking.check_table(ranking.RANKING, segments)
-    print(f"static: {len(ranking.RANKING)} entries, {len(errors)} problems")
+    errors = ranking.check_table(ranking_table.RANKING, segments)
+    print(f"static: {len(ranking_table.RANKING)} entries, {len(errors)} problems")
     hits = Counter()
     for arch in args.arch or list(arch_sim.ARCHS):
         with arch_sim.simulated_arch(arch), captured_logs():
