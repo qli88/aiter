@@ -5,13 +5,14 @@
 A local path supplies its segments and `takes(problem)`, the problems it runs (its
 segments may accept more: a CK segment serves several quant formats, each in its own
 path). `LocalDispatch` resolves each legacy dispatch key once, as the cached legacy
-`get_2stage_cfgs` does, and runs the plan with `executor.run_two_stage`.
+`get_2stage_cfgs` does, and runs the plan with `executor.run_two_stage` (`run_mxfp4` for
+MXFP4 weights).
 """
 
 import functools
 from dataclasses import replace
 
-from aiter import ActivationType, QuantType, dtypes
+from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -19,11 +20,14 @@ from .. import api, paths
 from ..dispatch import overrides, resolver, tuned
 from ..execute import executor
 from ..policy import quant_remap
+from ..problem import FrozenMap
+from ..segments.mxmoe import _is_mxfp4_inline_sort, _mxfp4_inline_sort_unsupported
 from ..shapes import get_inter_dim, get_padded_M
 
 # fused_moe_2stages looks the key up again without these, after sorting, for its log
 # lines only.
 _RELOOKUP_DROPS = frozenset({"act_scales", "num_local_tokens", "scatter"})
+_RELOOKUP_DROPS_EXTRAS = frozenset({"disable_inline_sort"})
 
 # `fused_moe_` arguments no local path supports yet.
 _UNSUPPORTED_ARGS = (
@@ -90,6 +94,7 @@ def key_args_supported(problem) -> bool:
     activation = problem.activation
     return (
         problem.layout.g1u1
+        and activation.kind in ("silu", "gelu")
         and activation.swiglu_limit is None
         and problem.inter is None
         and (activation.situ_beta, activation.situ_linear_beta) == (1.0, 1.0)
@@ -113,7 +118,12 @@ class LocalDispatch:
         """The second lookup, keyed on the `hidden_states` rows rather than `topk_ids`."""
         shape = replace(problem.shape, m=token)
         problem = problem.with_features(remove=_RELOOKUP_DROPS)
-        return self.resolve(replace(problem, inter=None, shape=shape), True)
+        extras = FrozenMap(
+            {k: v for k, v in problem.extras.items() if k not in _RELOOKUP_DROPS_EXTRAS}
+        )
+        return self.resolve(
+            replace(problem, inter=None, shape=shape, extras=extras), True
+        )
 
     def _dispatch(self, args, kwargs_items, arch, cu_num):
         """`(resolution, problem)` for a key, or None when not taken or declined.
@@ -138,14 +148,62 @@ class LocalDispatch:
         )
         if dispatched is None:
             return paths.DECLINED
+        if c.quant_type == QuantType.per_1x32:
+            dispatched = self._inline_sort_fallback(c, args, kwargs, dispatched)
+            if dispatched is None:
+                return paths.DECLINED
         resolution, problem = dispatched
         after_sort = None
         if problem is not None:
             token = get_padded_M(c["hidden_states"].shape[0])
             after_sort = functools.partial(self.relookup, problem, token)
-        return executor.run_two_stage(
+        run = (
+            executor.run_mxfp4
+            if c.quant_type == QuantType.per_1x32
+            else executor.run_two_stage
+        )
+        return run(
             c, resolution.metadata, resolution.plan, q_dtype_a, after_sort=after_sort
         )
+
+    def _inline_sort_fallback(self, c, args, kwargs, dispatched):
+        """`_fused_moe_impl`: a tuned inline-sort row this call cannot run is discarded,
+        and the key resolved again without inline-sort rows. None: that key declines."""
+        metadata = dispatched[0].metadata
+        if not _is_mxfp4_inline_sort(metadata):
+            return dispatched
+        reason = _mxfp4_inline_sort_unsupported(
+            metadata,
+            c["hidden_states"],
+            c["w1"],
+            c["w2"],
+            c["w1_scale"],
+            c["w2_scale"],
+            c["topk_ids"],
+            gate_mode=c.gate_mode,
+            num_local_tokens=c["num_local_tokens"],
+            expert_mask=c["expert_mask"],
+            bias1=c["bias1"],
+            bias2=c["bias2"],
+            a1_scale=c["a1_scale"],
+            a2_scale=c["a2_scale"],
+            stage2_scatter=None,
+            block_size_M=c.block_size_M,
+            hidden_pad=c["hidden_pad"],
+            intermediate_pad=c["intermediate_pad"],
+        )
+        if not reason:
+            return dispatched
+        kwargs = {**kwargs, "_disable_inline_sort": True}
+        fallback = self.dispatch(
+            args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num()
+        )
+        if fallback is not None:
+            logger.warning(
+                f"[fused_moe] inline-sort config is unsupported ({reason}); "
+                "using default heuristics"
+            )
+        return fallback
 
     def dispatch_record(self, args, kwargs):
         """The v2 `MOEMetadata` for a legacy key (logs emitted), or None if not taken."""

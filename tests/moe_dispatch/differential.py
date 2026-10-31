@@ -61,11 +61,15 @@ def _legacy_logs(key):
     return logs
 
 
-def one_stage_decline(path, key):
-    """The reason `path` hands `key` back to legacy as a 1-stage key, else None.
+# The stage-1 function of the legacy 2-stage branches a ranking region hands back.
+_LEGACY_2STAGE = {"CK-Tile split-K MXFP4": "fused_moe.cktile_moe_stage1"}
 
-    A ranking region marked legacy and a 1-stage tuned row both stand for the legacy
-    1-stage branch.
+
+def legacy_decline(path, key):
+    """`(reason, stage-1 function)` when `path` hands `key` back to a named legacy
+    branch, else None; the function is None for a 1-stage branch.
+
+    A 1-stage tuned row and a ranking region marked `legacy=` name the branch.
     """
     from aiter.moev2 import api
     from aiter.moev2.dispatch import resolver
@@ -79,18 +83,21 @@ def one_stage_decline(path, key):
     if not path.takes(problem):
         return None
     reason = resolver.resolve(problem, path.segments).declined or ""
-    if reason == "1-stage tuned row" or (
-        reason.startswith("ranking ") and reason.endswith(" is not ported")
-    ):
-        return reason
+    if reason == "1-stage tuned row":
+        return reason, None
+    if reason.startswith("ranking ") and reason.endswith(" is not ported"):
+        legacy = reason.split(": ", 1)[1].removesuffix(" is not ported")
+        return reason, _LEGACY_2STAGE.get(legacy)
     return None
 
 
 def compare(arch, check_logs=True):
-    """`(claimed {label: path name}, one_stage {label: path name}, problems [str])`.
+    """`(claimed, one_stage, two_stage, problems)`: `{label: path name}` three times and
+    a list of strings.
 
     `one_stage`: keys a path hands back as legacy 1-stage keys, which must be 1-stage
-    in the legacy record.
+    in the legacy record. `two_stage`: keys a ranking region hands back to a named legacy
+    2-stage branch, whose stage 1 the legacy record must run.
     """
     from aiter.moev2 import paths
     from aiter.moev2.dispatch import tuned
@@ -98,7 +105,7 @@ def compare(arch, check_logs=True):
 
     golden = snapshot.read(arch)
     checkers = [p for p in paths.registered().values() if p.dispatch_record is not None]
-    claimed, one_stage, problems = {}, {}, []
+    claimed, one_stage, two_stage, problems = {}, {}, {}, []
     with arch_sim.simulated_arch(arch) as (gfx, cu_num):
         keys = snapshot.dispatch_keys(gfx, cu_num)
         # Load the tuned table once up front so no key's logs include the load warnings.
@@ -118,15 +125,27 @@ def compare(arch, check_logs=True):
                         plan = record.error_record(exc)
                 if plan is None:
                     with captured_logs():
-                        reason = one_stage_decline(path, key)
-                    if reason is not None:
+                        handed_back = legacy_decline(path, key)
+                    if handed_back is None:
+                        continue
+                    reason, stage1 = handed_back
+                    expected = snapshot.resolve_same_as_base(golden, label)
+                    if stage1 is None:
                         one_stage[label] = path.name
-                        expected = snapshot.resolve_same_as_base(golden, label)
                         if not expected.get("run_1stage"):
                             problems.append(
                                 f"{label} [{path.name}] declined ({reason}) but legacy "
                                 f"runs it 2-stage: {json.dumps(expected, sort_keys=True)}"
                             )
+                        continue
+                    two_stage[label] = path.name
+                    got = expected.get("stage1")
+                    got = got.get("fn") if isinstance(got, dict) else got
+                    if expected.get("run_1stage") or got != stage1:
+                        problems.append(
+                            f"{label} [{path.name}] declined ({reason}) but legacy "
+                            f"does not run {stage1}: {json.dumps(expected, sort_keys=True)}"
+                        )
                     continue
                 if check_logs:
                     legacy_logs = _legacy_logs(key)
@@ -150,7 +169,7 @@ def compare(arch, check_logs=True):
                         f"    legacy: {json.dumps(expected, sort_keys=True)}\n"
                         f"    v2:     {json.dumps(got, sort_keys=True)}"
                     )
-    return claimed, one_stage, problems
+    return claimed, one_stage, two_stage, problems
 
 
 def main(argv=None):
@@ -170,7 +189,9 @@ def main(argv=None):
 
     failed = False
     for arch in args.arch or list(arch_sim.ARCHS):
-        claimed, one_stage, problems = compare(arch, check_logs=not args.no_logs)
+        claimed, one_stage, two_stage, problems = compare(
+            arch, check_logs=not args.no_logs
+        )
 
         def summary(by_label):
             counts = Counter(by_label.values())
@@ -179,6 +200,7 @@ def main(argv=None):
         print(
             f"{arch}: {len(claimed)} keys claimed by v2 ({summary(claimed)}), "
             f"{len(one_stage)} handed back as legacy 1-stage ({summary(one_stage)}), "
+            f"{len(two_stage)} as a legacy 2-stage branch ({summary(two_stage)}), "
             f"{len(problems)} problems"
         )
         for line in problems[:40]:
@@ -211,15 +233,40 @@ def _bits(t):
     return t.view(torch.uint8) if t.element_size() == 1 else t
 
 
+def _sorted_scale_defined(sorted_ids, token_num, groups, padded_groups):
+    """Flat indices of the bytes the sorted MX quant kernels write in their swizzled
+    e8m0 scale (`mx_scale_shuffle_idx` in csrc/include/mx_quant_utils.h): the rows of
+    routed tokens (not block padding), the `groups` columns (not the pad to 8)."""
+    import torch
+
+    rows = ((sorted_ids & 0xFFFFFF) < token_num).nonzero().flatten()
+    x = rows[:, None]
+    y = torch.arange(groups, device=rows.device)[None, :]
+    idx = (
+        (x // 32 * padded_groups) * 32
+        + (y // 8) * 256
+        + (y % 4) * 64
+        + (x % 16) * 4
+        + (y % 8) // 4 * 2
+        + (x % 32) // 16
+    )
+    return idx.flatten()
+
+
 def compare_launches(legacy, v2, call, out_legacy, out_v2):
     """`{(stage, argument): problem}` between two `kernel_bench_callable` recordings.
 
     Same stages, same functions, equal non-tensor arguments, and bitwise-equal tensors
     over what the kernels define: the sort buffers up to `num_valid_ids` (the rest is
-    `torch.empty`), `[token, topk, inter]` buffers at the routed slots that are local
-    (stage 1 skips the others), and nothing for the output buffer.
+    `torch.empty`), MX scales in sorted order at the routed rows and the `K / 32` groups
+    (`_sorted_scale_defined`), other buffers in sorted order at the routed rows (stage 1
+    skips block padding), `[token, topk, inter]` buffers at the routed slots that are
+    local (stage 1 skips the others), and nothing for the output buffer.
     """
     import torch
+
+    from aiter import dtypes
+    from aiter.moev2.shapes import get_inter_dim
 
     if [n for n, _ in legacy] != [n for n, _ in v2]:
         return {
@@ -237,10 +284,15 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
     for a, b, role in zip(stage1.args[3:5], v2_stage1.args[3:5], ("ids", "blocks")):
         roles[a.data_ptr()], roles[b.data_ptr()] = role, role
     for _, launch in legacy + v2:
-        if launch.keywords.get("sorted_weights") is not None:
-            roles[launch.keywords["sorted_weights"].data_ptr()] = "ids"
+        for name in ("sorted_weights", "m_indices"):
+            if launch.keywords.get(name) is not None:
+                roles[launch.keywords[name].data_ptr()] = "ids"
     topk_ids, expert_mask = call["topk_ids"], call.get("expert_mask")
     slots = None if expert_mask is None else expert_mask[topk_ids.long()].bool()
+    sorted_ids = stage1.args[3]
+    routed_rows = (sorted_ids[:num_valid] & 0xFFFFFF) < topk_ids.shape[0]
+    model_dim = call["hidden_states"].shape[-1]
+    _, _, inter_dim = get_inter_dim(call["w1"].shape, call["w2"].shape)
     skip = {out_legacy.data_ptr(), out_v2.data_ptr()}
     problems = {}
     for (name, a), (_, b) in zip(legacy, v2):
@@ -265,7 +317,19 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
                 )
                 continue
             role = roles.get(x.data_ptr())
-            if role == "ids":
+            rows = x.shape[0] if x.dim() == 2 else 0
+            scale = x.element_size() == 1 and (
+                x.dtype == dtypes.fp8_e8m0 or where in ("a1_scale", "a2_scale")
+            )
+            if scale and rows >= len(sorted_ids) and rows % 32 == 0:
+                groups = (model_dim if name == "stage1" else inter_dim) // 32
+                defined = _sorted_scale_defined(
+                    sorted_ids[:num_valid], topk_ids.shape[0], groups, -groups // 8 * -8
+                )
+                x, y = (_bits(t).reshape(-1)[defined] for t in (x, y))
+            elif role is None and rows == len(sorted_ids):
+                x, y = (_bits(t)[:num_valid][routed_rows] for t in (x, y))
+            elif role == "ids":
                 x, y = x[:num_valid], y[:num_valid]
             elif role == "blocks":
                 x, y = x[: num_valid // block_m], y[: num_valid // block_m]

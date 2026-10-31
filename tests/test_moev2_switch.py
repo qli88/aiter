@@ -175,6 +175,25 @@ def test_op_entry_path_records_into_the_legacy_kernel_bench(monkeypatch):
     assert bench == [("stage1", run)]
 
 
+def test_op_entry_path_sees_the_legacy_fused_decode_sort_quant_switch(monkeypatch):
+    import torch
+
+    from aiter.moev2 import hooks
+
+    seen = []
+
+    def run(call):
+        seen.append(hooks.fused_decode_sort_quant_disabled())
+        return torch.zeros(2, 8, dtype=torch.bfloat16)
+
+    paths.register(paths.Path("a4w4", lambda call: True, run, entry="op"))
+    _set(monkeypatch, "a4w4")
+    monkeypatch.setattr(legacy, "_fused_decode_sort_quant_disabled", True)
+    legacy.fused_moe(*_cpu_moe_args())
+    assert seen == [True]
+    assert not hooks.fused_decode_sort_quant_disabled()
+
+
 def test_torch_compile_traces_the_hooks_with_a_path_active(monkeypatch):
     import torch
 
@@ -209,9 +228,9 @@ def test_unknown_entry_is_an_error():
 
 
 def test_builtin_paths():
-    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
+    from aiter.moev2.migration import a4w4, a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
 
-    modules = (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale)
+    modules = (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale, a4w4)
     assert paths._BUILTIN_MODULES == tuple(m.__name__ for m in modules)
     for module in modules:
         assert module.PATH.name == module.NAME and module.PATH.entry == "op"

@@ -104,6 +104,17 @@ class RowRejection:
     warning: str | None
 
 
+@dataclass(frozen=True)
+class DefaultKernels:
+    """The kernels a segment picks when no tuned row applies, and the warning logged."""
+
+    kernel1: str
+    kernel2: str
+    block_m: int
+    ksplit: int
+    warning: str
+
+
 class Segment:
     """Base class of every segment.
 
@@ -163,6 +174,23 @@ class Segment:
     def check_row(self, p: MoeProblem, row, kernel_name1="") -> RowRejection | None:
         """Whether this segment can run tuned `row` for `p` (None: it can)."""
         return None
+
+    def declines_row(self, p: MoeProblem, row) -> str | None:
+        """Why tuned `row` goes back to the legacy code for `p`, though owned, or None."""
+        return None
+
+    def default_kernels(self, p: MoeProblem) -> DefaultKernels | None:
+        """For a stage 1 without a tuned row: the kernels it names for both stages (with
+        block_m, ksplit and the warning logged), or None to keep the defaults."""
+        return None
+
+    def stage2_kernel(self, p: MoeProblem, kernel_name1, kernel_name2) -> str:
+        """For a stage 2: the kernel name it runs for these tuned names."""
+        return kernel_name2
+
+    def metadata_fields(self, p: MoeProblem, params: Params) -> dict:
+        """`MOEMetadata` fields this segment sets (`block_m` replaces the plan's)."""
+        return {}
 
     def build(self, p: MoeProblem, params: Params):
         raise NotImplementedError(self.name)

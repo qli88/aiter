@@ -574,7 +574,7 @@ def test_claims_only_unquantized_16_bit(monkeypatch):
     assert not a16w16.claims(call)
 
 
-_LOCAL_PATHS = ("a8w8_pt", "a16w16", "a8w8_ptok", "a8w8_blockscale")
+_LOCAL_PATHS = ("a8w8_pt", "a16w16", "a8w8_ptok", "a8w8_blockscale", "a4w4")
 
 
 def _local_path_modules():
@@ -605,6 +605,16 @@ def _int_op_call(quant_type, weights):
     return call
 
 
+def _a4w4_op_call():
+    """MXFP4 activations and weights: fp4 packed two to a byte (K / 2 columns)."""
+    call = _fp8_op_call(QuantType.per_1x32)
+    call.update(
+        w1=torch.empty(4, 32, 32, dtype=dtypes.fp4x2),
+        w2=torch.empty(4, 64, 8, dtype=dtypes.fp4x2),
+    )
+    return call
+
+
 def test_the_paths_take_disjoint_keys():
     i8, u32 = dtypes.i8, torch.uint32
     owners = (
@@ -615,6 +625,7 @@ def test_the_paths_take_disjoint_keys():
         ("a8w8_ptok", _problem(quant=QuantType.per_Token, fp8=i8)),
         ("a8w8_ptok", _problem(quant=QuantType.per_Token, w=u32)),
         ("a8w8_blockscale", _problem(quant=QuantType.per_1x128)),
+        ("a4w4", _problem(quant=QuantType.per_1x32, fp8=dtypes.fp4x2)),
     )
     modules = _local_path_modules()
     for owner, p in owners:
@@ -707,6 +718,7 @@ def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
         "a8w8_pt_i8": lambda: _int_op_call(QuantType.per_Tensor, "i8"),
         "a8w8_ptok_i8": lambda: _int_op_call(QuantType.per_Token, "i8"),
         "a8w8_ptok_i4": lambda: _int_op_call(QuantType.per_Token, "i4"),
+        "a4w4": _a4w4_op_call,
     }[base]()
     w1 = call["w1"]
     for change in (
@@ -934,6 +946,144 @@ def test_the_relookup_buckets_the_hidden_states_rows(monkeypatch):
     with hooks.set_sort_impl(sort), pytest.raises(Stop):
         a8w8_pt.PATH.run(call)
     assert tokens == [2, 4]
+
+
+def _a4w4_problem(token=64, shape=(7168, 256, 256, 8), doweight=False, **kwargs):
+    args = (token, *shape, dtypes.bf16, dtypes.fp4x2, dtypes.fp4x2)
+    args += (QuantType.per_1x32, True, ActivationType.Silu, doweight, 0, 0)
+    return MoeProblem.from_legacy_key(*args, **kwargs, arch="gfx950", cu_num=256)
+
+
+def _a4w4_resolve(monkeypatch, problem, row=None):
+    from aiter.moev2.migration import a4w4
+
+    monkeypatch.setattr(tuned, "lookup", lambda p: row)
+    return resolver.resolve(problem, a4w4.SEGMENTS)
+
+
+_MXMOE_ROW = {
+    "block_m": 16,
+    "ksplit": 0,
+    "run_1stage": 0,
+    "kernelName1": "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_xcd4",
+    "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16",
+}
+_MXMOE_SHAPE = (5120, 640, 128, 3)
+
+
+def test_a4w4_defaults_follow_the_legacy_branches(monkeypatch):
+    res = _a4w4_resolve(monkeypatch, _a4w4_problem(is_shuffled=True))
+    assert res.plan.structure()[0] == (
+        "sort", "quant.a1", "flydsl.gemm1", "quant.inter", "flydsl.gemm2"
+    )  # fmt: skip
+    assert (res.metadata.block_m, res.metadata.ksplit) == (32, -1)
+    kn1 = res.metadata.stage1.keywords["kernelName"]
+    assert kn1 == "flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2"
+    assert "using heuristic FlyDSL fallback" in res.logs[-1][1]
+    # doweight_stage1 rules FlyDSL out: CK-Tile split-K at decode sizes, else CK.
+    dw = _a4w4_problem(token=1, doweight=True, is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, dw)
+    assert res.plan is None and "CK-Tile split-K MXFP4 is not ported" in res.declined
+    dw = _a4w4_problem(token=4096, doweight=True, is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, dw)
+    assert res.plan.structure()[0][2] == "ck.gemm1"
+    assert res.metadata.stage1.func.__name__ == "ck_moe_stage1"
+
+
+def test_a4w4_tuned_rows_pick_the_mxmoe_and_layout_v2_segments(monkeypatch):
+    p = _a4w4_problem(token=8, shape=_MXMOE_SHAPE, is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, p, _MXMOE_ROW)
+    assert res.plan.structure()[0] == (
+        "sort.aux", "quant.a1", "mxmoe.gemm1", "mxmoe.gemm2"
+    )  # fmt: skip
+    m = res.metadata
+    assert (m.block_m, m.output_aux, m.fuse_quant, m.prequant) == (
+        16,
+        "opus",
+        "fp4",
+        False,
+    )
+    row = {
+        "block_m": 32,
+        "ksplit": 0,
+        "run_1stage": 0,
+        "kernelName1": "flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w4_fp4",
+        "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x256_atomic_nt_sbm32",
+    }
+    res = _a4w4_resolve(monkeypatch, _a4w4_problem(is_shuffled=True), row)
+    assert res.plan.structure()[0] == (
+        "sort", "quant.a1", "flydsl.gemm1_layout", "flydsl_layout.gemm2"
+    )  # fmt: skip
+    assert res.metadata.skip_inter_quant and res.metadata.output_aux is False
+
+
+def test_a4w4_rows_legacy_discards_or_overrides(monkeypatch):
+    # Legacy runs the FlyDSL heuristic over a tuned CK row on preshuffled weights.
+    ck = {
+        "block_m": 32,
+        "ksplit": 0,
+        "run_1stage": 0,
+        "kernelName1": "moe_ck2stages_gemm1_256x32x128x128_1x4_MulABScaleShuffled_v3_Nswizzle0_Quant3_MulRoutedWeight0_silu_FP4X2_FP4X2_B16",
+        "kernelName2": "moe_ck2stages_gemm2_256x32x128x128_1x4_MulABScaleShuffled_v3_Nswizzle0_Quant3_MulRoutedWeight1_FP4X2_FP4X2_B16",
+    }
+    res = _a4w4_resolve(monkeypatch, _a4w4_problem(is_shuffled=True), ck)
+    assert res.plan is None and "tuned CK row for shuffled MXFP4" in res.declined
+    # An inline-sort row is discarded under _disable_inline_sort and with expert_mask.
+    for kwargs in ({"_disable_inline_sort": True}, {"is_ep": True}):
+        p = _a4w4_problem(token=8, shape=_MXMOE_SHAPE, is_shuffled=True, **kwargs)
+        res = _a4w4_resolve(monkeypatch, p, _MXMOE_ROW)
+        assert res.plan.structure()[0][2] == "flydsl.gemm1", kwargs
+        warnings = [text for level, text in res.logs if level == logging.WARNING]
+        assert warnings[0].startswith("[fused_moe] discarding tuned inline-sort config")
+
+
+def test_a4w4_inline_sort_fallback_resolves_again_without_inline_sort(
+    monkeypatch, caplog
+):
+    from aiter.moev2.migration import a4w4, local
+
+    class Call(dict):
+        gate_mode = block_size_M = None
+
+        def __missing__(self, name):
+            return None
+
+    dispatched = []
+
+    def dispatch(args, kwargs, arch, cu_num):
+        dispatched.append(dict(kwargs))
+        return fallback
+
+    first = (types.SimpleNamespace(metadata=None), None)
+    fallback = (types.SimpleNamespace(metadata=None), None)
+    monkeypatch.setattr(local, "_is_mxfp4_inline_sort", lambda metadata: True)
+    monkeypatch.setattr(local, "_mxfp4_inline_sort_unsupported", lambda *a, **k: "x")
+    monkeypatch.setattr(a4w4.LOCAL, "dispatch", dispatch)
+    with caplog.at_level(logging.WARNING, logger="aiter"):
+        got = a4w4.LOCAL._inline_sort_fallback(
+            Call(), (), {"_disable_inline_sort": False}, first
+        )
+    assert got is fallback and dispatched == [{"_disable_inline_sort": True}]
+    assert (
+        "inline-sort config is unsupported (x); using default heuristics" in caplog.text
+    )
+    # A fallback key v2 declines goes back to legacy before the warning: it logs it.
+    fallback = None
+    caplog.clear()
+    got = a4w4.LOCAL._inline_sort_fallback(
+        Call(), (), {"_disable_inline_sort": False}, first
+    )
+    assert got is None and "inline-sort" not in caplog.text
+
+
+def test_the_relookup_ignores_disable_inline_sort(monkeypatch):
+    from aiter.moev2.migration import a4w4
+
+    seen = []
+    monkeypatch.setattr(a4w4.LOCAL, "resolve", lambda p, relookup: seen.append(p))
+    p = _a4w4_problem(_disable_inline_sort=True, config_file="/tmp/t.csv")
+    a4w4.LOCAL._relookup(p, 128)
+    assert dict(seen[0].extras) == {"tuned_table": "/tmp/t.csv"}
 
 
 def test_shape_helpers_moved_verbatim():

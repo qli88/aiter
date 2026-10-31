@@ -37,3 +37,15 @@ def online_tune() -> bool:
 def explain() -> bool:
     """`AITER_MOE_EXPLAIN=1`: log how each new problem is resolved."""
     return os.environ.get("AITER_MOE_EXPLAIN", "0") == "1"
+
+
+def flydsl_force() -> bool:
+    """`AITER_FLYDSL_FORCE` (default 1): MXFP4 defaults to FlyDSL for every activation,
+    not only Swiglu and SiTUv2."""
+    return os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
+
+
+def a4w4_fp8_inter() -> bool:
+    """`AITER_SITUV2_A4W4_FP8_INTER=1`: fp8 intermediate for tuned a4w4 FlyDSL rows
+    with a layout GEMM2 (when the call sets no `quant_dtype_a2`)."""
+    return os.environ.get("AITER_SITUV2_A4W4_FP8_INTER", "0") == "1"

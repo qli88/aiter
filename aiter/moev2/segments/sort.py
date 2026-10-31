@@ -5,24 +5,279 @@
 The backend is chosen as in the legacy `moe_sorting`, from the same environment variables:
 Opus by default, CK with AITER_USE_CK_MOE_SORTING=1, FlyDSL with
 AITER_USE_FLYDSL_MOE_SORTING=1. This module covers the plain sort (no local topk ids, no
-auxiliary outputs, not FLAT); the legacy `moe_sorting` stays in aiter/fused_moe.py,
-where tests patch its helpers. `hooks.set_sort_impl` replaces `moe_sorting` here.
+auxiliary outputs, not FLAT), the auxiliary sort of the MXFP4 kernels (`output_aux`)
+and the decode sort fused with the MXFP4 activation quant. The legacy `moe_sorting` and
+`_is_fused_decode_sort_quant_enabled` stay in aiter/fused_moe.py, where tests patch their
+globals. `hooks.set_sort_impl` replaces `moe_sorting` here, and
+`hooks.disable_fused_decode_sort_quant` the fused decode kernel.
 """
 
+import functools
 import os
 
 import torch
 
 import aiter
-from aiter import dtypes, logger
+from aiter import ActivationType, QuantType, dtypes, logger, mxfp4_moe_sort_fwd
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 
 from .. import hooks
 from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from .base import Cap, Segment
+from .flydsl import _empty_bf16
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+# Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
+_MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
+
+AUX_SORT_OPUS = "opus"
+
+
+def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
+    """Pick the auxiliary sort: Opus (one CTA per expert) or the fused one.
+
+    block_size 16 has no three-stage sort instance -- codegen emits `aux_sort3s_*`
+    only for MB in {32, 64, 128}, so it falls back to sort_quant_kernel_impl,
+    whose whole sort runs under `blockIdx.x == 0`. That single CTA costs
+    O(routed_rows); Opus spends one CTA per expert. So the fused sort wins while
+    the routed rows are few relative to the experts and loses linearly after,
+    which is why block_size 16 was originally pinned away from Opus wholesale.
+
+    Switch on which side of that crossover we are: routed_rows >= num_experts is
+    "at least one routed row per expert on average". Measured on kimi-k3 a4w4
+    (NE=896, topk=16, gfx950) the prologue crosses between token 32 and 64 --
+    fused is 2.2us faster at 32, Opus 0.9us faster at 64 and 10.6us faster at
+    512 -- and the rule puts the boundary at token 56.
+
+    Callers that cannot supply the shape keep the old conservative answer.
+    """
+    if output_aux != AUX_SORT_OPUS:
+        return False
+    if block_size != 16:
+        return True
+    if routed_rows is None or num_experts is None:
+        return False
+    return 3 * routed_rows >= 4 * num_experts  # crossover ~1.3 rows per expert
+
+
+# (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
+# sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
+_FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
+_FUSED_DECODE_SORT_QUANT_MAX_M = 128
+
+
+def _is_fused_decode_sort_quant_enabled(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    global_experts: int,
+    block_m: int,
+    quant_type: QuantType,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    activation: ActivationType,
+    is_g1u1: bool,
+    expert_mask: torch.Tensor | None,
+    num_local_tokens: torch.Tensor | None,
+    need_local_topk_ids: bool,
+    run_1stage: bool,
+    stage1_is_flydsl: bool,
+    hidden_pad: int,
+    ksplit: int,
+) -> bool:
+    """The legacy gate of the direct-scale HIP route-sort/quant kernel, unchanged."""
+    if hooks.fused_decode_sort_quant_disabled():
+        return False
+    try:
+        runtime_is_gfx950 = get_gfx_runtime() == "gfx950"
+    except (KeyError, OSError, RuntimeError):
+        return False
+    tokens = hidden_states.shape[0] if hidden_states.ndim == 2 else 0
+    topk = topk_ids.shape[1] if topk_ids.ndim == 2 else 0
+    return (
+        runtime_is_gfx950
+        and hidden_states.dtype == dtypes.bf16
+        and 1 <= tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
+        and hidden_states.shape[1] == 4096
+        and hidden_states.is_contiguous()
+        and topk_ids.dtype == dtypes.i32
+        and (global_experts, topk) in _FUSED_DECODE_SORT_QUANT_ROUTES
+        and topk_ids.shape[0] == tokens
+        and topk_ids.is_contiguous()
+        and topk_weights.dtype == dtypes.fp32
+        and topk_weights.is_contiguous()
+        and block_m == 32
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and is_g1u1
+        and expert_mask is None
+        and num_local_tokens is None
+        and not need_local_topk_ids
+        and not run_1stage
+        and stage1_is_flydsl
+        and hidden_pad == 0
+        # ksplit > 1 makes fused_moe_2stages hand stage 1 unquantized BF16
+        # activations (the kernel quantizes inline), so prequantizing here
+        # would feed the wrong dtype.
+        and ksplit <= 1
+    )
+
+
+def _fused_decode_sort_quant(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    model_dim: int,
+    global_experts: int,
+    block_m: int,
+    moebuf_dtype: torch.dtype,
+    accumulate: bool,
+    compact_scale: bool = False,
+):
+    """Return standard sorted metadata plus the pre-quantized stage-1 input."""
+    device = hidden_states.device
+    tokens = hidden_states.shape[0]
+    route_count = topk_ids.numel()
+    active_experts = min(global_experts, route_count)
+    max_sorted = (
+        (route_count + active_experts * (block_m - 1) + block_m - 1)
+        // block_m
+        * block_m
+    )
+    max_blocks = (max_sorted + block_m - 1) // block_m
+    sorted_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+    sorted_expert_ids = torch.empty(max_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = (
+        torch.empty((tokens, model_dim), dtype=moebuf_dtype, device=device)
+        if accumulate
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
+    activation_quant = torch.empty(
+        (tokens, model_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    activation_scale_token = torch.empty(
+        (tokens, model_dim // 32), dtype=dtypes.fp8_e8m0, device=device
+    )
+    aiter.mxfp4_moe_sort_quant_fwd(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale_token,
+        global_experts,
+    )
+    activation_scale = activation_scale_token
+    if not compact_scale:
+        activation_scale = mxfp4_moe_sort_fwd(
+            activation_scale_token,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=tokens,
+            cols=model_dim,
+        )
+    return (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale,
+    )
+
+
+def _adaptive_moe_sort(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    topk,
+    block_size,
+    model_dim,
+    *,
+    atomic=False,
+    emit_aux=False,
+    skip_quant=False,
+    moebuf_dtype=dtypes.bf16,
+):
+    device = topk_ids.device
+    M = topk_ids.shape[0]
+    BM = block_size
+    active = min(num_experts, M * topk)
+    max_sorted = (((M * topk + active * (BM - 1)) + BM - 1) // BM) * BM
+
+    sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+    m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    moe_buf = (
+        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        if atomic
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
+    # BM16 sort fuses output zeroing; three-stage sort only sorts.
+    # Atomic GEMM2 needs a zeroed destination on every invocation.
+    if atomic and BM != 16:
+        moe_buf.zero_()
+    empty_bf16 = _empty_bf16(device)
+    bf16_zero = moe_buf if (atomic and (BM == 16 or skip_quant)) else empty_bf16
+
+    # threestage-sort scratch (prologue==1). Previously allocated via
+    # torch::empty inside the kernel; now passed in so the C++ TU is torch-free.
+    # Size = NE*kSplitSortCtas + NE int32; kSplitSortCtas=16 mirrors
+    # csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h.
+    sort3stage_ws = (
+        torch.empty(0, dtype=dtypes.i32, device=device)
+        if BM == 16 or skip_quant
+        else torch.empty(num_experts * 17, dtype=dtypes.i32, device=device)
+    )
+
+    aiter.mxfp4_moe_sort(
+        topk_ids=topk_ids,
+        topk_weight=topk_weights,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids,
+        reverse_sorted=reverse_sorted,
+        sorted_weights=sorted_weights,
+        m_indices=m_indices,
+        bf16_zero_out=bf16_zero,
+        bf16_zero_workspace=empty_bf16,
+        sort3stage_ws=sort3stage_ws,
+        M_logical=M,
+        NE=num_experts,
+        TOPK=topk,
+        D_HIDDEN=model_dim,
+        D_INTER=1,  # (void)D_INTER in the sort path; unused
+        MB=BM,
+        prologue=0 if BM == 16 or skip_quant else 1,
+    )
+    std = (sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+    if emit_aux:
+        return (*std, m_indices, reverse_sorted)
+    return std
+
+
+@functools.cache
+def _mxfp4_aux_instance_supported(experts, topk, hidden, block_m, zero_init):
+    return _mxfp4_moe_sort_internal_is_supported(
+        experts, topk, hidden, block_m, zero_init
+    )
 
 
 def _sorted_buffers(
@@ -34,6 +289,7 @@ def _sorted_buffers(
     accumulate,
     expert_mask,
     output,
+    output_aux=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -46,10 +302,11 @@ def _sorted_buffers(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    # Stage2 accumulates into [M, model_dim] (also under EP); otherwise the caller owns
-    # the intermediate and this is a placeholder. A caller buffer can stand in: the
-    # sort kernel zeroes what it is handed.
-    if accumulate or expert_mask is not None:
+    # Stage2 accumulates into [M, model_dim] (also under EP, except for the non-atomic
+    # output_aux scatter, which writes every output row itself); otherwise the caller
+    # owns the intermediate and this is a placeholder. A caller buffer can stand in:
+    # the sort kernel zeroes what it is handed.
+    if accumulate or (expert_mask is not None and not output_aux):
         moe_buf = (
             output
             if output is not None
@@ -108,10 +365,37 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
     accumulate=True,
+    output_aux=False,
     output=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
+
+    if (
+        output_aux
+        and expert_mask is None
+        and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
+        and _mxfp4_aux_instance_supported(
+            num_experts, topk, model_dim, block_size, accumulate
+        )
+        and _MOE_SORT_BACKEND not in ("opus", "ck")
+    ):
+        # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
+        # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
+        # It has no expert_mask support, so EP always takes the Opus aux sort.
+        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
+        return _adaptive_moe_sort(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            topk,
+            block_size,
+            model_dim,
+            atomic=accumulate,
+            emit_aux=True,
+            moebuf_dtype=moebuf_dtype,
+        )
+
     ret = _sorted_buffers(
         topk_ids,
         num_experts,
@@ -121,7 +405,18 @@ def _moe_sorting_impl(
         accumulate,
         expert_mask,
         output,
+        output_aux,
     )
+    aux = (None, None)
+    if output_aux:
+        use_opus = True
+        dispatch_policy = (
+            0 if _aux_uses_opus(output_aux, block_size, M * topk, num_experts) else 1
+        )
+        aux = (
+            torch.empty(ret[0].shape[0], dtype=dtypes.i32, device=device),
+            torch.empty(M * topk, dtype=dtypes.i32, device=device),
+        )
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
             M, num_experts, topk, dispatch_policy, topk_ids.get_device()
@@ -142,8 +437,7 @@ def _moe_sorting_impl(
             workspace,
             dispatch_policy,
             None,
-            None,
-            None,
+            *aux,
         )
     else:
         aiter.moe_sorting_fwd(
@@ -156,6 +450,8 @@ def _moe_sorting_impl(
             num_local_tokens,
             dispatch_policy,
         )
+    if output_aux:
+        return (*ret, *aux)
     return ret
 
 
@@ -170,10 +466,17 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
     accumulate=True,
+    output_aux=False,
     output=None,
 ):
-    """`(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)`."""
-    if not _USE_CK_MOE_SORTING and _USE_FLYDSL_MOE_SORTING and dispatch_policy == 0:
+    """`(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)`, then
+    `m_indices` and `reverse_sorted` with `output_aux`."""
+    if (
+        not _USE_CK_MOE_SORTING
+        and _USE_FLYDSL_MOE_SORTING
+        and not output_aux
+        and dispatch_policy == 0
+    ):
         return _flydsl_moe_sorting(
             topk_ids,
             topk_weights,
@@ -199,6 +502,7 @@ def moe_sorting(
             dispatch_policy,
             use_opus=not _USE_CK_MOE_SORTING,
             accumulate=accumulate,
+            output_aux=output_aux,
             output=output,
         )
     except Exception as e:
@@ -221,7 +525,8 @@ class Sort(Segment):
         Cap(
             features=frozenset(
                 {"ep_mask", "num_local_tokens", "doweight_stage1", "act_scales"}
-            )
+            ),
+            extras=frozenset({"disable_inline_sort"}),
         ),
     )
 
@@ -243,6 +548,7 @@ class Sort(Segment):
         num_local_tokens,
         dispatch_policy,
         output,
+        accumulate=True,
     ):
         return hooks.sort_impl(moe_sorting)(
             topk_ids,
@@ -254,6 +560,43 @@ class Sort(Segment):
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-            accumulate=True,
+            accumulate=accumulate,
+            output=output,
+        )
+
+
+class SortAux(Sort):
+    """The sort with the MXFP4 auxiliary outputs (`m_indices`, `reverse_sorted`)."""
+
+    name = "sort.aux"
+
+    def produces(self, p, params):
+        return Buf("sorted", None, "aux_sorted", block_m=params.get("block_m"))
+
+    def run(
+        self,
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size,
+        expert_mask,
+        num_local_tokens,
+        output_aux,
+        accumulate,
+        output,
+    ):
+        return hooks.sort_impl(moe_sorting)(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            accumulate=accumulate,
+            output_aux=output_aux,
             output=output,
         )

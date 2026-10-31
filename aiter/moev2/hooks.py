@@ -3,7 +3,7 @@
 """Explicit test and benchmark hooks for aiter.moev2.
 
 The legacy code is driven by assigning module globals (`kernel_bench_callable`,
-`_moe_sorting_impl`, `cfg_2stages`). These context managers replace that: they restore
+`_moe_sorting_impl`, `cfg_2stages`, `_fused_decode_sort_quant_disabled`). These context managers replace that: they restore
 the previous state on exit, so a failing test cannot leak its override into the next.
 """
 
@@ -11,6 +11,7 @@ import contextlib
 
 _kernel_calls: list | None = None
 _sort_impl = None
+_fused_decode_sort_quant_off = False
 
 
 @contextlib.contextmanager
@@ -28,14 +29,21 @@ def set_kernel_bench_callable(calls: list | None = None):
 
 
 def legacy_kernel_bench(calls: list | None):
-    """`set_kernel_bench_callable(calls)`, or nothing when `calls` is None.
-
-    The legacy code wraps v2 runs in this with its `kernel_bench_callable` global, so
-    benchmarks that set that global see the kernels v2 launches too.
-    """
+    """`set_kernel_bench_callable(calls)`, or nothing when `calls` is None."""
     if calls is None:
         return contextlib.nullcontext()
     return set_kernel_bench_callable(calls)
+
+
+@contextlib.contextmanager
+def legacy_globals(kernel_calls: list | None, fused_decode_sort_quant_off: bool):
+    """The legacy code wraps v2 runs in this with its `kernel_bench_callable` and
+    `_fused_decode_sort_quant_disabled` globals, so code that sets them drives v2 too.
+    """
+    with legacy_kernel_bench(kernel_calls), disable_fused_decode_sort_quant(
+        fused_decode_sort_quant_off
+    ):
+        yield
 
 
 def record_kernel(stage: str, call):
@@ -58,3 +66,18 @@ def set_sort_impl(impl):
 def sort_impl(default):
     """The sorting backend to call: the override if one is set, else `default`."""
     return default if _sort_impl is None else _sort_impl
+
+
+@contextlib.contextmanager
+def disable_fused_decode_sort_quant(disabled: bool = True):
+    """Run the generic sort and MXFP4 quant where the fused decode kernel would run."""
+    global _fused_decode_sort_quant_off
+    previous, _fused_decode_sort_quant_off = _fused_decode_sort_quant_off, disabled
+    try:
+        yield
+    finally:
+        _fused_decode_sort_quant_off = previous
+
+
+def fused_decode_sort_quant_disabled() -> bool:
+    return _fused_decode_sort_quant_off

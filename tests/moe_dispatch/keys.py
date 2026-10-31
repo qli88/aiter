@@ -59,6 +59,16 @@ EXTRA_COMBOS = (
     ("Silu", "bfloat16", "fp8", "fp8", "per_Tensor", True, False),
     ("Gelu", "bfloat16", "fp8", "fp8", "per_Token", True, False),
     ("Silu", "bfloat16", "fp8", "uint32", "per_Token", True, False),
+    # Not the FlyDSL heuristic on preshuffled weights: CK-Tile split-K at decode sizes.
+    (
+        "Silu",
+        "bfloat16",
+        "float4_e2m1fn_x2",
+        "float4_e2m1fn_x2",
+        "per_1x32",
+        True,
+        True,
+    ),
 )
 
 TUNED_VARIANTS = ("base", "ep", "unshuffled")

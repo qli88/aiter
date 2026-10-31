@@ -8,16 +8,38 @@ validation, buffers, kernel launches and benchmark hooks.
 """
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe_registry import FusedMoeRequest
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
+from aiter.ops.flydsl.mxfp4_kname import parse_g2_kname_any
 
 from .. import hooks
 from ..dispatch.ops import Op
+from ..policy import _normalize_mxfp4_activation_params
+from ..segments.flydsl import (
+    _flydsl_route_output_nbytes,
+    _flydsl_stage1_wrapper,
+    _flydsl_stage2_fp8_enabled,
+    _flydsl_stage2_wrapper,
+    _flydsl_v2_stage2_wrapper,
+    _is_flydsl_stage2,
+    _stage2_runtime_uses_route_reduce,
+    _validate_flydsl_route_output_nbytes,
+)
+from ..segments.mxmoe import _mxfp4_a4w4_stage1_fw, _mxfp4_a4w4_stage2_fw
+from ..segments.sort import (
+    AUX_SORT_OPUS,
+    _fused_decode_sort_quant,
+    _is_fused_decode_sort_quant_enabled,
+)
 from ..shapes import get_inter_dim
 from .output import (
     _return_output,
@@ -252,6 +274,309 @@ def run_two_stage(c: Call, metadata, plan, q_dtype_a, after_sort=None):
         a2_scale=a2_scale,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
+    )
+    hooks.record_kernel("stage2", _stage2_call)
+    _stage2_call()
+    return _return_output(moe_out, output)
+
+
+def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
+    """`run_two_stage` for MXFP4 weights: the `per_1x32` branches of `_fused_moe_impl`
+    and `fused_moe_2stages` (route-reduce check, auxiliary or fused decode sort, sorted
+    quantization, the FlyDSL and MXMOE stage arguments)."""
+    block_size_M = metadata.block_m if c.block_size_M is None else c.block_size_M
+    if block_size_M is not None:
+        block_size_M = int(block_size_M)
+    sort = plan.starting(Op.SORT).segment
+    quant_a1 = plan.segment("quant.a1").segment
+    quant_inter = plan.segment("quant.inter")
+
+    hidden_states, w1, w2 = c["hidden_states"], c["w1"], c["w2"]
+    topk_ids, topk_weight = c["topk_ids"], c["topk_weight"]
+    expert_mask = c["expert_mask"]
+    num_local_tokens = c["num_local_tokens"]
+    output = c["output"]
+    doweight_stage1 = c["doweight_stage1"]
+    M, topk, model_dim, dtype = c.M, c.topk, c.model_dim, c.dtype
+    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+
+    runtime_stage2_reduce = _stage2_runtime_uses_route_reduce(
+        metadata.stage2, M, model_dim
+    )
+    if _is_flydsl_stage2(metadata.stage2) and runtime_stage2_reduce:
+        output_element_size = torch.empty((), dtype=dtype).element_size()
+        _validate_flydsl_route_output_nbytes(
+            _flydsl_route_output_nbytes(
+                metadata.stage2, M, topk, model_dim, output_element_size
+            )
+        )
+    prequantized_a1 = None
+    prequantized_a1_scale = None
+    m_indices = None
+    reverse_sorted = None
+    fused_sort_quant = not metadata.output_aux and _is_fused_decode_sort_quant_enabled(
+        hidden_states,
+        topk_ids,
+        topk_weight,
+        global_experts=c.global_E,
+        block_m=block_size_M,
+        quant_type=c.quant_type,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=w1.dtype,
+        activation=c.activation,
+        is_g1u1=c.isG1U1,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        need_local_topk_ids=False,
+        run_1stage=metadata.run_1stage,
+        stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
+        hidden_pad=c["hidden_pad"],
+        ksplit=metadata.ksplit,
+    )
+    if metadata.output_aux:
+        # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
+        # routes get reverse_sorted = -1).
+        if expert_mask is not None and stage2_func is not _flydsl_v2_stage2_wrapper:
+            raise NotImplementedError(
+                "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
+                "(only the layout-v2 scatter GEMM2 handles the masked aux sort)."
+            )
+        stage2_kwargs = metadata.stage2.keywords
+        kernel_name2 = stage2_kwargs.get("kernelName2") or stage2_kwargs.get(
+            "kernelName", ""
+        )
+        atomic = parse_g2_kname_any(kernel_name2)["atomic"]
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            m_indices,
+            reverse_sorted,
+        ) = sort.run(
+            topk_ids,
+            topk_weight,
+            c.global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            num_local_tokens,
+            output_aux=metadata.output_aux,
+            accumulate=atomic and not runtime_stage2_reduce,
+            output=output,
+        )[
+            :7
+        ]
+    elif fused_sort_quant:
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            prequantized_a1,
+            prequantized_a1_scale,
+        ) = _fused_decode_sort_quant(
+            hidden_states,
+            topk_ids,
+            topk_weight,
+            model_dim=model_dim,
+            global_experts=c.global_E,
+            block_m=block_size_M,
+            moebuf_dtype=dtype,
+            accumulate=not runtime_stage2_reduce,
+            compact_scale=False,
+        )
+    else:
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            sort.run(
+                topk_ids,
+                topk_weight,
+                c.global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                c["moe_sorting_dispatch_policy"],
+                output,
+                accumulate=not runtime_stage2_reduce,
+            )
+        )
+    if after_sort is not None:
+        after_sort()
+
+    token_num, _ = hidden_states.shape
+    inter_dim = c.inter_dim
+    moe_out = moe_buf
+    dtype = moe_out.dtype
+    device = hidden_states.device
+    if moe_out.numel() == 0:
+        moe_out = (
+            output
+            if output is not None
+            else torch.empty((token_num, model_dim), dtype=dtype, device=device)
+        )
+    is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
+        _normalize_mxfp4_activation_params(
+            c.activation, c["beta"], c["linear_beta"], c["swiglu_limit"]
+        )
+    )
+    if (
+        stage1_func is _mxfp4_a4w4_stage1_fw
+        and metadata.output_aux == AUX_SORT_OPUS
+        # block_m 16 is the only inline-quant a4w4 GEMM1: it reads raw bf16.
+        and int(metadata.block_m) != 16
+    ):
+        metadata = replace(metadata, prequant=True)
+    if prequantized_a1 is not None:
+        a1, a1_scale = prequantized_a1, prequantized_a1_scale
+    else:
+        a1, a1_scale = quant_a1.run_mxfp4(
+            metadata,
+            hidden_states,
+            c["a1_scale"],
+            q_dtype_a,
+            dtype,
+            w1.dtype,
+            c.activation,
+            c.gate_mode,
+            is_shuffled,
+            sorted_ids,
+            num_valid_ids,
+            model_dim,
+            topk,
+            block_size_M,
+            num_local_tokens,
+            sorted_weights,
+            c.global_E,
+        )
+    a2 = torch.empty((token_num, topk, inter_dim), dtype=dtype, device=device)
+    extra_stage1_args = {}
+    extra_stage2_args = {}
+    if stage1_func is _flydsl_stage1_wrapper:
+        extra_stage1_args["swiglu_limit"] = c["swiglu_limit"]
+    elif stage1_func is _mxfp4_a4w4_stage1_fw:
+        extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
+    if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
+        extra_stage1_args["v2_output_layout"] = True
+    if stage1_func is _flydsl_stage1_wrapper:
+        extra_stage1_args["situ_beta"] = config_situ_beta
+        extra_stage1_args["situ_linear_beta"] = config_situ_linear_beta
+    elif stage1_func is _mxfp4_a4w4_stage1_fw:
+        # MXMOE's activation comes from its name and betas enter its compile key.
+        extra_stage1_args["situ_beta"] = (
+            DEFAULT_SITUV2_BETA
+            if c.activation == ActivationType.Situv2 and c["beta"] is None
+            else config_situ_beta
+        )
+        extra_stage1_args["situ_linear_beta"] = (
+            DEFAULT_SITUV2_LINEAR_BETA
+            if c.activation == ActivationType.Situv2 and c["linear_beta"] is None
+            else config_situ_linear_beta
+        )
+    if (
+        stage2_func in (_flydsl_stage2_wrapper, _flydsl_v2_stage2_wrapper)
+        and expert_mask is not None
+    ):
+        extra_stage2_args["expert_mask"] = expert_mask
+        extra_stage2_args["topk_ids"] = topk_ids
+    stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
+    uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
+        stage2_func is _mxfp4_a4w4_stage2_fw
+        and str(stage2_keywords.get("kernelName2", "")).startswith(
+            "flydsl_moe2_layout_"
+        )
+    )
+    if uses_flydsl_v2_stage2:
+        extra_stage2_args["use_valid_token_count"] = num_local_tokens is not None
+        if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
+            # FP8 route-output reduction applies the route weights after GEMM2.
+            extra_stage2_args["topk_weights"] = topk_weight
+    if m_indices is not None:
+        extra_stage1_args["m_indices"] = m_indices
+        extra_stage1_args["moe_buf"] = moe_buf
+        extra_stage2_args["reverse_sorted"] = reverse_sorted
+    _stage1_call = functools.partial(
+        metadata.stage1,
+        a1,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        None if metadata.fuse_quant else a2,
+        topk,
+        block_m=block_size_M,
+        a1_scale=a1_scale,
+        w1_scale=_e8m0_view(w1, c["w1_scale"]),
+        sorted_weights=sorted_weights if doweight_stage1 else None,
+        **extra_stage1_args,
+    )
+    hooks.record_kernel("stage1", _stage1_call)
+    a2 = _stage1_call()
+    a2_scale = c["a2_scale"]
+    if isinstance(a2, tuple) and (
+        stage1_func is _mxfp4_a4w4_stage1_fw
+        or metadata.skip_inter_quant
+        or m_indices is not None
+    ):
+        a2, a2_scale = a2[0], a2[1]
+    elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
+        a2_raw, a2_scale = a2[0], a2[1]
+        _fp4_bytes = token_num * topk * (inter_dim // 2)
+        a2 = (
+            a2_raw.view(-1)
+            .view(torch.uint8)[:_fp4_bytes]
+            .view(dtypes.fp4x2)
+            .reshape(token_num, topk, -1)
+        )
+    elif metadata.fuse_quant == "fp8" and isinstance(a2, tuple):
+        a2, a2_scale = a2[0], a2[1]
+        a2 = a2.view(token_num, topk, -1)
+    elif (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and w1.dtype == dtypes.fp4x2
+        and (
+            q_dtype_a in [dtypes.bf16, dtypes.fp16]
+            and c.activation
+            in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)
+            or (metadata.ksplit > 1 and is_shuffled)
+        )
+    ):
+        a2_scale = None
+    else:
+        a2, a2_scale = quant_inter.segment.run_mxfp4(
+            a2,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
+            topk,
+            inter_dim,
+            block_size_M,
+            num_local_tokens,
+            sorted_weights,
+            c.global_E,
+        )
+    _stage2_call = functools.partial(
+        metadata.stage2,
+        a2,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_out,
+        topk,
+        w2_scale=_e8m0_view(w2, c["w2_scale"]),
+        a2_scale=a2_scale,
+        block_m=block_size_M,
+        sorted_weights=sorted_weights if not doweight_stage1 else None,
+        **extra_stage2_args,
     )
     hooks.record_kernel("stage2", _stage2_call)
     _stage2_call()

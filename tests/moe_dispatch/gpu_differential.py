@@ -35,7 +35,8 @@ _HERE = pathlib.Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
 
 # (token, model_dim, inter_dim, experts, topk, activation, doweight_stage1, out dtype, ep)
-# and optionally the weight format ("fp8" when absent, "i8", or "i4": int4 in uint32).
+# and optionally the weight format ("fp8" when absent, "i8", "i4": int4 in uint32, or
+# "fp4"/"fp4u": MXFP4, preshuffled or not).
 _A8W8_PT_DEFAULT = (
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 64, 256, 1024, 4096)),
     *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 32, 512)),
@@ -107,11 +108,41 @@ _A8W8_BLOCKSCALE_DEFAULT = (
     *((m, 4096, 1536, 16, 8, "Silu", False, "bf16", False) for m in (16, 512)),
 )  # fmt: skip
 
+# gfx950: shapes of each shipped cu256 row family, untuned shapes (the FlyDSL heuristic on
+# preshuffled weights, CK otherwise), expert-parallel (MXMOE rows fall back to the
+# heuristic) and doweight_stage1 (CK).
+_A4W4 = (
+    # FlyDSL stage 1 + layout-v2 stage 2.
+    *((m, 3072, 384, 256, 8, "Silu", False, "bf16", False, "fp4") for m in (1, 64, 1024)),
+    *((m, 4096, 512, 512, 10, "Silu", False, "bf16", False, "fp4") for m in (16,)),
+    # MXMOE stage 1 + layout-v2 stage 2.
+    *((m, 5120, 640, 128, 3, "Silu", False, "bf16", False, "fp4") for m in (8, 64, 256)),
+    *((m, 6144, 512, 257, 9, "Silu", False, "bf16", False, "fp4") for m in (2, 16)),
+    # FlyDSL stage 1 + FlyDSL stage 2, and + CK stage 2.
+    *((m, 4096, 1536, 16, 7, "Silu", False, "bf16", False, "fp4") for m in (16, 256)),
+    *((m, 5120, 2304, 32, 2, "Silu", False, "bf16", False, "fp4") for m in (8,)),
+    *((m, 3072, 768, 256, 8, "Silu", False, "bf16", False, "fp4") for m in (1, 2)),
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False, "fp4") for m in (64,)),
+    # Untuned.
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4") for m in (5, 200)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False, "fp4") for m in (40,)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "fp4") for m in (32,)),
+    # doweight_stage1 outside CK-Tile split-K (`token * topk > experts`), which the path
+    # declines (and which faults on legacy at (8, 4096, 512, 64, 4)).
+    *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False, "fp4") for m in (300, 1024)),
+    *((m, 3072, 384, 128, 8, "Silu", False, "bf16", True, "fp4") for m in (16, 512)),
+    *((m, 5120, 640, 64, 3, "Silu", False, "bf16", True, "fp4") for m in (64,)),
+    # Not preshuffled: CK.
+    *((m, 3072, 384, 256, 8, "Silu", False, "bf16", False, "fp4u") for m in (16, 256)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4u") for m in (5,)),
+)  # fmt: skip
+
 _CASES = {
     "a8w8_pt": _A8W8_PT_DEFAULT,
     "a16w16": _A16W16_DEFAULT,
     "a8w8_ptok": _A8W8_PTOK_DEFAULT,
     "a8w8_blockscale": _A8W8_BLOCKSCALE_DEFAULT,
+    "a4w4": _A4W4,
 }
 # The dispatch key's quant type and weight dtype of each path's tuned rows.
 _ROWS = {
@@ -119,6 +150,7 @@ _ROWS = {
     "a16w16": ("QuantType.No", "16"),
     "a8w8_ptok": ("QuantType.per_Token", "float8"),
     "a8w8_blockscale": ("QuantType.per_1x128", "float8"),
+    "a4w4": ("QuantType.per_1x32", "float4"),
 }
 
 
@@ -138,8 +170,9 @@ def _per_128x128_quant(weight, quant_dtype):
 def _make_call(path_name, case):
     """Inputs as op_tests/test_moe_2stage.py builds them for `-q 1` (per-tensor fp8,
     path a8w8_pt), `-q 0` (unquantized, path a16w16), `-q 2` (per-token fp8, path
-    a8w8_ptok), `-q 3` (per-token int4 weights, path a8w8_ptok) or `-q 5` (128x128 fp8
-    blocks, path a8w8_blockscale); int8 weights as `-q 1`/`-q 2` with int8.
+    a8w8_ptok), `-q 3` (per-token int4 weights, path a8w8_ptok), `-q 5` (128x128 fp8
+    blocks, path a8w8_blockscale) or `-q 4` (MXFP4, path a4w4; `--preshuffle` for
+    "fp4"); int8 weights as `-q 1`/`-q 2` with int8.
     Unlike op_tests, the weights are scaled by 1/sqrt(K) (see `weight`)."""
     import torch
 
@@ -148,6 +181,7 @@ def _make_call(path_name, case):
     from aiter.fused_moe import fused_topk
     from aiter.int4_utils import convert_int8_to_uint32_int4, rearrange_4bit_elements
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility import fp4_utils
 
     token, model_dim, inter_dim, E, topk, act, doweight, out, ep, *rest = case
     weights = rest[0] if rest else "fp8"
@@ -160,6 +194,7 @@ def _make_call(path_name, case):
         "a8w8_pt": QuantType.per_Tensor,
         "a8w8_ptok": QuantType.per_Token,
         "a8w8_blockscale": QuantType.per_128x128,
+        "a4w4": QuantType.per_1x32,
     }.get(path_name, QuantType.No)
 
     def weight(shape):
@@ -173,6 +208,13 @@ def _make_call(path_name, case):
             del w
             packed = shuffle_weight(qt, (16, 16), use_int4=True)
             return rearrange_4bit_elements(convert_int8_to_uint32_int4(packed)), scale
+        if weights in ("fp4", "fp4u"):
+            qt, scale = aiter.get_torch_quant(quant_type)(w, quant_dtype=dtypes.fp4x2)
+            qt = qt.view(*shape[:-1], shape[-1] // 2)
+            del w
+            if weights == "fp4":
+                qt = shuffle_weight(qt, layout=(16, 16))
+            return qt, fp4_utils.e8m0_shuffle(scale)
         if quant_type == QuantType.per_Tensor:
             qt, scale = aiter.pertoken_quant(w.view(E, -1), quant_dtype=q_dtype)
         elif quant_type == QuantType.per_Token:
@@ -330,10 +372,10 @@ def cases(path_name, synth_cases=()):
 
 def _clear_dispatch_caches():
     import aiter.fused_moe as fm
-    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
+    from aiter.moev2.migration import a4w4, a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
 
     fm.get_2stage_cfgs.cache_clear()
-    for path in (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale):
+    for path in (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale, a4w4):
         for cache in (path.LOCAL.dispatch, path.LOCAL.resolve, path.LOCAL.relookup):
             cache.cache_clear()
 

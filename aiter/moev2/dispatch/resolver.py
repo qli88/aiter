@@ -164,12 +164,18 @@ def _two_stage_plan(
     choices = []
     for segment in structure:
         if segment.covers[0] == Op.GEMM1:
-            params = Params(kernel=kernelName1, ksplit=ksplit, nt=nt)
+            params = Params(
+                kernel=kernelName1, kernel2=kernelName2, ksplit=ksplit, nt=nt
+            )
         elif segment.covers[0] == Op.GEMM2:
             params = Params(kernel=kernelName2, nt=nt)
         else:
             params = Params()
         choices.append(SegmentChoice(segment, params))
+    fields = {}
+    for choice in choices:
+        fields.update(choice.segment.metadata_fields(problem, choice.params))
+    block_m = fields.pop("block_m", block_m)
     plan = MoePlan(
         tuple(choices),
         source,
@@ -184,6 +190,7 @@ def _two_stage_plan(
         block_m,
         ksplit if is_asm else int(ksplit),
         run_1stage,
+        **fields,
     )
     return plan, metadata
 
@@ -223,6 +230,20 @@ def resolve(problem, segments) -> Resolution:
         if isinstance(matched, str):
             return declined(matched)
     logs = []
+    if matched is not None and len(matched) > 1:
+        reason = next(
+            filter(None, (s.declines_row(problem, cfg) for s in matched)), None
+        )
+        if reason is not None:
+            return declined(reason)
+        rejection = next(
+            filter(None, (s.check_row(problem, cfg) for s in matched)), None
+        )
+        if rejection is not None:
+            logs.append((WARNING, rejection.warning))
+            note(f"tuned row discarded: {rejection.warning}")
+            cfg = None
+            matched = None
     bypass_tuned_config = overrides.bypass_tuned()
     kernel_name1 = (
         str(cfg.get("kernelName1", "") or "").strip() if cfg is not None else ""
@@ -311,6 +332,9 @@ def resolve(problem, segments) -> Resolution:
             )
             logs.append((WARNING, message))
         source = "tuned"
+    gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
+    gemm2 = next(s for s in structure if s.covers[0] == Op.GEMM2)
+    kernelName2 = gemm2.stage2_kernel(problem, kernelName1, kernelName2)
     tag = f"({kernelName1=}, {kernelName2=})"
     logs.append(
         (
@@ -318,6 +342,11 @@ def resolve(problem, segments) -> Resolution:
             f"[fused_moe] using 2stage {'default' if cfg is None else tag} for {keys} ",
         )
     )
+    default = gemm1.default_kernels(problem) if source != "tuned" else None
+    if default is not None:
+        kernelName1, kernelName2 = default.kernel1, default.kernel2
+        block_m, ksplit = default.block_m, default.ksplit
+        logs.append((WARNING, default.warning))
     plan, metadata = _two_stage_plan(
         problem,
         structure,
