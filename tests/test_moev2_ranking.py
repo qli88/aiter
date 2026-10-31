@@ -15,10 +15,8 @@ import pytest
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.moev2.dispatch import ranking
-from aiter.moev2.dispatch.ops import Op
 from aiter.moev2.dispatch.ranking import Entry, Region, match, when
 from aiter.moev2.problem import MoeProblem
-from aiter.moev2.segments.base import Segment
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
@@ -238,9 +236,10 @@ def test_bad_structures_fail():
 
 
 def test_a_last_structure_with_shape_conditions_fails():
-    class SmallMOnly(Segment):
+    from aiter.moev2.segments.ck import CkGemm1
+
+    class SmallMOnly(CkGemm1):
         name = "small.gemm1"
-        covers = (Op.GEMM1, Op.ACT)
 
         def reject_reason(self, p):
             return None if p.shape.m <= 64 else "M > 64"

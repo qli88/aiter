@@ -28,6 +28,7 @@ from ..segments.defaults import (
 )
 from ..segments.whole_graph import FusedMoeImplResolutionError, resolve_fused_moe_impl
 from . import kernel_names, overrides, profile, ranking, tuned
+from .buf import CALL_INPUT
 from .ops import Op, chain
 from .plan import MoePlan, SegmentChoice
 
@@ -57,7 +58,12 @@ class Resolution:
 
 
 def feasible_plans(problem, segments):
-    """`(plans, rejected)`: segment tuples covering the op chain, and `{name: reason}`."""
+    """`(plans, rejected)`: segment tuples covering the op chain, and `{name: reason}`.
+
+    In a plan, every `Buf` a segment reads matches the last one of that kind produced
+    before it. A segment that fits the chain but in no plan, because of its boundaries,
+    is in `rejected` with the first mismatch found.
+    """
     ops = chain(problem)
     rejected = {}
     usable = []
@@ -67,8 +73,12 @@ def feasible_plans(problem, segments):
             usable.append(segment)
         else:
             rejected[segment.name] = reason
+    reads = {s.name: s.reads(problem) for s in usable}
+    produced = {s.name: s.produces(problem, Params()) for s in usable}
+    mismatches = {}
+    placed = set()
 
-    def walk(i):
+    def walk(i, last):
         if i == len(ops):
             yield ()
             return
@@ -76,10 +86,25 @@ def feasible_plans(problem, segments):
             start, end = segment.covers
             if start != ops[i] or end not in ops:
                 continue
-            for rest in walk(ops.index(end) + 1):
+            reason = next(
+                filter(
+                    None, (b.mismatch(last.get(b.kind)) for b in reads[segment.name])
+                ),
+                None,
+            )
+            if reason is not None:
+                mismatches.setdefault(segment.name, reason)
+                continue
+            out = produced[segment.name]
+            for rest in walk(ops.index(end) + 1, {**last, out.kind: out}):
+                placed.add(segment.name)
                 yield (segment,) + rest
 
-    return list(walk(0)), rejected
+    plans = list(walk(0, {CALL_INPUT.kind: CALL_INPUT}))
+    for name, reason in mismatches.items():
+        if name not in placed:
+            rejected[name] = reason
+    return plans, rejected
 
 
 def _plan_name(structure):

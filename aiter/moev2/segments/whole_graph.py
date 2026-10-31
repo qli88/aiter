@@ -11,7 +11,7 @@ from aiter.fused_moe_registry import FusedMoeImplResolutionError, resolve_fused_
 from aiter.ops.flydsl.moe_common import GateMode
 
 from ..dispatch import kernel_names
-from ..dispatch.buf import Buf
+from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec
 from .base import RowRejection, Segment
@@ -28,6 +28,9 @@ class WholeGraph(Segment):
     @property
     def capabilities(self):
         return a8w8_per_tensor_caps() + a8w8_per_token_caps() + a16w16_caps()
+
+    def reads(self, p):
+        return (CALL_INPUT,)
 
     def produces(self, p, params):
         return Buf("out", ScaleSpec(p.out_dtype))

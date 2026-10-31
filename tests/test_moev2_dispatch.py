@@ -274,6 +274,54 @@ def test_plan_describes_its_structure():
     assert res.plan.structure() and "ck.gemm1" in res.plan.describe()
 
 
+def test_a_segment_reads_the_last_buffer_of_each_kind_before_it():
+    from aiter.moev2.dispatch.buf import Buf
+    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.problem import ScaleSpec
+    from aiter.moev2.segments.ck import CkGemm1, CkGemm2
+    from aiter.moev2.segments.sort import Sort
+
+    aux = Buf("sorted", None, layout="aux_sorted")
+
+    class AuxSort(Sort):
+        name = "sort.aux"
+
+        def produces(self, p, params):
+            return aux
+
+    class AuxGemm1(CkGemm1):
+        name = "aux.gemm1"
+
+        def reads(self, p):
+            return (aux, Buf("tokens", p.act_in))
+
+    class AuxGemm2(CkGemm2):
+        name = "aux.gemm2"
+
+        def reads(self, p):
+            return (aux, Buf("inter", p.act_in))
+
+    class Bf16Gemm2(CkGemm2):
+        name = "bf16.gemm2"
+
+        def reads(self, p):
+            return (Buf("sorted", None), Buf("inter", ScaleSpec(dtypes.bf16)))
+
+    extra = (AuxSort(), AuxGemm1(), AuxGemm2(), Bf16Gemm2())
+    plans, rejected = resolver.feasible_plans(_problem(), a8w8_pt.SEGMENTS + extra)
+    names = sorted(" | ".join(s.name for s in structure) for structure in plans)
+    # The GEMM2s read the sort's layout from three segments back.
+    assert names == [
+        "impl.whole_graph",
+        "sort | quant.a1 | asm.stage1 | quant.inter | ck.gemm2",
+        "sort | quant.a1 | ck.gemm1 | quant.inter | ck.gemm2",
+        "sort.aux | quant.a1 | aux.gemm1 | quant.inter | aux.gemm2",
+    ]
+    assert list(rejected) == ["bf16.gemm2"]
+    assert "reads inter:" in rejected["bf16.gemm2"]
+    assert "gets inter:" in rejected["bf16.gemm2"]
+
+
 # 2.3 kernel names
 
 

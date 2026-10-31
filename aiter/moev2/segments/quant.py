@@ -12,7 +12,7 @@ import functools
 from aiter import QuantType
 from aiter import get_hip_quant as get_quant
 
-from ..dispatch.buf import Buf
+from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
 from .base import Cap, Segment
 
@@ -23,6 +23,9 @@ class QuantA1(Segment):
     name = "quant.a1"
     covers = (Op.QUANT_A1, Op.QUANT_A1)
     capabilities = (Cap(features=_FEATURES),)
+
+    def reads(self, p):
+        return (CALL_INPUT,)
 
     def produces(self, p, params):
         return Buf("tokens", p.act_in)
@@ -57,6 +60,10 @@ class QuantInter(Segment):
     name = "quant.inter"
     covers = (Op.QUANT_INTER, Op.QUANT_INTER)
     capabilities = (Cap(features=_FEATURES),)
+
+    def reads(self, p):
+        # Any unquantized intermediate: `asm.stage1` writes bf16 even for fp16 outputs.
+        return (Buf("inter", None),)
 
     def produces(self, p, params):
         return Buf("inter", p.act_in)

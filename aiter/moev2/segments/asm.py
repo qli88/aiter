@@ -119,6 +119,9 @@ class AsmStage1(Segment):
         )
         return a8w8_per_tensor_caps() + a8w8_per_token_caps() + int8
 
+    def reads(self, p):
+        return (Buf("sorted", None), Buf("tokens", p.act_in))
+
     def produces(self, p, params):
         return Buf("inter", ScaleSpec(dtypes.bf16))
 
