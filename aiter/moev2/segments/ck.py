@@ -100,8 +100,26 @@ def _cap(specs):
     )
 
 
+def per_token_fp8():
+    """fp8 per-token `ScaleSpec` of the running arch."""
+    return scale_spec(QuantType.per_Token, dtypes.fp8)
+
+
+def blockscale_fp8():
+    """fp8 `ScaleSpec` with 1x128 activation groups (128x128 weight blocks)."""
+    return scale_spec(QuantType.per_1x128, dtypes.fp8)
+
+
 def a8w8_per_tensor_caps():
     return (_cap(frozenset({per_tensor_fp8()})),)
+
+
+def a8w8_per_token_caps():
+    return (_cap(frozenset({per_token_fp8()})),)
+
+
+def a8w8_blockscale_caps():
+    return (_cap(frozenset({blockscale_fp8()})),)
 
 
 def a16w16_caps():
@@ -113,7 +131,12 @@ def a16w16_caps():
 
 
 def ck_2stage_caps():
-    return a8w8_per_tensor_caps() + a16w16_caps()
+    return (
+        a8w8_per_tensor_caps()
+        + a8w8_per_token_caps()
+        + a8w8_blockscale_caps()
+        + a16w16_caps()
+    )
 
 
 def ck_stage1_caps():

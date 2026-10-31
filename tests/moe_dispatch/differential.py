@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import sys
+from collections import Counter
 
 _HERE = pathlib.Path(__file__).resolve().parent
 
@@ -60,15 +61,44 @@ def _legacy_logs(key):
     return logs
 
 
+def one_stage_decline(path, key):
+    """The reason `path` hands `key` back to legacy as a 1-stage key, else None.
+
+    A ranking region marked legacy and a 1-stage tuned row both stand for the legacy
+    1-stage branch.
+    """
+    from aiter.moev2 import api
+    from aiter.moev2.dispatch import resolver
+
+    if path.takes is None:
+        return None
+    try:
+        problem = api.problem_from_key(key.args, key.call_kwargs())
+    except Exception:  # noqa: BLE001 - key_checks.py reports these
+        return None
+    if not path.takes(problem):
+        return None
+    reason = resolver.resolve(problem, path.segments).declined or ""
+    if reason == "1-stage tuned row" or (
+        reason.startswith("ranking ") and reason.endswith(" is not ported")
+    ):
+        return reason
+    return None
+
+
 def compare(arch, check_logs=True):
-    """Return (claimed {label: path name}, problems [str]) for one simulated arch."""
+    """`(claimed {label: path name}, one_stage {label: path name}, problems [str])`.
+
+    `one_stage`: keys a path hands back as legacy 1-stage keys, which must be 1-stage
+    in the legacy record.
+    """
     from aiter.moev2 import paths
     from aiter.moev2.dispatch import tuned
     from moe_dispatch import arch_sim, record, snapshot
 
     golden = snapshot.read(arch)
     checkers = [p for p in paths.registered().values() if p.dispatch_record is not None]
-    claimed, problems = {}, []
+    claimed, one_stage, problems = {}, {}, []
     with arch_sim.simulated_arch(arch) as (gfx, cu_num):
         keys = snapshot.dispatch_keys(gfx, cu_num)
         # Load the tuned table once up front so no key's logs include the load warnings.
@@ -87,6 +117,16 @@ def compare(arch, check_logs=True):
                     except Exception as exc:  # noqa: BLE001
                         plan = record.error_record(exc)
                 if plan is None:
+                    with captured_logs():
+                        reason = one_stage_decline(path, key)
+                    if reason is not None:
+                        one_stage[label] = path.name
+                        expected = snapshot.resolve_same_as_base(golden, label)
+                        if not expected.get("run_1stage"):
+                            problems.append(
+                                f"{label} [{path.name}] declined ({reason}) but legacy "
+                                f"runs it 2-stage: {json.dumps(expected, sort_keys=True)}"
+                            )
                     continue
                 if check_logs:
                     legacy_logs = _legacy_logs(key)
@@ -110,7 +150,7 @@ def compare(arch, check_logs=True):
                         f"    legacy: {json.dumps(expected, sort_keys=True)}\n"
                         f"    v2:     {json.dumps(got, sort_keys=True)}"
                     )
-    return claimed, problems
+    return claimed, one_stage, problems
 
 
 def main(argv=None):
@@ -130,13 +170,16 @@ def main(argv=None):
 
     failed = False
     for arch in args.arch or list(arch_sim.ARCHS):
-        claimed, problems = compare(arch, check_logs=not args.no_logs)
-        by_path = {}
-        for name in claimed.values():
-            by_path[name] = by_path.get(name, 0) + 1
-        summary = ", ".join(f"{k}={v}" for k, v in sorted(by_path.items())) or "none"
+        claimed, one_stage, problems = compare(arch, check_logs=not args.no_logs)
+
+        def summary(by_label):
+            counts = Counter(by_label.values())
+            return ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"
+
         print(
-            f"{arch}: {len(claimed)} keys claimed by v2 ({summary}), {len(problems)} problems"
+            f"{arch}: {len(claimed)} keys claimed by v2 ({summary(claimed)}), "
+            f"{len(one_stage)} handed back as legacy 1-stage ({summary(one_stage)}), "
+            f"{len(problems)} problems"
         )
         for line in problems[:40]:
             print("  " + line)
@@ -184,6 +227,8 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
         }
     stage1 = dict(legacy)["stage1"]
     v2_stage1 = dict(v2)["stage1"]
+    if "block_m" not in stage1.keywords:
+        return {("stage1", ""): f"stage1: {stage1.func} is not a 2-stage launch"}
     # Executor and legacy both call stage 1 as (a1, w1, w2, sorted_ids,
     # sorted_expert_ids, num_valid_ids, out, topk, block_m=..., ...).
     block_m = int(stage1.keywords["block_m"])
@@ -301,30 +346,41 @@ def run_differential(path_name, call, *, bitwise=False):
         paths.reload()
     if len(results) != 1 or results[0] is paths.DECLINED:
         raise AssertionError(f"path {path_name} did not run this call: {results}")
-    problems = list(
-        compare_launches(legacy_launches, v2_launches, call, ref, out).values()
-    )
+    problems = compare_launches(legacy_launches, v2_launches, call, ref, out)
     if problems:
         raise AssertionError(
-            f"{path_name}: launches differ: " + "; ".join(problems[:6])
+            f"{path_name}: launches differ: " + "; ".join(list(problems.values())[:6])
         )
     if bitwise:
         assert torch.equal(ref, out), f"{path_name}: output differs from legacy"
-    else:
-        finite = ref.isfinite()
-        assert torch.equal(finite, out.isfinite()) and torch.equal(
-            ref[~finite], out[~finite]
-        ), f"{path_name}: non-finite outputs differ from legacy"
-
-        def gap(x):
-            return (x.float()[finite] - ref.float()[finite]).abs().max().item()
-
-        noise, err = gap(ref2), gap(out)
-        tol = max(4 * _ulp(ref), 2 * noise)
-        assert (
-            err <= tol
-        ), f"{path_name}: max |v2 - legacy| {err} > {tol} (legacy noise {noise})"
+        return ref, out
+    _check_output(path_name, ref, ref2, out)
     return ref, out
+
+
+def _check_output(path_name, ref, ref2, out):
+    """`out` matches legacy `ref` within the noise between two legacy runs."""
+    import torch
+
+    finite = ref.isfinite()
+
+    def gap(x):
+        diff = (x.float()[finite] - ref.float()[finite]).abs()
+        return diff.max().item() if diff.numel() else 0.0
+
+    noise = gap(ref2) if torch.equal(finite, ref2.isfinite()) else float("inf")
+    peak = ref.float()[finite].abs().max().item() if finite.any() else 0.0
+    assert (
+        noise <= peak
+    ), f"{path_name}: legacy output not reproducible (noise {noise}, peak {peak})"
+    assert torch.equal(finite, out.isfinite()) and torch.equal(
+        ref[~finite], out[~finite]
+    ), f"{path_name}: non-finite outputs differ from legacy"
+    err = gap(out)
+    tol = max(4 * _ulp(ref), 2 * noise)
+    assert (
+        err <= tol
+    ), f"{path_name}: max |v2 - legacy| {err} > {tol} (legacy noise {noise})"
 
 
 if __name__ == "__main__":

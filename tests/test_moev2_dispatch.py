@@ -525,41 +525,166 @@ def test_claims_only_unquantized_16_bit(monkeypatch):
     assert not a16w16.claims(call)
 
 
+_LOCAL_PATHS = ("a8w8_pt", "a16w16", "a8w8_ptok", "a8w8_blockscale")
+
+
+def _local_path_modules():
+    import importlib
+
+    return [importlib.import_module(f"aiter.moev2.migration.{n}") for n in _LOCAL_PATHS]
+
+
+def _fp8_op_call(quant_type):
+    call = _per_tensor_op_call()
+    call["quant_type"] = quant_type.value
+    return call
+
+
 def test_the_paths_take_disjoint_keys():
-    from aiter.moev2.migration import a8w8_pt, a16w16
+    owners = {
+        "a8w8_pt": _problem(),
+        "a16w16": _problem(quant=QuantType.No, fp8=dtypes.bf16),
+        "a8w8_ptok": _problem(quant=QuantType.per_Token),
+        "a8w8_blockscale": _problem(quant=QuantType.per_1x128),
+    }
+    modules = _local_path_modules()
+    for owner, p in owners.items():
+        assert [m.NAME for m in modules if m.takes(p)] == [owner], p
 
-    bf16 = _problem(quant=QuantType.No, fp8=dtypes.bf16)
-    assert a16w16.takes(bf16) and not a8w8_pt.takes(bf16)
-    assert a8w8_pt.takes(_problem()) and not a16w16.takes(_problem())
+
+def test_claims_per_token_and_blockscale_fp8(monkeypatch):
+    from aiter.moev2.migration import a8w8_blockscale, a8w8_ptok, local
+
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    modules = _local_path_modules()
+    for quant, owner in (
+        (QuantType.per_Token, a8w8_ptok),
+        (QuantType.per_1x128, a8w8_blockscale),
+        (QuantType.per_128x128, a8w8_blockscale),  # remapped to per_1x128 by legacy
+    ):
+        call = _fp8_op_call(quant)
+        assert [m.NAME for m in modules if m.claims(call)] == [owner.NAME], quant
+        for change in (
+            {"w1": torch.empty(4, 32, 64, dtype=torch.int8)},
+            {"w1": torch.empty(4, 16, 64, dtype=dtypes.fp8)},  # g1u0
+            {"activation": ActivationType.Swiglu.value},
+            {"quant_type_a": QuantType.per_Tensor.value},
+            {"bias1": torch.empty(1)},
+        ):
+            assert not owner.claims({**call, **change}), (quant, change)
 
 
-@pytest.mark.parametrize("base", ["a8w8_pt", "a16w16"])
+@pytest.mark.parametrize("base", _LOCAL_PATHS)
 def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
     """A claimed call's key is taken by the same path, and only by it.
 
     Changes here are visible in the dispatch key; call-only checks (bias tensors,
     padding, AITER_ONLINE_TUNE) are in `claims` alone.
     """
-    from aiter.moev2.migration import a8w8_pt, a16w16, local
+    from aiter.moev2.migration import local
 
     monkeypatch.setattr(local, "get_gfx", lambda: "gfx950")
     monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(api, "get_gfx_runtime", lambda: "gfx950")
-    call = _per_tensor_op_call() if base == "a8w8_pt" else _a16w16_op_call()
+    call = {
+        "a8w8_pt": _per_tensor_op_call,
+        "a16w16": _a16w16_op_call,
+        "a8w8_ptok": lambda: _fp8_op_call(QuantType.per_Token),
+        "a8w8_blockscale": lambda: _fp8_op_call(QuantType.per_1x128),
+    }[base]()
     w1 = call["w1"]
     for change in (
         {},
-        {"quant_type": QuantType.per_Token.value},
-        {"quant_type": QuantType.No.value},
-        {"quant_type": QuantType.per_Tensor.value},
+        *({"quant_type": q.value} for q in QuantType.__members__.values()),
         {"w1": torch.empty(4, 16, 64, dtype=w1.dtype)},  # g1u0
         {"activation": ActivationType.Gelu.value},
         {"dtype": dtypes.fp16},
     ):
         changed = {**call, **change}
         problem = api.build_problem(changed, arch="gfx950", cu_num=256)
-        for path in (a8w8_pt, a16w16):
+        for path in _local_path_modules():
             assert path.claims(changed) == path.takes(problem), (path.NAME, change)
+
+
+def _default_resolve(monkeypatch, token, quant, inter_dim=256):
+    from aiter.moev2.migration import a8w8_blockscale, a8w8_ptok
+
+    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    p = _problem(token=token, quant=quant)
+    p = dataclasses.replace(p, shape=dataclasses.replace(p.shape, inter_dim=inter_dim))
+    path = a8w8_blockscale if quant == QuantType.per_1x128 else a8w8_ptok
+    return resolver.resolve(p, path.SEGMENTS)
+
+
+def test_per_token_fp8_defaults_hand_the_1stage_region_back(monkeypatch):
+    res = _default_resolve(monkeypatch, 17, QuantType.per_Token)
+    assert res.plan is None and "1-stage ASM fmoe is not ported" in res.declined
+    res = _default_resolve(monkeypatch, 16, QuantType.per_Token, inter_dim=192)
+    assert res.plan is None and "not inter_dim_128" in res.declined
+    res = _default_resolve(monkeypatch, 16, QuantType.per_Token)
+    assert res.plan.structure()[0] == (
+        "sort", "quant.a1", "ck.gemm1", "quant.inter", "ck.gemm2"
+    )  # fmt: skip
+    assert (res.metadata.block_m, res.metadata.ksplit) == (32, 0)
+
+
+def test_blockscale_defaults_take_the_legacy_block_m_and_ksplit(monkeypatch):
+    calls = []
+
+    def has_kernel(*args):
+        calls.append(args)
+        return 0
+
+    res = _default_resolve(monkeypatch, 1, QuantType.per_1x128)
+    assert (res.metadata.block_m, res.metadata.ksplit) == (16, 14)
+    res = _default_resolve(monkeypatch, 33, QuantType.per_1x128)
+    assert res.plan is None and "fmoe_fp8_blockscale_g1u1 is not ported" in res.declined
+
+    import aiter
+
+    monkeypatch.setattr(aiter, "fmoe_fp8_blockscale_g1u1_has_kernel", has_kernel)
+    _default_resolve(monkeypatch, 16, QuantType.per_1x128)
+    _default_resolve(monkeypatch, 33, QuantType.per_1x128, inter_dim=192)
+    assert calls == []  # legacy asks the kernel table only past the shape checks
+    res = _default_resolve(monkeypatch, 33, QuantType.per_1x128)
+    assert calls == [(ActivationType.Silu.value, False, 32, 256, 7168)]
+    assert res.plan.structure()[0][2] == "ck.gemm1"
+    assert (res.metadata.block_m, res.metadata.ksplit) == (64, 0)
+
+
+def test_a_tuned_asm_blockscale_row_runs_the_packed_stage1(monkeypatch):
+    from aiter.moev2.migration import a8w8_blockscale
+
+    row = {
+        "block_m": 16,
+        "ksplit": 0,
+        "run_1stage": 0,
+        "kernelName1": "_ZN5aiter59fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1_16x256_2tg_pf3E",
+        "kernelName2": "moe_ck2stages_gemm2_256x16x128x256_1x4_MulABScaleExpertWeightA8W8blkscale_v1_Nswizzle0_Quant4_MulRoutedWeight1_F8_F8_B16",
+    }
+    monkeypatch.setattr(tuned, "lookup", lambda problem: row)
+    res = resolver.resolve(
+        _problem(quant=QuantType.per_1x128), a8w8_blockscale.SEGMENTS
+    )
+    assert res.plan.structure()[0] == (
+        "sort", "quant.a1", "asm.stage1_1x128", "ck.gemm2"
+    )  # fmt: skip
+    assert res.metadata.stage1.func.__name__ == "asm_stage1"
+
+
+def test_the_packed_stage1_buffer_splits_like_legacy():
+    from aiter.moev2.segments.asm import AsmStage1Blockscale as S
+
+    token, topk, inter, model = 5, 8, 256, 512
+    a1 = torch.empty(token, model, dtype=dtypes.fp8)
+    a1_scale = torch.empty(model // 128, token, dtype=torch.float32)
+    a2 = S.out_buffer(a1, a1_scale, token, topk, inter, dtypes.fp8)
+    assert a2.shape == (token + (token * 4 + 127) // 128, topk, inter)
+    out, scale = S.split_out(a2, a1, a1_scale, token, topk, inter)
+    assert out.shape == (token, topk, inter) and out.data_ptr() == a2.data_ptr()
+    assert scale.dtype == torch.float32 and scale.shape == (token, topk * inter // 128)
+    assert scale.data_ptr() == a2[token:].data_ptr()
 
 
 def test_g1u0_is_not_claimed_and_has_no_ck_plan():
@@ -580,9 +705,7 @@ def test_g1u0_is_not_claimed_and_has_no_ck_plan():
 
 
 def test_tuned_cache_clear_also_resets_path_caches():
-    from aiter.moev2.migration import a8w8_pt, a16w16
-
-    for path in (a8w8_pt, a16w16):
+    for path in _local_path_modules():
         caches = (path.LOCAL.dispatch, path.LOCAL.resolve, path.LOCAL.relookup)
         assert all(cache in tuned._CACHES for cache in caches)
 

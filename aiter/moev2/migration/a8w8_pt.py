@@ -33,7 +33,7 @@ SEGMENTS = (
 
 
 def claims(call) -> bool:
-    return local.claims(call, QuantType.per_Tensor, ARCHS, (dtypes.fp8,))
+    return local.claims(call, (QuantType.per_Tensor,), ARCHS, (dtypes.fp8,))
 
 
 def takes(problem) -> bool:

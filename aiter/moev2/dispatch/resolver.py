@@ -20,10 +20,15 @@ from aiter import logger
 from ..execute.metadata import MOEMetadata
 from ..segments.asm import stage2_block_m
 from ..segments.base import Params
-from ..segments.defaults import BLOCK_SIZE_M, get_block_size_M, use_nt
+from ..segments.defaults import (
+    BLOCK_SIZE_M,
+    default_block_m,
+    default_ksplit,
+    use_nt,
+)
 from ..segments.whole_graph import FusedMoeImplResolutionError, resolve_fused_moe_impl
 from . import kernel_names, overrides, profile, ranking, tuned
-from .ops import chain
+from .ops import Op, chain
 from .plan import MoePlan, SegmentChoice
 
 INFO = logging.INFO
@@ -109,8 +114,8 @@ def match_row(plans, row):
     if isinstance(k2, str):
         return k2
     for structure in plans:
-        gemm1 = [s for s in structure if s.covers[0].name == "GEMM1"]
-        gemm2 = [s for s in structure if s.covers[0].name == "GEMM2"]
+        gemm1 = [s for s in structure if s.covers[0] == Op.GEMM1]
+        gemm2 = [s for s in structure if s.covers[0] == Op.GEMM2]
         if gemm1 and gemm2 and gemm1[0].owns(k1) and gemm2[0].owns(k2):
             return structure
     return f"no segments run kernelName1={k1}, kernelName2={k2}"
@@ -127,15 +132,15 @@ def _two_stage_plan(
     nt,
     run_1stage,
 ):
-    names = [s.name for s in structure]
-    is_asm = "asm.stage1" in names
+    gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
+    is_asm = kernel_names.ASM in gemm1.prefixes
     if is_asm:
         block_m = stage2_block_m(block_m)
     choices = []
     for segment in structure:
-        if segment.name in ("ck.gemm1", "asm.stage1"):
+        if segment.covers[0] == Op.GEMM1:
             params = Params(kernel=kernelName1, ksplit=ksplit, nt=nt)
-        elif segment.name == "ck.gemm2":
+        elif segment.covers[0] == Op.GEMM2:
             params = Params(kernel=kernelName2, nt=nt)
         else:
             params = Params()
@@ -146,8 +151,8 @@ def _two_stage_plan(
         Params(block_m=block_m, ksplit=ksplit),
         tuple(c.segment.produces(problem, c.params) for c in choices[:-1]),
     )
-    stage1 = plan.segments[names.index("asm.stage1" if is_asm else "ck.gemm1")]
-    stage2 = plan.segments[names.index("ck.gemm2")]
+    stage1 = plan.starting(Op.GEMM1)
+    stage2 = plan.starting(Op.GEMM2)
     metadata = MOEMetadata(
         stage1.segment.build(problem, stage1.params),
         stage2.segment.build(problem, stage2.params),
@@ -240,12 +245,13 @@ def resolve(problem, segments) -> Resolution:
             return declined(f"ranking {region}: {legacy} is not ported")
         if structure is None:
             return declined(f"ranking {region}: no listed structure is feasible")
-        ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
         run_1stage_xbf16 = False
-        block_m = get_block_size_M(s.m, s.topk, s.experts, s.inter_dim)
+        dims = (q_type, s.m, s.topk, s.experts, s.inter_dim, s.model_dim)
+        block_m = default_block_m(*dims)
+        ksplit = default_ksplit(*dims)
         use_non_temporal_load = use_nt(s.m, s.topk, s.experts)
         logs.append(
             (

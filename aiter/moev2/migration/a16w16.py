@@ -25,7 +25,7 @@ SEGMENTS = (Sort(), QuantA1(), CkGemm1(), QuantInter(), CkGemm2(), WholeGraph())
 
 
 def claims(call) -> bool:
-    return local.claims(call, QuantType.No, ARCHS, (dtypes.bf16, dtypes.fp16))
+    return local.claims(call, (QuantType.No,), ARCHS, (dtypes.bf16, dtypes.fp16))
 
 
 def takes(problem) -> bool:

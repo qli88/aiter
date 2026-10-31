@@ -103,6 +103,8 @@ class Path:
 _BUILTIN_MODULES: tuple = (
     "aiter.moev2.migration.a8w8_pt",
     "aiter.moev2.migration.a16w16",
+    "aiter.moev2.migration.a8w8_ptok",
+    "aiter.moev2.migration.a8w8_blockscale",
 )
 
 _REGISTRY: dict[str, Path] = {}

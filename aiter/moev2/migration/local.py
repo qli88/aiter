@@ -38,16 +38,18 @@ _UNSUPPORTED_ARGS = (
 )
 
 
-def claims(call, quant_type, archs, weight_dtypes) -> bool:
+def claims(call, quant_types, archs, weight_dtypes) -> bool:
     """Cheap checks on the `fused_moe_` arguments; `run` may still decline.
 
-    `quant_type` (and a `quant_type_a`, if given), Silu or Gelu, separated gate/up, no
-    bias, padding or caller-chosen activation dtypes, outside AITER_ONLINE_TUNE, on
-    `archs`, with 3D `w1`/`w2` of `weight_dtypes` and `w1` holding gate and up (g1u1).
+    A quant type in `quant_types` (and the same `quant_type_a`, if given), Silu or Gelu,
+    separated gate/up, no bias, padding or caller-chosen activation dtypes, outside
+    AITER_ONLINE_TUNE, on `archs`, with 3D `w1`/`w2` of `weight_dtypes` and `w1` holding
+    gate and up (g1u1).
     """
     if overrides.online_tune():
         return False
-    if QuantType(call["quant_type"]) != quant_type:
+    quant_type = QuantType(call["quant_type"])
+    if quant_type not in quant_types:
         return False
     quant_type_a = call["quant_type_a"]
     if quant_type_a is not None and QuantType(quant_type_a) != quant_type:

@@ -11,10 +11,15 @@ the same output up to the GEMM2 atomics, and log the same dispatch lines on a fi
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt --synth-table
 
 Shipped tables have per-tensor rows for gfx942 only (and bf16 rows for gfx942 and a few
-gfx950 shapes). `--synth-table` copies the path's gfx942 CK rows to the running arch in a
-temporary AITER_CONFIG_FMOE, so the tuned CK branch runs on a gfx950 too. ASM and FlyDSL
-rows are not copied: their gfx942 configs give garbage on gfx950 (legacy and v2 alike),
-so those branches need a gfx942 for this check.
+gfx950 shapes). `--synth-table` adds the path's gfx942 CK rows, copied to the running
+arch, to the arch's own rows in a temporary AITER_CONFIG_FMOE, so the tuned CK branch runs
+on a gfx950 too. ASM and FlyDSL rows are not copied: their gfx942 configs give garbage on
+gfx950 (legacy and v2 alike). For a8w8_blockscale, whose shipped ASM stage-1 rows are
+gfx942 only, the arch's own CK rows are also added with stage 1 swapped for the arch's
+ASM kernel of the same tile M (when it ships one), so that branch runs too.
+
+A case that does not fit in the free GPU memory is reported as skipped; one that raises
+the same error on legacy and v2 passes, with the error printed.
 """
 
 import argparse
@@ -49,18 +54,73 @@ _A16W16_DEFAULT = (
     *((m, 4096, 384, 128, 8, "Silu", False, "bf16", False) for m in (64, 1024)),
 )  # fmt: skip
 
-_CASES = {"a8w8_pt": _A8W8_PT_DEFAULT, "a16w16": _A16W16_DEFAULT}
+# Outside gfx950's default 1-stage ASM region (`token > 16 or inter_dim % 128`, bf16
+# output, Silu or Gelu, Silu only with doweight_stage1), which the path declines.
+_A8W8_PTOK_DEFAULT = (
+    # fp16 shapes stay small: larger ones overflow, and where the infinities land
+    # differs between two legacy runs (GEMM2 atomics).
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16)),
+    *((m, 2048, 256, 128, 8, "Gelu", False, "fp16", False) for m in (32, 512)),
+    *((m, 4096, 512, 64, 4, "Gelu", True, "bf16", False) for m in (8, 300)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False) for m in (5, 200)),
+    *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True) for m in (16,)),
+    *((m, 2048, 256, 64, 8, "Silu", False, "fp16", True) for m in (512,)),
+    # Shapes with shipped gfx950 cu256 rows (ASM stage 1 + CK stage 2, and CK).
+    *((m, 5120, 1536, 40, 8, "Silu", False, "bf16", False) for m in (1, 2, 256, 1024, 4096)),
+    *((m, 5120, 1536, 41, 10, "Silu", False, "bf16", False) for m in (3, 8, 64)),
+    *((m, 5120, 384, 161, 9, "Silu", False, "bf16", False) for m in (4, 2048)),
+    *((m, 6144, 512, 257, 9, "Silu", False, "bf16", False) for m in (16, 1024)),
+)  # fmt: skip
+
+# Outside gfx950's default 1-stage ASM region (`token > 32`, bf16 output, no
+# doweight_stage1, a kernel for the shape); token <= 32 runs CK with split-K.
+_A8W8_BLOCKSCALE_DEFAULT = (
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 32)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 32)),
+    *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False) for m in (8, 300)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False) for m in (5, 200)),
+    *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True) for m in (16,)),
+    *((m, 7168, 256, 64, 8, "Silu", True, "bf16", True) for m in (512,)),
+    # Shapes with shipped gfx950 cu256 rows (CK, some with split-K).
+    *((m, 4096, 384, 128, 8, "Silu", False, "bf16", False) for m in (1, 256, 4096)),
+    *((m, 4096, 384, 128, 8, "Silu", True, "bf16", False) for m in (8, 512)),
+    *((m, 7168, 512, 257, 9, "Silu", False, "bf16", False) for m in (1, 128)),
+    *((m, 4096, 1536, 16, 8, "Silu", False, "bf16", False) for m in (16, 512)),
+)  # fmt: skip
+
+_CASES = {
+    "a8w8_pt": _A8W8_PT_DEFAULT,
+    "a16w16": _A16W16_DEFAULT,
+    "a8w8_ptok": _A8W8_PTOK_DEFAULT,
+    "a8w8_blockscale": _A8W8_BLOCKSCALE_DEFAULT,
+}
 # The dispatch key's quant type and weight dtype of each path's tuned rows.
 _ROWS = {
     "a8w8_pt": ("QuantType.per_Tensor", "float8"),
     "a16w16": ("QuantType.No", "16"),
+    "a8w8_ptok": ("QuantType.per_Token", "float8"),
+    "a8w8_blockscale": ("QuantType.per_1x128", "float8"),
 }
+
+
+def _per_128x128_quant(weight, quant_dtype):
+    """op_tests/test_moe_2stage.py `weight_per_128x128_quant`."""
+    import aiter
+
+    E, dim1, dim2 = weight.shape
+    blocks = weight.view(E, dim1 // 128, 128, dim2 // 128, 128)
+    blocks = blocks.permute(0, 1, 3, 2, 4).contiguous().view(E, -1, 128 * 128)
+    qt, scale = aiter.pertoken_quant(blocks, quant_dtype=quant_dtype)
+    qt = qt.view(E, dim1 // 128, dim2 // 128, 128, 128)
+    qt = qt.permute(0, 1, 3, 2, 4).contiguous().view(E, dim1, dim2)
+    return qt, scale.view(E, dim1 // 128, dim2 // 128)
 
 
 def _make_call(path_name, case):
     """Inputs as op_tests/test_moe_2stage.py builds them for `-q 1` (per-tensor fp8,
-    path a8w8_pt) or `-q 0` (unquantized, path a16w16), except that the weights are
-    scaled by 1/sqrt(K)."""
+    path a8w8_pt), `-q 0` (unquantized, path a16w16), `-q 2` (per-token fp8, path
+    a8w8_ptok) or `-q 5` (128x128 fp8 blocks, path a8w8_blockscale).
+    Unlike op_tests, the weights are scaled by 1/sqrt(K) (see `weight`)."""
     import torch
 
     import aiter
@@ -73,22 +133,32 @@ def _make_call(path_name, case):
     dtype = {"bf16": dtypes.bf16, "fp16": dtypes.fp16}[out]
     device = "cuda"
     hidden = torch.randn((token, model_dim), dtype=dtype, device=device)
-    # Scaled so each GEMM keeps values near 1: unscaled, the fp16 outputs reach the
-    # fp16 limit, and whether a sum overflows then depends on the order of the GEMM2
-    # atomics.
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device=device)
-    w1 /= model_dim**0.5
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device=device)
-    w2 /= inter_dim**0.5
-    if path_name == "a8w8_pt":
-        quant_type = QuantType.per_Tensor
-        w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=dtypes.fp8)
-        w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=dtypes.fp8)
-    else:
-        quant_type = QuantType.No
-        w1_qt, w1_scale, w2_qt, w2_scale = w1, None, w2, None
-    w1_qt = shuffle_weight(w1_qt.view(w1.shape), layout=(16, 16))
-    w2_qt = shuffle_weight(w2_qt.view(w2.shape), layout=(16, 16))
+    quant_type = {
+        "a8w8_pt": QuantType.per_Tensor,
+        "a8w8_ptok": QuantType.per_Token,
+        "a8w8_blockscale": QuantType.per_128x128,
+    }.get(path_name, QuantType.No)
+
+    def weight(shape):
+        # Quantized one at a time, the bf16 copy freed: the GPU may be shared.
+        # Scaled by 1/sqrt(K) so each GEMM keeps values near 1: unscaled, the fp16
+        # outputs reach the fp16 limit, and whether a sum overflows then depends on
+        # the order of the GEMM2 atomics.
+        w = torch.randn(shape, dtype=dtype, device=device) / shape[-1] ** 0.5
+        if quant_type == QuantType.per_Tensor:
+            qt, scale = aiter.pertoken_quant(w.view(E, -1), quant_dtype=dtypes.fp8)
+        elif quant_type == QuantType.per_Token:
+            qt, scale = aiter.pertoken_quant(w, quant_dtype=dtypes.fp8)
+        elif quant_type == QuantType.per_128x128:
+            qt, scale = _per_128x128_quant(w, dtypes.fp8)
+        else:
+            qt, scale = w, None
+        qt = qt.view(shape)
+        del w
+        return shuffle_weight(qt, layout=(16, 16)), scale
+
+    w1_qt, w1_scale = weight((E, inter_dim * 2, model_dim))
+    w2_qt, w2_scale = weight((E, model_dim, inter_dim))
     global_E = 2 * E if ep else E
     score = torch.randn((token, global_E), dtype=dtype, device=device)
     topk_weight, topk_ids = fused_topk(hidden, score, topk, True)
@@ -112,7 +182,8 @@ def _make_call(path_name, case):
 
 
 def _synth_rows(path_name, table_file, gfx, cu_num, limit):
-    """`path_name`'s gfx942 rows rewritten for (gfx, cu_num); the case tuples."""
+    """The table: (gfx, cu_num)'s own rows plus `path_name`'s gfx942 CK rows rewritten
+    for it (own rows win on a shared key); the case tuples of a sample of the latter."""
     import pandas as pd
 
     from aiter.moev2.dispatch import kernel_names
@@ -134,13 +205,19 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
 
     src = src[src["kernelName1"].map(portable) & src["kernelName2"].map(portable)]
     src["gfx"], src["cu_num"] = gfx, cu_num
-    if path_name == "a8w8_pt":
+    if w_dtype == "float8":
         fp8 = "torch.float8_e4m3fn" if gfx == "gfx950" else "torch.float8_e4m3fnuz"
         src["q_dtype_a"] = src["q_dtype_w"] = fp8
     # Spread the sample over kernel families, block_m, ksplit and token counts.
     src = src.sort_values(["kernelName1", "block_m", "ksplit", "token"])
     step = max(1, len(src) // limit)
     sample = src.iloc[::step].head(limit)
+    own = df[(df["gfx"] == gfx) & (df["cu_num"] == cu_num)]
+    extra = df.iloc[:0]
+    if path_name == "a8w8_blockscale":
+        extra = _asm_blockscale_rows(df, gfx, cu_num)
+        sample = pd.concat([extra, sample])
+    table = pd.concat([extra, own, src]).drop_duplicates(_KEY_COLUMNS)
     cases = []
     for r in sample.itertuples():
         act = str(r.act_type).split(".")[-1]
@@ -149,7 +226,42 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
             (int(r.token), int(r.model_dim), int(r.inter_dim), int(r.expert),
              int(r.topk), act, bool(r.doweight_stage1), out, False)
         )  # fmt: skip
-    return src, cases
+    return table, cases
+
+
+_KEY_COLUMNS = [
+    "gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk", "act_type",
+    "dtype", "q_dtype_a", "q_dtype_w", "q_type", "use_g1u1", "doweight_stage1",
+]  # fmt: skip
+
+
+def _asm_blockscale_rows(df, gfx, cu_num):
+    """The arch's own 1x128 CK rows with stage 1 swapped for its ASM kernel of the same
+    tile M: shipped ASM rows for this format exist for gfx942 only."""
+    import pandas as pd
+
+    listing = (
+        _REPO / "hsa" / gfx / "fmoe_2stages"
+        / "fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1.csv"
+    )  # fmt: skip
+    if not listing.exists():
+        return df.iloc[:0]
+    kernels = pd.read_csv(listing)
+    kernels = kernels[kernels["tile_n"] == 128]  # every 1x128 inter_dim fits
+    by_tile_m = {m: min(g["knl_name"]) for m, g in kernels.groupby("tile_m")}
+    own = df[
+        (df["gfx"] == gfx)
+        & (df["cu_num"] == cu_num)
+        & (df["q_type"] == "QuantType.per_1x128")
+        & (df["run_1stage"] == 0)
+        & (df["use_g1u1"] == 1)
+        & (df["doweight_stage1"] == 0)
+        & (df["ksplit"] == 0)
+        & df["kernelName1"].str.startswith("moe_ck2stages_gemm1_")
+        & df["block_m"].isin(list(by_tile_m))
+    ].copy()
+    own["kernelName1"] = own["block_m"].map(by_tile_m)
+    return own
 
 
 def cases(path_name, synth_cases=()):
@@ -160,10 +272,10 @@ def cases(path_name, synth_cases=()):
 
 def _clear_dispatch_caches():
     import aiter.fused_moe as fm
-    from aiter.moev2.migration import a8w8_pt, a16w16
+    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
 
     fm.get_2stage_cfgs.cache_clear()
-    for path in (a8w8_pt, a16w16):
+    for path in (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale):
         for cache in (path.LOCAL.dispatch, path.LOCAL.resolve, path.LOCAL.relookup):
             cache.cache_clear()
 
@@ -198,6 +310,7 @@ def run_case(path_name, case):
     if legacy_error or v2_error:
         if legacy_error != v2_error:
             return f"{case}: legacy raises {legacy_error}; v2 raises {v2_error}"
+        print(f"     both raise {legacy_error[:160]}")
         return None
     try:
         run_differential(path_name, call)
@@ -217,14 +330,25 @@ def _child(args):
     print(
         f"{get_gfx_runtime()} cu{get_cu_num()} torch {torch.__version__}: {len(todo)} cases"
     )
-    problems = []
+    problems, skipped = [], []
     for case in todo:
-        problem = run_case(args.path, case)
-        print(("FAIL " if problem else "ok   ") + str(case), flush=True)
+        try:
+            problem = run_case(args.path, case)
+        except torch.OutOfMemoryError:
+            # The GPU may be shared; a case that does not fit is reported, not compared.
+            problem = None
+            skipped.append(case)
+        torch.cuda.empty_cache()
+        status = (
+            "SKIP" if skipped and skipped[-1] is case else "FAIL" if problem else "ok  "
+        )
+        print(f"{status} {case}", flush=True)
         if problem:
             problems.append(problem)
     for line in problems:
         print("  " + line)
+    if skipped:
+        print(f"{len(skipped)} cases skipped: out of GPU memory")
     print(f"{len(problems)} problems")
     return 1 if problems else 0
 
