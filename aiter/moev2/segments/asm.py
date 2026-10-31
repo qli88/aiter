@@ -3,6 +3,7 @@
 """ASM stage-1 kernels (`_ZN5aiter...fmoe_stage1...E`)."""
 
 import functools
+from dataclasses import replace
 
 import torch
 
@@ -15,7 +16,13 @@ from ..dispatch.ops import Op
 from ..problem import ScaleSpec
 from ..shapes import get_inter_dim
 from .base import Segment
-from .ck import a8w8_blockscale_caps, a8w8_per_tensor_caps, a8w8_per_token_caps
+from .ck import (
+    a8w8_blockscale_caps,
+    a8w8_per_tensor_caps,
+    a8w8_per_token_caps,
+    int8_per_tensor_caps,
+    int8_per_token_caps,
+)
 
 
 def asm_stage1(
@@ -104,7 +111,13 @@ class AsmStage1(Segment):
 
     @property
     def capabilities(self):
-        return a8w8_per_tensor_caps() + a8w8_per_token_caps()
+        # The kernel tables (`get_cfg` in asm_moe_2stage.cu): fp8 with or without
+        # doweight, int8 without; per-tensor runs as per-token.
+        int8 = tuple(
+            replace(cap, features=cap.features - {"doweight_stage1"})
+            for cap in int8_per_tensor_caps() + int8_per_token_caps()
+        )
+        return a8w8_per_tensor_caps() + a8w8_per_token_caps() + int8
 
     def produces(self, p, params):
         return Buf("inter", ScaleSpec(dtypes.bf16))

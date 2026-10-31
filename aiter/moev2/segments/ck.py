@@ -85,12 +85,13 @@ def per_tensor_fp8():
     return scale_spec(QuantType.per_Tensor, dtypes.fp8)
 
 
-def _cap(specs):
+def _cap(specs, weights=None):
+    weights = specs if weights is None else weights
     return Cap(
         arch=frozenset({"gfx942", "gfx950"}),
         act_in=specs,
-        w1=specs,
-        w2=specs,
+        w1=weights,
+        w2=weights,
         out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
         activation=frozenset({"silu", "gelu"}),
         gate_mode=frozenset({"separated"}),
@@ -122,6 +123,31 @@ def a8w8_blockscale_caps():
     return (_cap(frozenset({blockscale_fp8()})),)
 
 
+def per_tensor_int8():
+    return scale_spec(QuantType.per_Tensor, dtypes.i8)
+
+
+def per_token_int8():
+    return scale_spec(QuantType.per_Token, dtypes.i8)
+
+
+def per_token_int4():
+    """int4 weights packed eight to a `uint32`, per-token scales (fp8 activations)."""
+    return scale_spec(QuantType.per_Token, torch.uint32)
+
+
+def int8_per_tensor_caps():
+    return (_cap(frozenset({per_tensor_int8()})),)
+
+
+def int8_per_token_caps():
+    return (_cap(frozenset({per_token_int8()})),)
+
+
+def int4_per_token_caps():
+    return (_cap(frozenset({per_token_fp8()}), frozenset({per_token_int4()})),)
+
+
 def a16w16_caps():
     """bf16/fp16 activations and weights, unquantized (`QuantType.No`)."""
     return tuple(
@@ -131,10 +157,15 @@ def a16w16_caps():
 
 
 def ck_2stage_caps():
+    """The `gen_instances.py` build list: f8 and i8 (and f8 x i4) per-tensor/per-token,
+    f8 1x128, and unquantized f16/b16."""
     return (
         a8w8_per_tensor_caps()
         + a8w8_per_token_caps()
         + a8w8_blockscale_caps()
+        + int8_per_tensor_caps()
+        + int8_per_token_caps()
+        + int4_per_token_caps()
         + a16w16_caps()
     )
 

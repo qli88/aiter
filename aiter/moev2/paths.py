@@ -68,6 +68,9 @@ class Path:
     function to the call's arguments. `run` returns the output, or `DECLINED`.
     `graduated`: True, or the archs (`get_gfx_runtime()` values) the path runs on by
     default; the default needs a passed GPU gate on that arch.
+    `graduated_claims(call)`: when the path runs by default (AITER_MOEV2 unset), it
+    claims only the calls this also accepts, the formats its gate covered; None for all.
+    A format added to a graduated path stays behind AITER_MOEV2 until its own gate.
     `dispatch_record(args, kwargs)`: for a legacy `get_2stage_cfgs(*args, **kwargs)` key,
     the v2 plan in the legacy snapshot record format, or None if the path does not take
     the key (not claimed, or declined). Used by the CPU differential test; the GPU cases
@@ -81,6 +84,7 @@ class Path:
     claims: Callable[[Mapping], bool]
     run: Callable[[Mapping], object]
     graduated: bool | frozenset = False
+    graduated_claims: Callable[[Mapping], bool] | None = None
     dispatch_record: Callable[[tuple, dict], object] | None = None
     entry: str = "api"
     segments: tuple = ()
@@ -178,9 +182,14 @@ def any_active() -> bool:
 
 def route_to_v2(call: Mapping, entry: str = "api"):
     """The active path at `entry` that claims this call, or None for the legacy code."""
+    by_default = envs.moev2_selection() == "default"
     for path in active():
-        if path.entry == entry and path.claims(call):
-            return path
+        if path.entry != entry or not path.claims(call):
+            continue
+        gate = path.graduated_claims
+        if by_default and gate is not None and not gate(call):
+            continue
+        return path
     return None
 
 

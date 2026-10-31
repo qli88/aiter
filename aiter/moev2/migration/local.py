@@ -43,8 +43,8 @@ def claims(call, quant_types, archs, weight_dtypes) -> bool:
 
     A quant type in `quant_types` (and the same `quant_type_a`, if given), Silu or Gelu,
     separated gate/up, no bias, padding or caller-chosen activation dtypes, outside
-    AITER_ONLINE_TUNE, on `archs`, with 3D `w1`/`w2` of `weight_dtypes` and `w1` holding
-    gate and up (g1u1).
+    AITER_ONLINE_TUNE, on `archs`, with 3D `w1`/`w2` of one of `weight_dtypes` and `w1`
+    holding gate and up (g1u1).
     """
     if overrides.online_tune():
         return False
@@ -70,7 +70,7 @@ def claims(call, quant_types, archs, weight_dtypes) -> bool:
     w1, w2 = call["w1"], call["w2"]
     if (
         w1.dtype not in weight_dtypes
-        or w2.dtype not in weight_dtypes
+        or w2.dtype != w1.dtype
         or w1.dim() != 3
         or w2.dim() != 3
     ):
