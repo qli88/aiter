@@ -22,6 +22,7 @@ __all__ = ["FusedMoeImplResolutionError", "WholeGraph", "resolve_fused_moe_impl"
 
 class WholeGraph(Segment):
     name = "impl.whole_graph"
+    reach = "tuned"
     prefixes = (kernel_names.IMPL,)
     covers = (Op.SORT, Op.REDUCE)
 

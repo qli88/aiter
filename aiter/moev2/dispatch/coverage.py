@@ -10,13 +10,15 @@ tests/moe_dispatch/coverage_checks.py):
   or a decline caused by its tuned row.
 - `row_status`: what the resolver does with the problem's exact tuned row: used, or
   why not (legacy's discard warning, or the decline).
-- `segment_errors`: a segment in a rankable feasible plan of some problem but in no
-  ranking entry, unless it is `tuned_only`; a `tuned_only` segment in a ranking entry.
+- `segment_errors`: segments whose `reach` does not hold: "ranked" in no ranking entry,
+  "tuned" or "hibernating" in one, "tuned" run by no shipped tuned row, "hibernating"
+  run by one or without a GPU test.
 """
 
+from ..segments.base import REACHES
 from . import tuned
-from .ranking import _default_table, best, rankable
-from .resolver import WARNING, feasible_plans, resolve
+from .ranking import _default_table, best
+from .resolver import WARNING, resolve
 
 KINDS = ("plan", "gap", "legacy", "row")
 
@@ -71,31 +73,43 @@ def row_status(problem, resolution) -> str | None:
     return f"discarded: {warning}" if warning else "discarded"
 
 
-def segment_errors(paths, problems, table=None) -> list:
-    """Errors over `(label, problem)` pairs and the paths (with `takes`, `segments`)."""
+def segment_errors(paths, table=None, used=None, tested=frozenset()) -> list:
+    """Errors in the `reach` of the paths' segments.
+
+    `used`: the names of the segments in the plan of some shipped tuned row that runs,
+    over every arch; None skips the checks that need it. `tested`: the hibernating
+    segments with a GPU test.
+    """
     table = _default_table() if table is None else table
     ranked = ranked_segments(table)
     segments = {s.name: s for path in paths for s in path.segments}
-    errors = [
-        f"{name}: tuned_only, but in a ranking entry"
-        for name, s in sorted(segments.items())
-        if s.tuned_only and name in ranked
-    ]
-    unchecked = {
-        name for name, s in segments.items() if not s.tuned_only and name not in ranked
-    }
-    for label, problem in problems:
-        if not unchecked:
-            break
-        for path in paths:
-            if not path.takes(problem):
-                continue
-            for plan in rankable(feasible_plans(problem, path.segments)[0]):
-                for s in plan:
-                    if s.name in unchecked:
-                        unchecked.discard(s.name)
-                        errors.append(
-                            f"{s.name}: feasible for {label} but in no ranking entry; "
-                            "rank it, or mark it tuned_only if only tuned rows reach it"
-                        )
+    errors = []
+    for name, s in sorted(segments.items()):
+        if s.reach not in REACHES:
+            errors.append(f"{name}: unknown reach {s.reach!r}; known: {REACHES}")
+        elif s.reach == "ranked":
+            if name not in ranked:
+                errors.append(
+                    f"{name}: in no ranking entry; rank it, or set reach to "
+                    '"tuned" (only tuned rows run it) or "hibernating" (nothing does)'
+                )
+        elif name in ranked:
+            errors.append(f'{name}: reach "{s.reach}", but in a ranking entry')
+        elif s.reach == "tuned":
+            if used is not None and name not in used:
+                errors.append(
+                    f'{name}: reach "tuned", but no shipped tuned row runs it; '
+                    'set reach to "hibernating" or remove it'
+                )
+        else:
+            if used is not None and name in used:
+                errors.append(
+                    f'{name}: reach "hibernating", but a shipped tuned row runs it; '
+                    'set reach to "tuned"'
+                )
+            if name not in tested:
+                errors.append(
+                    f'{name}: reach "hibernating" without a GPU test; list one in '
+                    "tests/moe_dispatch/hibernating.py"
+                )
     return errors

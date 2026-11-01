@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""aiter.moev2.dispatch.coverage: gaps, tuned rows that do not run, unranked segments."""
+"""aiter.moev2.dispatch.coverage: gaps, tuned rows that do not run, segment reach."""
 
 import pathlib
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.moev2.dispatch import coverage
@@ -47,28 +48,59 @@ def test_classify_tells_plans_gaps_and_legacy_branches_apart():
     assert coverage.classify(g1u0, a16w16.SEGMENTS)[0] == "legacy"
 
 
-def test_a_segment_in_no_ranking_entry_fails_unless_tuned_only():
-    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt
-
-    errors = coverage.segment_errors([a8w8_pt.PATH], [("p", _problem())], table=())
-    assert "ck.gemm1: feasible for p but in no ranking entry; " in "".join(errors)
-    assert not any(
-        error.startswith(s.name + ":")
-        for error in errors
-        for s in a8w8_pt.SEGMENTS
-        if s.tuned_only
-    )
-    path = a8w8_blockscale.PATH
+def _reach_errors(reach, *, ranked=False, used=None, tested=()):
+    segment = SimpleNamespace(name="x.seg", reach=reach)
     table = (
-        Entry(
-            "x",
-            match(quant_type=QuantType.per_1x128),
-            otherwise=["sort | quant.a1 | asm.stage1_1x128 | ck.gemm2"],
-        ),
+        (Entry("x", match(quant_type=QuantType.per_1x128), otherwise=["x.seg"]),)
+        if ranked
+        else ()
     )
-    assert coverage.segment_errors([path], [], table=table) == [
-        "asm.stage1_1x128: tuned_only, but in a ranking entry"
-    ]
+    return coverage.segment_errors(
+        [SimpleNamespace(segments=[segment])], table=table, used=used, tested=tested
+    )
+
+
+def test_each_reach_is_checked():
+    assert _reach_errors("ranked", ranked=True) == []
+    assert "in no ranking entry" in _reach_errors("ranked")[0]
+    assert _reach_errors("tuned", used={"x.seg"}) == []
+    assert _reach_errors("tuned") == []  # usage not known: not checked
+    assert "no shipped tuned row runs it" in _reach_errors("tuned", used=set())[0]
+    assert "but in a ranking entry" in _reach_errors("tuned", ranked=True)[0]
+    assert _reach_errors("hibernating", used=set(), tested={"x.seg"}) == []
+    assert "a shipped tuned row runs it" in "".join(
+        _reach_errors("hibernating", used={"x.seg"}, tested={"x.seg"})
+    )
+    assert "without a GPU test" in _reach_errors("hibernating", used=set())[0]
+    assert "but in a ranking entry" in "".join(
+        _reach_errors("hibernating", ranked=True, tested={"x.seg"})
+    )
+    assert "unknown reach" in _reach_errors("tuned_only")[0]
+
+
+def test_the_registered_segments_hold_their_reach():
+    from aiter.moev2 import paths
+
+    registered = paths.registered().values()
+    assert coverage.segment_errors(registered) == []
+    ranked = coverage.ranked_segments()
+    segments = {s.name: s for p in registered for s in p.segments}
+    assert {"sort", "ck.gemm1", "flydsl_fhmoe.gemm2"} <= ranked
+    assert {"asm.stage1_1x128", "impl.whole_graph", "sort.flat"} <= {
+        name for name, s in segments.items() if s.reach == "tuned"
+    }
+
+
+def test_every_hibernating_segment_lists_its_test():
+    sys.path.insert(0, str(_HERE))
+    from moe_dispatch import hibernating
+
+    from aiter.moev2 import paths
+
+    segments = {s for p in paths.registered().values() for s in p.segments}
+    assert set(hibernating.TESTS) == {
+        s.name for s in segments if s.reach == "hibernating"
+    }
 
 
 def test_known_declines_match_path_reason_and_problem():
@@ -90,12 +122,3 @@ def test_known_declines_match_path_reason_and_problem():
     )
     padding = "ranking a4w4[...]: CK 2-stage, padding ignored is not ported"
     assert known_declines.find("a4w4", _problem(), padding) is None
-
-
-def test_the_ranking_names_no_tuned_only_segment():
-    from aiter.moev2 import paths
-
-    ranked = coverage.ranked_segments()
-    segments = {s.name: s for p in paths.registered().values() for s in p.segments}
-    assert not {name for name, s in segments.items() if s.tuned_only} & ranked
-    assert {"sort", "ck.gemm1", "flydsl_fhmoe.gemm2"} <= ranked

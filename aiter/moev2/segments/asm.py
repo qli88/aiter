@@ -306,7 +306,7 @@ class AsmStage1Blockscale(AsmStage1):
     """
 
     name = "asm.stage1_1x128"
-    tuned_only = True
+    reach = "tuned"
     covers = (Op.GEMM1, Op.QUANT_INTER)
     transpose_a1_scale = True
 
@@ -345,7 +345,7 @@ class AsmStage1Cktile(AsmStage1):
     branch passes no bias."""
 
     name = "asm.stage1_cktile"
-    tuned_only = True
+    reach = "tuned"
 
     @property
     def capabilities(self):

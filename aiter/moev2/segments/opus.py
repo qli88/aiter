@@ -78,7 +78,7 @@ class OpusGemm1(_OpusStage1):
     """An Opus stage 1 writing the mxfp8 intermediate."""
 
     name = "opus.gemm1"
-    tuned_only = True
+    reach = "tuned"
     covers = (Op.GEMM1, Op.QUANT_INTER)
 
     def produces(self, p, params):
@@ -89,7 +89,7 @@ class OpusGemm1Layout(_OpusStage1):
     """An Opus stage 1 writing the sorted, quantized input of a FlyDSL layout GEMM2."""
 
     name = "opus.gemm1_layout"
-    tuned_only = True
+    reach = "tuned"
     covers = (Op.GEMM1, Op.QUANT_INTER)
 
     def reads(self, p):
@@ -121,7 +121,7 @@ class OpusGemm2(Segment):
     """An Opus stage 2, after a FlyDSL, Opus, CK or CK-Tile stage 1."""
 
     name = "opus.gemm2"
-    tuned_only = True
+    reach = "tuned"
     prefixes = (kernel_names.OPUS,)
     covers = (Op.GEMM2, Op.REDUCE)
 

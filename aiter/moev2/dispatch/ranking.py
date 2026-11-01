@@ -477,7 +477,7 @@ def best(problem, plans, table=None, tuned_row=False):
 
 
 def rankable(plans):
-    """The plans the ranking chooses among: whole-graph plans are tuned-only."""
+    """The plans the ranking chooses among: whole-graph plans have reach "tuned"."""
     return [plan for plan in plans if len(plan) > 1]
 
 
