@@ -56,8 +56,9 @@ DECLINED = _Declined()
 # Where the legacy code consults the paths: "api" at the top of `fused_moe` (before the
 # FHMoE dispatch, with the `fused_moe` parameters; skipped while torch.compile traces),
 # "op" inside the `fused_moe_` custom op (with its parameters: enums as ints, the scatter
-# context flattened), so torch.compile records the same op whichever code runs it.
-ENTRIES = ("api", "op")
+# context flattened), so torch.compile records the same op whichever code runs it;
+# "fhmoe" inside the `fhmoe_` custom op, the same way, for calls with a shared expert.
+ENTRIES = ("api", "op", "fhmoe")
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,7 @@ _BUILTIN_MODULES: tuple = (
     "aiter.moev2.migration.a16wi4",
     "aiter.moev2.migration.a8w4",
     "aiter.moev2.migration.mxfp8",
+    "aiter.moev2.migration.fhmoe",
 )
 
 _REGISTRY: dict[str, Path] = {}

@@ -253,11 +253,14 @@ class Match:
 
 
 def match(**fields) -> Match:
+    """`match(quant_type=..., w1_dtype={...})`. Without `shared`, only problems without
+    a shared expert match (`shared=None`)."""
     unknown = sorted(set(fields) - set(MATCH_FIELDS) - set(SCALARS))
     if unknown:
         raise ValueError(
             f"unknown match fields {unknown}; known: {sorted(MATCH_FIELDS)}"
         )
+    fields.setdefault("shared", None)
     return Match(FrozenMap({k: _as_set(k, v) for k, v in fields.items()}))
 
 

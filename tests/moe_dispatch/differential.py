@@ -113,13 +113,80 @@ def legacy_decline(path, key):
     return None
 
 
+def legacy_fhmoe(key):
+    """`(record, logs)` of `key` as `fhmoe_` dispatches it: `get_2stage_cfgs`, then
+    `_use_fhmoe_wrappers` (an error record where either raises)."""
+    import aiter.fused_moe as fm
+    from aiter.fhmoe import _use_fhmoe_wrappers
+    from moe_dispatch import record
+
+    with captured_logs() as logs:
+        try:
+            metadata = fm.get_2stage_cfgs.__wrapped__(*key.args, **key.call_kwargs())
+            got = record.normalize(_use_fhmoe_wrappers(metadata))
+        except Exception as exc:  # noqa: BLE001
+            got = record.error_record(exc)
+    return got, logs
+
+
+def compare_fhmoe(path, key, check_logs=True):
+    """`(outcome, problem)` of a path of the `fhmoe` entry for `key` as `fhmoe_`
+    dispatches it (the shared expert added): outcome None when the path does not take
+    it, "claimed" when its plan must equal the legacy one, "raises" when it declines a
+    key legacy raises on, "declined" when it hands back a key legacy runs."""
+    from aiter.moev2 import api
+    from moe_dispatch import record
+
+    try:
+        problem = api.problem_from_key(key.args, key.call_kwargs(), fhmoe=True)
+    except Exception:  # noqa: BLE001 - key_checks.py reports these
+        return None, None
+    if not path.takes(problem):
+        return None, None
+    with captured_logs() as v2_logs:
+        try:
+            plan = path.dispatch_record(key.args, key.call_kwargs())
+        except Exception as exc:  # noqa: BLE001
+            plan = record.error_record(exc)
+    expected, legacy_logs = legacy_fhmoe(key)
+    if plan is None:
+        return ("raises" if "error" in expected else "declined"), None
+    label = f"{key.label()}|fhmoe"
+    if check_logs and v2_logs != legacy_logs:
+        return "claimed", (
+            f"{label} [{path.name}] log lines differ\n"
+            f"    legacy: {legacy_logs}\n"
+            f"    v2:     {v2_logs}"
+        )
+    got = plan if isinstance(plan, dict) else record.normalize(plan)
+    if got != expected:
+        return "claimed", (
+            f"{label} [{path.name}]\n"
+            f"    legacy: {json.dumps(expected, sort_keys=True)}\n"
+            f"    v2:     {json.dumps(got, sort_keys=True)}"
+        )
+    return "claimed", None
+
+
+OUTCOMES = {
+    "claimed": "claimed by v2",
+    "one_stage": "handed back as legacy 1-stage",
+    "two_stage": "as a legacy 2-stage branch",
+    "raises": "declined where legacy raises",
+    "declined": "declined where legacy runs",
+}
+
+
 def compare(arch, check_logs=True, live=False):
-    """`(claimed, one_stage, two_stage, problems)`: `{label: path name}` three times and
-    a list of strings. `live`: generate the legacy records instead of reading golden/.
+    """`(outcomes, problems)`: `{outcome: {label: path name}}` for each of `OUTCOMES`,
+    and a list of strings. `live`: generate the legacy records instead of reading
+    golden/.
 
     `one_stage`: keys a path hands back as legacy 1-stage keys, which must be 1-stage
     in the legacy record. `two_stage`: keys a ranking region hands back to a named legacy
-    2-stage branch, whose stage 1 the legacy record must run.
+    2-stage branch, whose stage 1 the legacy record must run. Paths of the `fhmoe` entry
+    see every key with the shared expert added (`compare_fhmoe`; labels end in `|fhmoe`,
+    the legacy records are generated).
     """
     from aiter.moev2 import paths
     from aiter.moev2.dispatch import tuned
@@ -138,7 +205,12 @@ def compare(arch, check_logs=True, live=False):
     else:
         golden = snapshot.read(arch)
     checkers = [p for p in paths.registered().values() if p.dispatch_record is not None]
-    claimed, one_stage, two_stage, problems = {}, {}, {}, []
+    fhmoe_paths = [p for p in checkers if p.entry == "fhmoe"]
+    checkers = [p for p in checkers if p.entry != "fhmoe"]
+    outcomes = {name: {} for name in OUTCOMES}
+    claimed = outcomes["claimed"]
+    one_stage, two_stage = outcomes["one_stage"], outcomes["two_stage"]
+    problems = []
     with arch_sim.simulated_arch(arch) as (gfx, cu_num):
         keys = snapshot.dispatch_keys(gfx, cu_num)
         # Load the tuned table once up front so no key's logs include the load warnings.
@@ -202,7 +274,16 @@ def compare(arch, check_logs=True, live=False):
                         f"    legacy: {json.dumps(expected, sort_keys=True)}\n"
                         f"    v2:     {json.dumps(got, sort_keys=True)}"
                     )
-    return claimed, one_stage, two_stage, problems
+            fhmoe_label = f"{label}|fhmoe"
+            for path in fhmoe_paths:
+                if any(fhmoe_label in seen for seen in outcomes.values()):
+                    break
+                outcome, problem = compare_fhmoe(path, key, check_logs)
+                if outcome is not None:
+                    outcomes[outcome][fhmoe_label] = path.name
+                if problem is not None:
+                    problems.append(problem)
+    return outcomes, problems
 
 
 def main(argv=None):
@@ -233,7 +314,7 @@ def main(argv=None):
 
     failed = False
     for arch in args.arch or list(arch_sim.ARCHS):
-        claimed, one_stage, two_stage, problems = compare(
+        outcomes, problems = compare(
             arch, check_logs=not args.no_logs, live=bool(args.env)
         )
 
@@ -241,12 +322,11 @@ def main(argv=None):
             counts = Counter(by_label.values())
             return ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"
 
-        print(
-            f"{arch}: {len(claimed)} keys claimed by v2 ({summary(claimed)}), "
-            f"{len(one_stage)} handed back as legacy 1-stage ({summary(one_stage)}), "
-            f"{len(two_stage)} as a legacy 2-stage branch ({summary(two_stage)}), "
-            f"{len(problems)} problems"
+        counts = ", ".join(
+            f"{len(outcomes[name])} {what} ({summary(outcomes[name])})"
+            for name, what in OUTCOMES.items()
         )
+        print(f"{arch}: {counts}, {len(problems)} problems")
         for line in problems[:40]:
             print("  " + line)
         failed |= bool(problems)
@@ -459,9 +539,13 @@ def run_differential(path_name, call, *, bitwise=False):
     bound = inspect.signature(fm.fused_moe).bind(**call)
     bound.apply_defaults()
     # The legacy hooks pass every parameter, defaults included; check the same mapping.
-    entry_call = (
-        dict(bound.arguments) if path.entry == "api" else api.op_call(bound.arguments)
-    )
+    entry_call = {
+        "api": dict,
+        "op": api.op_call,
+        "fhmoe": api.fhmoe_call,
+    }[
+        path.entry
+    ](bound.arguments)
 
     def launch(mode):
         bench = []

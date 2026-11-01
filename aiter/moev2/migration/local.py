@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Dispatch and execution shared by the local paths (one GPU, the `fused_moe_` entry).
+"""Dispatch and execution shared by the local paths (one GPU, the `fused_moe_` entry;
+FHMoE's `fhmoe_` adds its shared expert to the key with `fhmoe=True`).
 
 A local path supplies its segments and `takes(problem)`, the problems it runs (its
 segments may accept more: a CK segment serves several quant formats, each in its own
@@ -10,6 +11,7 @@ MXFP4 weights, `run_one_stage` for a 1-stage plan, which has no second lookup).
 """
 
 import functools
+import os
 from dataclasses import replace
 
 from aiter import ActivationType, QuantType, dtypes, logger
@@ -128,6 +130,31 @@ def claims(
     return act_dtypes is None or activation_dtype(call) in act_dtypes
 
 
+def legacy_grouped_gfx1250(call) -> bool:
+    """`grouped_gemm_gfx1250_a8w4` runs the call instead of returning None (its checks
+    before the launch, for a per_1x32 g1u1 call of fp8 activations into MXFP4 weights
+    with Silu, Swiglu or SiTUv2)."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    if GateMode(call["gate_mode"]) != GateMode.INTERLEAVE:
+        return False
+    if not grouped._use_grouped_gemm_enabled():
+        return False
+    if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
+        return False
+    if call["w1_scale"] is None or call["w2_scale"] is None:
+        return False
+    gfx_env = ";".join(
+        str(os.environ.get(k, "")).lower()
+        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
+    )
+    return (
+        get_gfx() == "gfx1250"
+        or "gfx1250" in gfx_env
+        or os.environ.get("AITER_FORCE_GFX1250", "0") in grouped._TRUTHY_ENV
+    )
+
+
 def key_args_supported(
     problem,
     *,
@@ -135,12 +162,16 @@ def key_args_supported(
     gate_modes=SEPARATED,
     act_params=False,
     g1u0=False,
+    shared=None,
 ) -> bool:
     """False for keys with arguments or a layout the path does not support (see
-    `claims`; bias and padding are left to the segments' `Cap`s)."""
+    `claims`; bias and padding are left to the segments' `Cap`s). `shared`: the
+    placement of the shared expert the path runs (None: no shared expert)."""
     activation = problem.activation
+    placement = None if problem.shared is None else problem.shared.placement
     return (
-        (g1u0 or problem.layout.g1u1)
+        placement == shared
+        and (g1u0 or problem.layout.g1u1)
         and activation.kind in activations
         and problem.gate_mode in gate_modes
         and problem.inter is None
@@ -155,9 +186,13 @@ def key_args_supported(
 
 
 class LocalDispatch:
-    def __init__(self, segments, takes):
+    """`fhmoe`: the calls come from `fhmoe_` (the shared expert in the problem, the
+    selected block size enforced)."""
+
+    def __init__(self, segments, takes, fhmoe=False):
         self.segments = tuple(segments)
         self.takes = takes
+        self.fhmoe = fhmoe
         self.resolve = tuned.cached(maxsize=2048)(self._resolve)
         self.relookup = tuned.cached(maxsize=2048)(self._relookup)
         self.dispatch = tuned.cached(maxsize=2048)(self._dispatch)
@@ -183,7 +218,9 @@ class LocalDispatch:
 
         `problem` is None when no second lookup follows (whole-graph plans).
         """
-        problem = api.problem_from_key(args, dict(kwargs_items), arch, cu_num)
+        problem = api.problem_from_key(
+            args, dict(kwargs_items), arch, cu_num, self.fhmoe
+        )
         if not self.takes(problem):
             return None
         primary = self.resolve(problem, False)
@@ -193,9 +230,10 @@ class LocalDispatch:
             return primary, None
         return primary, problem
 
-    def run(self, call):
+    def run(self, call, q_dtype_a=None, config_file=None):
+        """`q_dtype_a`, `config_file`: as `api.dispatch_key` takes them."""
         c = executor.prologue(call, quant_remap)
-        args, kwargs, q_dtype_a = api.dispatch_key(c)
+        args, kwargs, q_dtype_a = api.dispatch_key(c, q_dtype_a, config_file)
         if executor.a16w4_unsupported(c, q_dtype_a) is not None:
             # Legacy raises NotImplementedError before its dispatch.
             return paths.DECLINED
@@ -209,6 +247,15 @@ class LocalDispatch:
             if dispatched is None:
                 return paths.DECLINED
         resolution, problem = dispatched
+        if (
+            self.fhmoe
+            and c.block_size_M is not None
+            and int(c.block_size_M) != int(resolution.metadata.block_m)
+        ):
+            raise ValueError(
+                f"FHMoE block_size_M={c.block_size_M} does not match the selected "
+                f"kernel block size {resolution.metadata.block_m}"
+            )
         if resolution.metadata.run_1stage:
             return executor.run_one_stage(
                 c, resolution.metadata, resolution.plan, q_dtype_a
@@ -267,7 +314,7 @@ class LocalDispatch:
 
     def dispatch_record(self, args, kwargs):
         """The v2 `MOEMetadata` for a legacy key (logs emitted), or None if not taken."""
-        problem = api.problem_from_key(args, kwargs)
+        problem = api.problem_from_key(args, kwargs, fhmoe=self.fhmoe)
         if not self.takes(problem):
             return None
         resolution = resolver.resolve(problem, self.segments)

@@ -44,6 +44,7 @@ def _paths():
         a16w4,
         a16w16,
         a16wi4,
+        fhmoe,
         mxfp8,
     )
 
@@ -57,6 +58,7 @@ def _paths():
         a16wi4,
         a8w4,
         mxfp8,
+        fhmoe,
     )
     return [m.PATH for m in modules]
 

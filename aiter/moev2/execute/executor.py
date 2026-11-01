@@ -609,8 +609,8 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
         if is_a16w4_port
         else torch.empty((token_num, topk, inter_dim), dtype=dtype, device=device)
     )
-    extra_stage1_args = {}
-    extra_stage2_args = {}
+    extra_stage1_args = plan.starting(Op.GEMM1).segment.call_args(c)
+    extra_stage2_args = plan.starting(Op.GEMM2).segment.call_args(c)
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(c["bias1"])

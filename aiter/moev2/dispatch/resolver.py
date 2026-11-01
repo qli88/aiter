@@ -382,6 +382,11 @@ def resolve(problem, segments) -> Resolution:
     for _row in profile.exact(problem):
         pass  # no profile files are read yet
 
+    if problem.extras.get("tuned_table") is not None and (
+        cfg is None or bypass_tuned_config
+    ):
+        # Legacy raises: a dedicated table (FHMoE) runs its exact rows only.
+        return declined("no exact row in the dedicated table")
     s = problem.shape
     q_type = problem.quant_type
     if cfg is None or bypass_tuned_config:

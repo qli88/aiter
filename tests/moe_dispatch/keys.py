@@ -263,6 +263,9 @@ def fhmoe_keys(gfx, cu_num, arch_fp8):
     path, df = fhmoe_table()
     rows = df[(df["gfx"] == gfx) & (df["cu_num"] == cu_num)]
     keys = []
+    # Twice the largest tuned token count of each geometry: a token count without an
+    # exact row, which the dedicated table does not fall back from.
+    untuned = {}
     for _, row in rows.iterrows():
         combo = list(_row_combo(row, arch_fp8))
         combo[-1] = (row["hidden_pad"], row["intermediate_pad"])
@@ -270,7 +273,15 @@ def fhmoe_keys(gfx, cu_num, arch_fp8):
             "gate_mode": _enum(GateMode, row["gate_mode"]),
             "config_file": path,
         }
-        keys.append(_make_key("fhmoe", "base", _row_shape(row), tuple(combo), extra))
+        shape = _row_shape(row)
+        keys.append(_make_key("fhmoe", "base", shape, tuple(combo), extra))
+        group = (shape[1:], tuple(combo), extra["gate_mode"])
+        token = max(int(shape[0]), untuned.get(group, (0,))[0])
+        untuned[group] = (token, extra)
+    tuned_tokens = {(int(r["token"]), *_row_shape(r)[1:]) for _, r in rows.iterrows()}
+    for (dims, combo, _), (token, extra) in untuned.items():
+        if (2 * token, *dims) not in tuned_tokens:
+            keys.append(_make_key("fhmoe", "base", (2 * token, *dims), combo, extra))
     return keys
 
 

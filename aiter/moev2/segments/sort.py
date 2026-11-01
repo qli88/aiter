@@ -591,7 +591,8 @@ class Sort(Segment):
                 }
             ),
             pads=True,
-            extras=frozenset({"disable_inline_sort"}),
+            extras=frozenset({"disable_inline_sort", "tuned_table"}),
+            shared=True,
         ),
     )
 

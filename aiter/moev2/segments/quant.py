@@ -31,7 +31,7 @@ from .base import Cap, Segment
 _FEATURES = frozenset(
     {"ep_mask", "num_local_tokens", "doweight_stage1", "act_scales", "bias1", "bias2"}
 )
-_EXTRAS = frozenset({"disable_inline_sort"})
+_EXTRAS = frozenset({"disable_inline_sort", "tuned_table"})
 # Debug: unit scales instead of the mxfp8 quant (the legacy module reads the same flag).
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
@@ -39,7 +39,7 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 class QuantA1(Segment):
     name = "quant.a1"
     covers = (Op.QUANT_A1, Op.QUANT_A1)
-    capabilities = (Cap(features=_FEATURES, pads=True, extras=_EXTRAS),)
+    capabilities = (Cap(features=_FEATURES, pads=True, extras=_EXTRAS, shared=True),)
 
     def reads(self, p):
         return (CALL_INPUT,)
@@ -256,7 +256,7 @@ def quant_inter_mxfp4(
 class QuantInter(Segment):
     name = "quant.inter"
     covers = (Op.QUANT_INTER, Op.QUANT_INTER)
-    capabilities = (Cap(features=_FEATURES, pads=True, extras=_EXTRAS),)
+    capabilities = (Cap(features=_FEATURES, pads=True, extras=_EXTRAS, shared=True),)
 
     def reads(self, p):
         # Any unquantized intermediate: `asm.stage1` writes bf16 even for fp16 outputs.

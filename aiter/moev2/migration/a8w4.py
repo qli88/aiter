@@ -19,8 +19,6 @@ that legacy's grouped gfx1250 branch takes (gfx1250 named by the build variables
 AITER_USE_GROUPED_GEMM, todo 5.26) are not claimed.
 """
 
-import os
-
 from aiter import ActivationType, QuantType, dtypes
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -88,31 +86,7 @@ def claims(call) -> bool:
         bias=True,
         act_params=True,
         pads=True,
-    ) and not _legacy_grouped_gfx1250(call)
-
-
-def _legacy_grouped_gfx1250(call) -> bool:
-    """`grouped_gemm_gfx1250_a8w4` runs the call instead of returning None (its checks
-    before the launch, for a call `claims` already accepted)."""
-    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
-
-    if GateMode(call["gate_mode"]) != GateMode.INTERLEAVE:
-        return False
-    if not grouped._use_grouped_gemm_enabled():
-        return False
-    if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
-        return False
-    if call["w1_scale"] is None or call["w2_scale"] is None:
-        return False
-    gfx_env = ";".join(
-        str(os.environ.get(k, "")).lower()
-        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
-    )
-    return (
-        local.get_gfx() == "gfx1250"
-        or "gfx1250" in gfx_env
-        or os.environ.get("AITER_FORCE_GFX1250", "0") in grouped._TRUTHY_ENV
-    )
+    ) and not local.legacy_grouped_gfx1250(call)
 
 
 def takes(problem) -> bool:

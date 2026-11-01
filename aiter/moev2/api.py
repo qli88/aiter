@@ -11,16 +11,18 @@ point that honours the switch.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from aiter import ActivationType, QuantType
+from aiter import ActivationType, QuantType, dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.ops.flydsl.moe_common import GateMode
 
 from . import paths
 from .policy import _normalize_mxfp4_activation_params, resolve_activation_dtype
-from .problem import MoeProblem
+from .problem import MoeProblem, SharedExpertSpec, scale_spec
 from .shapes import get_padded_M
 
 if TYPE_CHECKING:
@@ -29,11 +31,14 @@ if TYPE_CHECKING:
     from .execute.executor import Call
 
 
-def dispatch_key(c: Call):
+def dispatch_key(c: Call, q_dtype_a=None, config_file=None):
     """`(args, kwargs, q_dtype_a)`: the legacy `get_2stage_cfgs` arguments for a call.
 
     Built exactly as `_fused_moe_impl` builds them, from the prologue's derived values.
+    `q_dtype_a` and `config_file` are its `_q_dtype_a` and `_metadata_config_file`
+    (FHMoE): the activation format unless the call names one, and a dedicated table.
     """
+    forced_q_dtype_a = q_dtype_a
     hidden_states, w1, w2 = c["hidden_states"], c["w1"], c["w2"]
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
@@ -49,6 +54,8 @@ def dispatch_key(c: Call):
     )
     if c["quant_dtype_a"] is not None:
         q_dtype_a = c["quant_dtype_a"]
+    elif forced_q_dtype_a is not None:
+        q_dtype_a = forced_q_dtype_a
     situ_beta, situ_linear_beta, _ = _normalize_mxfp4_activation_params(
         c.activation, c["beta"], c["linear_beta"], c["swiglu_limit"]
     )
@@ -80,7 +87,7 @@ def dispatch_key(c: Call):
         "opus_weights_shuffled": getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
         "gate_up_interleave": getattr(w1, "gate_up_interleave", None),
-        "config_file": None,
+        "config_file": config_file,
         "_disable_inline_sort": False,
         "q_dtype_a2": c["quant_dtype_a2"],
         "input_dtype": hidden_states.dtype,
@@ -91,13 +98,28 @@ def dispatch_key(c: Call):
     return args, kwargs, q_dtype_a
 
 
-def problem_from_key(args, kwargs, arch=None, cu_num=None) -> MoeProblem:
-    return MoeProblem.from_legacy_key(
+def problem_from_key(args, kwargs, arch=None, cu_num=None, fhmoe=False) -> MoeProblem:
+    """The `MoeProblem` of a legacy key; `fhmoe`: as `fhmoe_` dispatches it (the key has
+    no field for the shared expert)."""
+    problem = MoeProblem.from_legacy_key(
         *args,
         **kwargs,
         arch=get_gfx_runtime() if arch is None else arch,
         cu_num=get_cu_num() if cu_num is None else cu_num,
     )
+    return fhmoe_problem(problem) if fhmoe else problem
+
+
+def fhmoe_problem(problem) -> MoeProblem:
+    """`problem` with the FHMoE shared expert: the last routed row, fp8 1x32 weights.
+
+    `clamp` stays at its default: `clamp_shared` changes the launch, not the plan.
+    """
+    shared_w = scale_spec(QuantType.per_1x32, dtypes.fp8)
+    shared = SharedExpertSpec(
+        "fused_row", problem.shape.experts - 1, shared_w, shared_w
+    )
+    return replace(problem, shared=shared)
 
 
 def build_problem(call, arch=None, cu_num=None) -> MoeProblem:
@@ -176,6 +198,92 @@ def op_call(call) -> dict | None:
     }
 
 
+def fhmoe_call(call) -> dict | None:
+    """The `fhmoe_` arguments the legacy `fused_moe` passes for `call`, after its checks
+    of the shared-expert arguments (raised as it raises them).
+
+    None when the call has no shared expert (it goes to `fused_moe_`).
+    """
+    has_shared_expert = (
+        any(
+            call[name] is not None
+            for name in ("shared_w1", "shared_w2", "shared_w1_scale", "shared_w2_scale")
+        )
+        or call["shared_expert_id"] != -1
+    )
+    if not has_shared_expert:
+        return None
+    w1 = call["w1"]
+    routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
+    unsupported = []
+    if call["stage2_scatter"] is not None:
+        unsupported.append("stage2_scatter")
+    if call["quant_type_a"] is not None:
+        unsupported.append("quant_type_a")
+    fhmoe_quant_dtype_a = (
+        dtypes.fp8
+        if GateMode(call["gate_mode"]) == GateMode.INTERLEAVE
+        else dtypes.fp4x2
+    )
+    quant_dtype_a = call["quant_dtype_a"]
+    if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
+        unsupported.append("quant_dtype_a")
+    if call["quant_dtype_a2"] is not None:
+        unsupported.append("quant_dtype_a2")
+    if routed_mxfp8 and call["a1_scale"] is not None:
+        unsupported.append("a1_scale")
+    if routed_mxfp8 and call["a2_scale"] is not None:
+        unsupported.append("a2_scale")
+    if unsupported:
+        raise NotImplementedError(
+            "FHMoE shared-expert dispatch does not support " + ", ".join(unsupported)
+        )
+    weights = (w1, call["w2"], call["shared_w1"], call["shared_w2"])
+    if routed_mxfp8 and any(
+        weight is not None and not getattr(weight, "is_shuffled", False)
+        for weight in weights
+    ):
+        raise ValueError(
+            "FHMoE weights must be AITER-preshuffled and marked "
+            "is_shuffled=True; re-run the shuffle after tensor copies"
+        )
+    names = (
+        "hidden_states",
+        "w1",
+        "w2",
+        "topk_weight",
+        "topk_ids",
+        "expert_mask",
+        "doweight_stage1",
+        "w1_scale",
+        "w2_scale",
+        "a1_scale",
+        "a2_scale",
+        "num_local_tokens",
+        "moe_sorting_dispatch_policy",
+        "dtype",
+        "hidden_pad",
+        "intermediate_pad",
+        "bias1",
+        "bias2",
+        "swiglu_limit",
+        "gate_mode",
+        "shared_w1",
+        "shared_w2",
+        "shared_w1_scale",
+        "shared_w2_scale",
+        "shared_expert_id",
+        "output",
+        "clamp_shared",
+    )
+    return {
+        **{name: call[name] for name in names},
+        "activation": call["activation"].value,
+        "quant_type": call["quant_type"].value,
+        "block_size_M": call["block_size_M"] or -1,
+    }
+
+
 def fused_moe(
     hidden_states,
     w1,
@@ -217,11 +325,14 @@ def fused_moe(
 ):
     """Same contract as `aiter.fused_moe.fused_moe`, served by aiter.moev2."""
     call = dict(locals())
-    op = None
+    op = fhmoe = None
     for path in paths.registered().values():
         if path.entry == "op":
             op = op_call(call) if op is None else op
             path_call = op
+        elif path.entry == "fhmoe":
+            fhmoe = fhmoe_call(call) if fhmoe is None else fhmoe
+            path_call = fhmoe
         else:
             path_call = call
         if path_call is not None and path.claims(path_call):
