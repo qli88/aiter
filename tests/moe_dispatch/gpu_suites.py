@@ -9,11 +9,16 @@ suites run for every path.
     python tests/moe_dispatch/gpu_suites.py                 # list paths and commands
     python tests/moe_dispatch/gpu_suites.py --path a8w8_pt  # commands for one path
     python tests/moe_dispatch/gpu_suites.py --path a8w8_pt --run
+    python tests/moe_dispatch/gpu_suites.py --path a8w8_pt --compare --log-dir DIR
 
-Commands match how .github/scripts/aiter_test.sh runs each file.
+`--compare` runs each suite of the GPU's arch with `AITER_MOEV2=off` and with
+`AITER_MOEV2=<path>` and fails where v2 fails and legacy passes (the 3.9 gate). Commands
+match how .github/scripts/aiter_test.sh runs each file.
 """
 
 import argparse
+import os
+import pathlib
 import shlex
 import subprocess
 import sys
@@ -131,11 +136,55 @@ def suites_for(path):
     return PATHS[path] + SHARED
 
 
+def _run(suite, mode, log):
+    """True when `suite` passes with AITER_MOEV2=`mode`; its output goes to `log`."""
+    env = {**os.environ, "AITER_MOEV2": mode}
+    with open(log, "w") as out:
+        proc = subprocess.run(
+            suite.cmd, env=env, stdout=out, stderr=subprocess.STDOUT, check=False
+        )
+    return proc.returncode == 0
+
+
+def compare(path, log_dir):
+    """Lines of `path`'s suites under `off` and under the path; the second item is
+    False when v2 fails a suite legacy passes."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    arch = get_gfx()
+    log_dir = pathlib.Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    lines, ok = [], True
+    for i, suite in enumerate(suites_for(path)):
+        line = shlex.join(suite.cmd)
+        if arch not in suite.archs or suite.gpus > 1:
+            lines.append(f"  skip ({arch}, {suite.gpus} GPUs): {line}")
+            continue
+        result = {}
+        for mode in ("off", path):
+            log = log_dir / f"{path}.{i}.{mode}.log"
+            result[mode] = "pass" if _run(suite, mode, log) else "FAIL"
+        ok &= not (result["off"] == "pass" and result[path] == "FAIL")
+        lines.append(f"  off {result['off']}, v2 {result[path]}: {line}")
+    return lines, ok
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--path", choices=sorted(PATHS))
     parser.add_argument("--run", action="store_true", help="run the commands")
+    parser.add_argument(
+        "--compare", action="store_true", help="run with off and with the path"
+    )
+    parser.add_argument("--log-dir", default="moe_suite_logs")
     args = parser.parse_args(argv)
+    if args.compare:
+        if not args.path:
+            parser.error("--compare needs --path")
+        lines, ok = compare(args.path, args.log_dir)
+        print(f"[{args.path}]")
+        print("\n".join(lines))
+        return 0 if ok else 1
     paths = [args.path] if args.path else list(PATHS)
     failed = []
     for path in paths:
