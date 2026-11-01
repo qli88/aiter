@@ -12,10 +12,11 @@ KINDS = ("tokens", "sorted", "inter", "routed_out", "p2p_scatter", "out")
 @dataclass(frozen=True)
 class Buf:
     # fmt None: "sorted" (routing, not values), the caller's own hidden_states, or, in
-    # `Segment.reads`, any format. layout None, in `Segment.reads` only: any layout.
+    # `Segment.reads`, any format. In `Segment.reads` only, layout None: any layout; a
+    # frozenset: any of those layouts.
     kind: str
     fmt: ScaleSpec | None
-    layout: str | None = "default"  # "aux_sorted", "v2_sorted", "opus_bucketed", ...
+    layout: str | frozenset | None = "default"  # "aux_sorted", "v2_sorted", ...
     block_m: int | None = None
 
     def __post_init__(self):
@@ -26,7 +27,8 @@ class Buf:
         """Why `have` cannot be read where this `Buf` is required, or None."""
         if have is None:
             return f"reads {self}, which no earlier segment produces"
-        if (self.layout is not None and have.layout != self.layout) or (
+        layouts = self.layout if isinstance(self.layout, frozenset) else {self.layout}
+        if (self.layout is not None and have.layout not in layouts) or (
             self.fmt is not None and have.fmt != self.fmt
         ):
             return f"reads {self}, gets {have}"
@@ -38,6 +40,8 @@ class Buf:
             parts.append(str(self.fmt))
         if self.layout is None:
             parts.append("any layout")
+        elif isinstance(self.layout, frozenset):
+            parts.append("|".join(sorted(self.layout)))
         elif self.layout != "default":
             parts.append(self.layout)
         if self.block_m is not None:

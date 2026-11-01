@@ -13,6 +13,7 @@ emits them (`Resolution.emit`) once per problem, where the legacy cache would ha
 """
 
 import logging
+import math
 from dataclasses import dataclass
 
 from aiter import logger
@@ -35,6 +36,8 @@ from .plan import MoePlan, SegmentChoice
 INFO = logging.INFO
 WARNING = logging.WARNING
 EXPLAIN_PREFIX = "[aiter.moe] "
+# Activations the 1-stage ASM kernels have (Silu/Gelu, gfx950 MXFP4 SiTUv2 FLAT).
+ONE_STAGE_ACTIVATIONS = ("silu", "gelu", "situv2")
 
 
 @dataclass(frozen=True)
@@ -123,13 +126,45 @@ def _owned_kernel(raw):
     return kernel
 
 
+def _no_stage2(raw) -> bool:
+    """A 1-stage row's kernelName2: empty, the literal "Null", or a blank cell (NaN)."""
+    return raw in ("", "Null") or (isinstance(raw, float) and math.isnan(raw))
+
+
+def _plain_1stage_row(row) -> bool:
+    """A 1-stage row with an ASM kernelName1 and no stage 2: none of legacy's discards
+    before the 1-stage activation check look at it."""
+    k1 = _owned_kernel(row.get("kernelName1", ""))
+    return (
+        bool(row.get("run_1stage", False))
+        and not isinstance(k1, str)
+        and k1 is not None
+        and k1.family == kernel_names.ASM
+        and _no_stage2(row.get("kernelName2", ""))
+    )
+
+
 def match_row(plans, row):
     """The plan structure that runs tuned `row`, or a decline reason (str)."""
-    if row.get("run_1stage", False):
-        return "1-stage tuned row"
     k1 = _owned_kernel(row.get("kernelName1", ""))
     if isinstance(k1, str):
         return k1
+    if row.get("run_1stage", False):
+        if not _plain_1stage_row(row):
+            return (
+                f"1-stage row with kernelName1={k1}, "
+                f"kernelName2={row.get('kernelName2', '')!r}"
+            )
+        flat = bool(int(row["flat"])) if "flat" in row else False
+        for structure in plans:
+            one_stage = _one_stage(structure)
+            if (
+                one_stage is not None
+                and one_stage.owns(k1)
+                and getattr(structure[0], "flat", False) == flat
+            ):
+                return structure
+        return f"no segment runs 1-stage {k1}{' (FLAT)' if flat else ''}"
     if k1 is not None and k1.family == kernel_names.IMPL:
         for structure in plans:
             if len(structure) == 1 and structure[0].owns(k1):
@@ -144,6 +179,52 @@ def match_row(plans, row):
         if gemm1 and gemm2 and gemm1[0].owns(k1) and gemm2[0].owns(k2):
             return structure
     return f"no segments run kernelName1={k1}, kernelName2={k2}"
+
+
+def _one_stage(structure):
+    """The segment of `structure` that runs both GEMMs in one launch, or None."""
+    if len(structure) == 1:
+        return None
+    return next(
+        (s for s in structure if s.covers[0] <= Op.GEMM1 and s.covers[1] >= Op.GEMM2),
+        None,
+    )
+
+
+def _one_stage_plan(
+    problem,
+    structure,
+    source,
+    kernelName1,
+    block_m,
+    ksplit,
+    xbf16,
+    run_1stage=True,
+    flat=0,
+):
+    """The plan and the legacy `fused_moe_1stage` metadata of a 1-stage structure.
+    `run_1stage`: the tuned row's value as legacy passes it on."""
+    one_stage = _one_stage(structure)
+    params = Params(kernel=kernelName1, xbf16=xbf16, flat=flat)
+    choices = tuple(
+        SegmentChoice(segment, params if segment is one_stage else Params())
+        for segment in structure
+    )
+    plan = MoePlan(
+        choices,
+        source,
+        Params(block_m=block_m, ksplit=ksplit),
+        tuple(c.segment.produces(problem, c.params) for c in choices[:-1]),
+    )
+    metadata = MOEMetadata(
+        one_stage.build(problem, params),
+        None,
+        block_m,
+        ksplit,
+        run_1stage,
+        flat=flat,
+    )
+    return plan, metadata
 
 
 def _two_stage_plan(
@@ -232,10 +313,25 @@ def resolve(problem, segments) -> Resolution:
             f"tuned lookup: kernelName1={cfg.get('kernelName1')!r} "
             f"kernelName2={cfg.get('kernelName2')!r}"
         )
+        matched = None
+    logs = []
+    if (
+        cfg is not None
+        and _plain_1stage_row(cfg)
+        and problem.activation.kind not in ONE_STAGE_ACTIVATIONS
+    ):
+        # Legacy's check after its other discards, none of which applies to the row.
+        message = (
+            f"[fused_moe] discarding 1-stage tuned config for unsupported "
+            f"activation {problem.activation.activation}; using default heuristics"
+        )
+        logs.append((WARNING, message))
+        note(f"tuned row discarded: {message}")
+        cfg = None
+    if cfg is not None:
         matched = match_row(plans, cfg)
         if isinstance(matched, str):
             return declined(matched)
-    logs = []
     if matched is not None and len(matched) > 1:
         reason = next(
             filter(None, (s.declines_row(problem, cfg) for s in matched)), None
@@ -299,11 +395,13 @@ def resolve(problem, segments) -> Resolution:
             return declined(f"ranking {region}: no listed structure is feasible")
         kernelName1 = ""
         kernelName2 = ""
-        run_1stage = False
-        run_1stage_xbf16 = False
+        one_stage = _one_stage(structure)
+        run_1stage = one_stage is not None
+        run_1stage_xbf16 = run_1stage and one_stage.default_xbf16(problem)
+        flat = 0
         dims = (q_type, s.m, s.topk, s.experts, s.inter_dim, s.model_dim)
-        block_m = default_block_m(*dims)
-        ksplit = default_ksplit(*dims)
+        block_m = BLOCK_SIZE_M if run_1stage else default_block_m(*dims)
+        ksplit = 0 if run_1stage else default_ksplit(*dims)
         use_non_temporal_load = use_nt(s.m, s.topk, s.experts)
         logs.append(
             (
@@ -330,6 +428,14 @@ def resolve(problem, segments) -> Resolution:
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        if "xbf16" in cfg:
+            run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
+        else:
+            run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
+        if "flat" in cfg:
+            flat = int(cfg["flat"]) if run_1stage else 0
+        else:
+            flat = 0
         if not problem.any_shuffled and not run_1stage:
             message = (
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
@@ -338,6 +444,28 @@ def resolve(problem, segments) -> Resolution:
             )
             logs.append((WARNING, message))
         source = "tuned"
+    if run_1stage:
+        tag = f"({kernelName1=}, {kernelName2=})"
+        xbf16 = " xbf16" if run_1stage_xbf16 else ""
+        logs.append(
+            (
+                INFO,
+                f"[fused_moe] using 1stage{xbf16} {'default' if cfg is None else tag} for {keys} ",
+            )
+        )
+        plan, metadata = _one_stage_plan(
+            problem,
+            structure,
+            source,
+            kernelName1,
+            block_m,
+            ksplit,
+            run_1stage_xbf16,
+            run_1stage,
+            flat,
+        )
+        note(f"selected {plan.describe()}")
+        return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))
     gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
     gemm2 = next(s for s in structure if s.covers[0] == Op.GEMM2)
     kernelName2 = gemm2.stage2_kernel(problem, kernelName1, kernelName2)

@@ -9,14 +9,16 @@ or scatter. Today these resolve to the FlyDSL heuristic (default on preshuffled
 weights), the MXMOE heuristic (SiTUv2), CK-Tile (split-K on preshuffled weights; Swiglu
 without FlyDSL), CK 2-stage (Silu/Gelu default otherwise), or a tuned FlyDSL, FlyDSL
 layout-v2, MXMOE or CK row (with a CK-Tile stage 2 or not). The SiTUv2 default without
-FlyDSL or MXMOE, 1-stage tuned rows, tuned CK rows on preshuffled weights (which the
-legacy code overrides with its defaults), bias or padding on kernels that take none,
-and any other tuned row are declined back to the legacy code.
+FlyDSL or MXMOE, tuned CK rows on preshuffled weights (which the legacy code
+overrides with its defaults), bias or padding on kernels that take none, and any other
+tuned row are declined back to the legacy code. Tuned 1-stage rows (all FLAT) run
+1-stage ASM `fmoe`.
 """
 
 from aiter import ActivationType, QuantType, dtypes
 
 from .. import paths
+from ..segments.asm import AsmFmoe1Stage
 from ..segments.ck import CkGemm1, CkGemm2
 from ..segments.ck_tile import CktileGemm1, CktileGemm2
 from ..segments.mxfp4 import (
@@ -31,7 +33,7 @@ from ..segments.mxfp4 import (
     mxfp4,
 )
 from ..segments.quant import QuantA1, QuantInter
-from ..segments.sort import Sort, SortAux
+from ..segments.sort import Sort, SortAux, SortFlat
 from . import local
 
 NAME = "a4w4"
@@ -39,6 +41,7 @@ ARCHS = ("gfx950",)
 SEGMENTS = (
     Sort(),
     SortAux(),
+    SortFlat(),
     QuantA1(),
     CkGemm1(),
     CktileGemm1(),
@@ -53,6 +56,7 @@ SEGMENTS = (
     FlydslLayoutGemm2(),
     FlydslLayoutGemm2Scatter(),
     MxmoeGemm2(),
+    AsmFmoe1Stage(),
 )
 
 
@@ -87,6 +91,7 @@ def takes(problem) -> bool:
             activations=tuple(a.name.lower() for a in ACTIVATIONS),
             act_params=True,
         )
+        and problem.arch in ARCHS
         and problem.quant_type == QuantType.per_1x32
         and problem.w1 == mxfp4()
         and problem.act_in == mxfp4()

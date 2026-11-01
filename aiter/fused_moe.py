@@ -64,7 +64,7 @@ from aiter.moev2.reference.torch_moe import (  # noqa: F401
     torch_moe_stage2,
 )
 from aiter.moev2.routing.topk import fused_topk  # noqa: F401
-from aiter.moev2.segments.asm import asm_stage1
+from aiter.moev2.segments.asm import asm_stage1, fused_moe_1stage
 from aiter.moev2.segments.ck import ck_moe_stage1
 from aiter.moev2.segments.ck_tile import (
     _is_cktile_mxfp4_stage2_name,
@@ -121,6 +121,7 @@ from aiter.moev2.segments.sort import (
     _adaptive_moe_sort,
     _aux_uses_opus,
     _fused_decode_sort_quant,
+    _moe_prepare_unsorted_input,
     _mxfp4_aux_instance_supported,
 )
 from aiter.moev2.shapes import (  # noqa: F401
@@ -227,40 +228,6 @@ def _is_fused_decode_sort_quant_enabled(
 
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
-
-
-# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
-# topk_weights through the sorted_* kernarg slots and accumulate via
-# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
-
-
-def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
-    device = topk_ids.device
-    M = topk_ids.shape[0]
-    # FLAT kernels zero their own output rows on-device and need an
-    # extra M*8-byte per-token coordination region appended to moe_buf.
-    # We over-allocate as a flat byte buffer and expose only the row part.
-    #
-    # The trailing region does not need initialisation; the kernel
-    # tolerates arbitrary contents on the first reference per dispatch.
-    elem_size = torch.empty(0, dtype=moebuf_dtype).element_size()
-    row_bytes = M * model_dim * elem_size
-    flag_bytes = 8
-    flat_buf = torch.empty(row_bytes + flag_bytes, dtype=torch.uint8, device=device)
-    moe_buf = flat_buf[:row_bytes].view(moebuf_dtype).view(M, model_dim)
-    topk_ids_i32 = (
-        topk_ids
-        if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()
-        else topk_ids.to(dtypes.i32).contiguous()
-    )
-    topk_weights_f32 = (
-        topk_weights
-        if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
-        else topk_weights.to(dtypes.fp32).contiguous()
-    )
-    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
-    # but must be valid device pointers -- alias topk_ids as scratch.
-    return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
 def _moe_sorting_impl(
@@ -1470,167 +1437,6 @@ def _fused_moe_impl(
             prequantized_a1_scale=prequantized_a1_scale,
         )
         return _return_output(ret, output)
-
-
-def fused_moe_1stage(
-    hidden_states,
-    w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
-    w2,  # [expert(local_expert:EP), dim, inter_dim]
-    topk,
-    sorted_ids,
-    sorted_weights,
-    sorted_expert_ids,
-    num_valid_ids,
-    moe_buf,
-    isG1U1,
-    block_size_M=32,
-    activation=ActivationType.Silu,
-    quant_type=QuantType.No,
-    xbf16=False,
-    kernelName: str = "",
-    # following for quant
-    q_dtype_a=None,
-    q_dtype_w=None,
-    w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-    num_local_tokens: torch.Tensor | None = None,
-    M: int | None = None,
-    device=None,
-    doweight_stage1: bool | None = None,
-    flat: int = 0,
-):
-    if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
-        # pure bf16
-        aiter.fmoe(
-            moe_buf,
-            hidden_states,
-            w1,
-            w2,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            topk,
-        )
-    elif quant_type == QuantType.per_Token and doweight_stage1 and isG1U1:
-        a8_type = w1.dtype
-        _, model_dim, _ = w2.shape
-
-        a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
-        a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
-        aiter.dynamic_per_token_scaled_quant(a8, hidden_states, a8_scale)
-
-        aiter.fmoe_g1u1_tkw1(
-            moe_buf,
-            a8,
-            w1,
-            w2,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            topk,
-            a8_scale,
-            w1_scale,
-            w2_scale,
-            kernelName,
-            a2_scale,
-            activation,
-        )
-    else:
-        if xbf16:
-            # xquant happens inside the asm kernel for per_1x128
-            a1 = hidden_states
-            a1_scale = torch.empty(0, device="cuda")
-        else:
-            quant_func = get_quant(quant_type)
-            if hidden_states.dtype != q_dtype_a:
-                if quant_type == QuantType.per_1x128:
-                    quant_func = functools.partial(quant_func, transpose_scale=True)
-                a1, a1_scale = quant_func(
-                    hidden_states,
-                    scale=a1_scale,
-                    quant_dtype=q_dtype_a,
-                    num_rows=num_local_tokens,
-                )
-            else:
-                assert (
-                    a1_scale is not None or quant_type == QuantType.No
-                ), "a1_scale must be provided for quantized input for fused_moe"
-                a1 = hidden_states
-                if quant_type == QuantType.per_1x128:
-                    scale_t = torch.empty_like(a1_scale)
-                    aiter.partial_transpose(
-                        scale_t, a1_scale, num_rows=num_local_tokens
-                    )
-                    a1_scale = scale_t
-
-        token_num = hidden_states.shape[0]
-        E, model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
-        if quant_type == QuantType.per_1x32:
-            # FLAT per_1x32 kernels are always xbf16: X stays bf16 and is
-            # dynamic-quantized to MXFP4 inside the kernel, so there is no host
-            # activation e8m0 scale to pack. Only the (not-yet-enabled) non-flat
-            # pre-quantized fp4 path carries a host scale that needs sorting.
-            if not xbf16:
-                a1_scale = mxfp4_moe_sort_fwd(
-                    a1_scale,
-                    sorted_ids=sorted_ids,
-                    num_valid_ids=num_valid_ids,
-                    token_num=token_num,
-                    cols=model_dim,
-                )
-            w1_scale = w1_scale.view(E, -1)
-            w2_scale = w2_scale.view(E, -1)
-
-        if quant_type == QuantType.per_1x128:
-            fmoe_func = functools.partial(
-                aiter.fmoe_fp8_blockscale_g1u1,
-                fc_scale_blkn=128,
-                fc_scale_blkk=128,
-                block_size_M=block_size_M,
-            )
-        elif isG1U1:
-            fmoe_func = aiter.fmoe_g1u1
-        else:
-            aiter.fmoe_int8_g1u0(
-                moe_buf,
-                a1,
-                w1,
-                w2,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                topk,
-                a1_scale,
-                w1_scale,
-                w2_scale,
-                fc2_smooth_scale=None,
-                activation=activation,
-            )
-            return moe_buf
-
-        fmoe_func(
-            moe_buf,
-            a1,
-            w1,
-            w2,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            topk,
-            a1_scale,
-            w1_scale,
-            w2_scale,
-            kernelName,
-            fc2_smooth_scale=None,
-            activation=activation,
-        )
-    return moe_buf
 
 
 cfg_2stages = None

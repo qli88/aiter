@@ -6,7 +6,7 @@ A local path supplies its segments and `takes(problem)`, the problems it runs (i
 segments may accept more: a CK segment serves several quant formats, each in its own
 path). `LocalDispatch` resolves each legacy dispatch key once, as the cached legacy
 `get_2stage_cfgs` does, and runs the plan with `executor.run_two_stage` (`run_mxfp4` for
-MXFP4 weights).
+MXFP4 weights, `run_one_stage` for a 1-stage plan, which has no second lookup).
 """
 
 import functools
@@ -116,9 +116,8 @@ def claims(
         or w2.dim() != 3
     ):
         return False
-    # g1u0 stays on legacy unless the path runs it: CK stage 1 always reads w1 as gate
-    # and up, and the 1-stage ASM `fmoe` that legacy runs for some g1u0 keys is not
-    # ported.
+    # g1u0 stays on legacy unless the path runs it: CK and ASM stage 1 always read w1
+    # as gate and up, so only the 1-stage ASM `fmoe` keys have a plan.
     _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
     if not g1u0 and w1.shape[1] != 2 * inter_dim:
         return False
@@ -210,6 +209,10 @@ class LocalDispatch:
             if dispatched is None:
                 return paths.DECLINED
         resolution, problem = dispatched
+        if resolution.metadata.run_1stage:
+            return executor.run_one_stage(
+                c, resolution.metadata, resolution.plan, q_dtype_a
+            )
         after_sort = None
         if problem is not None:
             token = get_padded_M(c["hidden_states"].shape[0])

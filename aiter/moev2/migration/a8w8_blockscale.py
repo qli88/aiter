@@ -5,30 +5,32 @@
 Claims `fused_moe_` calls with `QuantType.per_1x128` or `per_128x128` (which the legacy
 code remaps to `per_1x128`) and g1u1 fp8 weights (the arch's fp8) on gfx942/gfx950, Silu
 or Gelu, separated gate/up, no bias, padding, scatter or caller-chosen activation dtypes,
-outside AITER_ONLINE_TUNE. Today these resolve to CK 2-stage (default, with the 1x128
-block_m and split-K, and most tuned rows) or ASM stage 1 + CK stage 2; the default 1-stage
-ASM `fmoe_fp8_blockscale_g1u1` region and 1-stage tuned rows are declined back to the
-legacy code, as is any other tuned row.
+outside AITER_ONLINE_TUNE. Today these resolve to 1-stage ASM `fmoe_fp8_blockscale_g1u1`
+(default, in its region), CK 2-stage (default elsewhere, with the 1x128 block_m and
+split-K; most tuned rows), ASM stage 1 + CK stage 2, or a tuned 1-stage row (FLAT too);
+any other tuned row is declined back to the legacy code.
 """
 
 from aiter import QuantType, dtypes
 
 from .. import paths
-from ..segments.asm import AsmStage1Blockscale
+from ..segments.asm import AsmFmoe1Stage, AsmStage1Blockscale
 from ..segments.ck import CkGemm1, CkGemm2, blockscale_fp8
 from ..segments.quant import QuantA1, QuantInter
-from ..segments.sort import Sort
+from ..segments.sort import Sort, SortFlat
 from . import local
 
 NAME = "a8w8_blockscale"
 ARCHS = ("gfx942", "gfx950")
 SEGMENTS = (
     Sort(),
+    SortFlat(),
     QuantA1(),
     CkGemm1(),
     AsmStage1Blockscale(),
     QuantInter(),
     CkGemm2(),
+    AsmFmoe1Stage(),
 )
 
 

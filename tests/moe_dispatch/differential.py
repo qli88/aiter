@@ -72,6 +72,8 @@ _LEGACY_2STAGE = {
     "CK-Tile split-K MXFP4 or CK 2-stage SiTUv2": (_CKTILE, "fused_moe.ck_moe_stage1"),
     "CK 2-stage, padding ignored": ("fused_moe.ck_moe_stage1",),
     "CK 2-stage a16w4": ("fused_moe.ck_moe_stage1",),
+    "CK 2-stage g1u0": ("fused_moe.ck_moe_stage1",),
+    "ASM stage 1 + CK stage 2 g1u0": ("fused_moe.asm_stage1",),
     # A bypassed tuned row turns the MXMOE fallback off (AITER_BYPASS_TUNE_CONFIG).
     "the next branch (a tuned row is bypassed)": (
         "fused_moe._flydsl_stage1_wrapper",
@@ -85,7 +87,8 @@ def legacy_decline(path, key):
     """`(reason, stage-1 functions)` when `path` hands `key` back to a named legacy
     branch, else None; the functions are None for a 1-stage branch.
 
-    A 1-stage tuned row and a ranking region marked `legacy=` name the branch.
+    A 1-stage tuned row the path does not run and a ranking region marked `legacy=`
+    name the branch.
     """
     from aiter.moev2 import api
     from aiter.moev2.dispatch import resolver
@@ -99,7 +102,7 @@ def legacy_decline(path, key):
     if not path.takes(problem):
         return None
     reason = resolver.resolve(problem, path.segments).declined or ""
-    if reason == "1-stage tuned row":
+    if reason.startswith(("1-stage row with ", "no segment runs 1-stage ")):
         return reason, None
     if reason.startswith("ranking ") and reason.endswith(" is not ported"):
         legacy = reason.split(": ", 1)[1].removesuffix(" is not ported")
@@ -309,6 +312,7 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
     import torch
 
     from aiter import dtypes
+    from aiter.moev2.segments.asm import fused_moe_1stage
     from aiter.moev2.shapes import get_inter_dim
 
     if [n for n, _ in legacy] != [n for n, _ in v2]:
@@ -317,26 +321,42 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
         }
     stage1 = dict(legacy)["stage1"]
     v2_stage1 = dict(v2)["stage1"]
-    if "block_m" not in stage1.keywords:
-        return {("stage1", ""): f"stage1: {stage1.func} is not a 2-stage launch"}
-    # Executor and legacy both call stage 1 as (a1, w1, w2, sorted_ids,
-    # sorted_expert_ids, num_valid_ids, out, topk, block_m=..., ...).
-    block_m = int(stage1.keywords["block_m"])
-    num_valid = int(stage1.args[5][0])
+    skip = {out_legacy.data_ptr(), out_v2.data_ptr()}
+    if stage1.func is fused_moe_1stage:
+        # (hidden_states, w1, w2, topk, sorted_ids, sorted_weights, sorted_expert_ids,
+        # num_valid_ids, moe_buf, isG1U1, block_size_M, ...); moe_buf is the output.
+        skip |= {stage1.args[8].data_ptr(), v2_stage1.args[8].data_ptr()}
+        block_m = int(stage1.args[10])
+        at = {"ids": 4, "weights": 5, "blocks": 6, "num_valid": 7}
+        if stage1.keywords.get("flat"):
+            # The FLAT pass-through: the topk ids and weights, so every tensor whole.
+            at = {}
+    elif "block_m" in stage1.keywords:
+        # (a1, w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, out, topk,
+        # block_m=..., ...)
+        block_m = int(stage1.keywords["block_m"])
+        at = {"ids": 3, "blocks": 4, "num_valid": 5}
+    else:
+        return {("stage1", ""): f"stage1: {stage1.func} is not a known launch"}
+    num_valid = int(stage1.args[at["num_valid"]][0]) if at else None
     roles = {}
-    for a, b, role in zip(stage1.args[3:5], v2_stage1.args[3:5], ("ids", "blocks")):
-        roles[a.data_ptr()], roles[b.data_ptr()] = role, role
+    for role, i in at.items():
+        if role != "num_valid":
+            role = "ids" if role == "weights" else role
+            roles[stage1.args[i].data_ptr()] = roles[v2_stage1.args[i].data_ptr()] = (
+                role
+            )
     for _, launch in legacy + v2:
         for name in ("sorted_weights", "m_indices"):
             if launch.keywords.get(name) is not None:
                 roles[launch.keywords[name].data_ptr()] = "ids"
     topk_ids, expert_mask = call["topk_ids"], call.get("expert_mask")
     slots = None if expert_mask is None else expert_mask[topk_ids.long()].bool()
-    sorted_ids = stage1.args[3]
-    routed_rows = (sorted_ids[:num_valid] & 0xFFFFFF) < topk_ids.shape[0]
+    sorted_ids = stage1.args[at["ids"]] if at else None
+    if sorted_ids is not None:
+        routed_rows = (sorted_ids[:num_valid] & 0xFFFFFF) < topk_ids.shape[0]
     model_dim = call["hidden_states"].shape[-1]
     _, _, inter_dim = get_inter_dim(call["w1"].shape, call["w2"].shape)
-    skip = {out_legacy.data_ptr(), out_v2.data_ptr()}
     problems = {}
     for (name, a), (_, b) in zip(legacy, v2):
         if a.func is not b.func:
@@ -368,7 +388,9 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
             scale = x.element_size() == 1 and (
                 x.dtype == dtypes.fp8_e8m0 or where in ("a1_scale", "a2_scale")
             )
-            if scale and rows >= len(sorted_ids) and rows % 32 == 0:
+            if sorted_ids is None:
+                pass  # FLAT: no sorted buffers
+            elif scale and rows >= len(sorted_ids) and rows % 32 == 0:
                 groups = (model_dim if name == "stage1" else inter_dim) // 32
                 defined = _sorted_scale_defined(
                     sorted_ids[:num_valid], topk_ids.shape[0], groups, -groups // 8 * -8

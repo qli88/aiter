@@ -13,18 +13,19 @@ unsafe), or a tuned FlyDSL a16w4 row or `swiglu_mxfp4_bf16_cktile` row. The CK b
 (gfx942 Relu2 and SiTUv2 outside FlyDSL and CK-Tile), interleaved calls outside the
 CK-Tile interleaved branch (legacy runs FlyDSL kernels for separated weights there, todo
 5.8), Relu2 with g1u1, bias or `doweight_stage1` (legacy raises), the alias rows outside
-the CK-Tile branches (ASM stage 1 + CK stage 2), 1-stage tuned rows and any other tuned
-row are declined back to the legacy code.
+the CK-Tile branches (ASM stage 1 + CK stage 2) and any other tuned row are declined
+back to the legacy code. Tuned 1-stage rows (all FLAT) run 1-stage ASM `fmoe`.
 """
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import paths
+from ..segments.asm import AsmFmoe1Stage
 from ..segments.ck_tile import CktileGemm1, CktileGemm2, cktile_interleaved_swiglu
 from ..segments.mxfp4 import FlydslGemm1, FlydslGemm2, a16w4, mxfp4
 from ..segments.quant import QuantA1, QuantInter
-from ..segments.sort import Sort
+from ..segments.sort import Sort, SortFlat
 from ..shapes import get_inter_dim
 from . import local
 
@@ -32,12 +33,14 @@ NAME = "a16w4"
 ARCHS = ("gfx942", "gfx950")
 SEGMENTS = (
     Sort(),
+    SortFlat(),
     QuantA1(),
     CktileGemm1(),
     FlydslGemm1(),
     QuantInter(),
     CktileGemm2(),
     FlydslGemm2(),
+    AsmFmoe1Stage(),
 )
 
 ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)

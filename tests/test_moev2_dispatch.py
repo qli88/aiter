@@ -568,10 +568,11 @@ def test_claims_only_unquantized_16_bit(monkeypatch):
         {"activation": ActivationType.Swiglu.value},
         {"bias2": torch.empty(1)},
         {"w2": torch.empty(4, 64, 16, dtype=dtypes.fp8)},
-        {"w1": torch.empty(4, 16, 64, dtype=dtypes.bf16)},  # g1u0
         {"dtype": torch.float32},
     ):
         assert not a16w16.claims({**call, **change}), change
+    # g1u0: the ranking runs the 1-stage `fmoe` keys and declines the rest.
+    assert a16w16.claims({**call, "w1": torch.empty(4, 16, 64, dtype=dtypes.bf16)})
     monkeypatch.setattr(local, "get_gfx", lambda: "gfx1201")
     assert not a16w16.claims(call)
 
@@ -841,7 +842,7 @@ def test_int8_defaults_run_asm_stage1_and_int4_runs_ck(monkeypatch):
     res = _default_resolve(
         monkeypatch, 33, QuantType.per_Token, arch="gfx942", fp8=dtypes.i8
     )
-    assert res.plan is None and "1-stage ASM fmoe is not ported" in res.declined
+    _assert_default_1stage(res)
     res = _default_resolve(
         monkeypatch, 32, QuantType.per_Token, arch="gfx942", fp8=dtypes.i8
     )
@@ -861,16 +862,62 @@ def test_asm_int8_has_no_doweight_stage1_kernel():
     assert AsmStage1().reject_reason(fp8) is None
 
 
-def test_per_token_fp8_defaults_hand_the_1stage_region_back(monkeypatch):
-    res = _default_resolve(monkeypatch, 17, QuantType.per_Token)
-    assert res.plan is None and "1-stage ASM fmoe is not ported" in res.declined
+def _assert_default_1stage(res, xbf16=False):
+    """Legacy's default 1-stage metadata: `fused_moe_1stage` without a kernel name,
+    BLOCK_SIZE_M, no split-K, no stage 2."""
+    assert res.plan.structure()[0] == ("sort", "asm.fmoe_1stage")
+    md = res.metadata
+    assert md.stage1.func.__name__ == "fused_moe_1stage" and md.stage2 is None
+    assert (md.run_1stage, md.block_m, md.ksplit, md.flat) == (True, 32, 0, 0)
+    assert md.stage1.keywords["kernelName"] == ""
+    assert md.stage1.keywords["xbf16"] is xbf16
+    assert "run_1stage = True" in res.logs[0][1]
+    assert res.logs[-1][1].startswith(
+        f"[fused_moe] using 1stage{' xbf16' if xbf16 else ''} default for "
+    )
+
+
+def test_per_token_fp8_defaults_run_1stage_fmoe_in_its_region(monkeypatch):
+    _assert_default_1stage(_default_resolve(monkeypatch, 17, QuantType.per_Token))
     res = _default_resolve(monkeypatch, 16, QuantType.per_Token, inter_dim=192)
-    assert res.plan is None and "not inter_dim_128" in res.declined
+    _assert_default_1stage(res)
     res = _default_resolve(monkeypatch, 16, QuantType.per_Token)
     assert res.plan.structure()[0] == (
         "sort", "quant.a1", "ck.gemm1", "quant.inter", "ck.gemm2"
     )  # fmt: skip
     assert (res.metadata.block_m, res.metadata.ksplit) == (32, 0)
+
+
+_NO_G1U0_PLAN = (
+    "no feasible plan",
+    "ranking a16w16_g1u0[otherwise]: no listed structure is feasible",
+)
+
+
+def test_g1u0_keys_run_1stage_fmoe_where_legacy_does(monkeypatch):
+    from aiter.moev2.migration import a8w8_ptok, a16w16
+
+    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+
+    def g1u0(token, arch="gfx942", **kw):
+        p = _problem(token=token, arch=arch, **kw)
+        return dataclasses.replace(p, layout=dataclasses.replace(p.layout, g1u1=False))
+
+    bf16 = {"quant": QuantType.No, "fp8": dtypes.bf16}
+    int8 = {"quant": QuantType.per_Token, "fp8": dtypes.i8}
+    for path, fmt, branch, one_stage, two_stage in (
+        (a16w16, bf16, "CK 2-stage g1u0", 255, 256),
+        (a8w8_ptok, int8, "ASM stage 1 + CK stage 2 g1u0", 33, 32),
+    ):
+        p = g1u0(one_stage, **fmt)
+        assert path.takes(p)
+        _assert_default_1stage(resolver.resolve(p, path.SEGMENTS))
+        res = resolver.resolve(g1u0(two_stage, **fmt), path.SEGMENTS)
+        assert res.declined.endswith(f": {branch} is not ported"), res.declined
+        # gfx950 has no g1u0 key in fused_moe_1stage_dict: nothing runs g1u0 there.
+        res = resolver.resolve(g1u0(one_stage, arch="gfx950", **fmt), path.SEGMENTS)
+        assert res.declined in _NO_G1U0_PLAN, res.declined
+    assert not a8w8_ptok.takes(g1u0(64, quant=QuantType.per_Token))
 
 
 def test_blockscale_defaults_take_the_legacy_block_m_and_ksplit(monkeypatch):
@@ -882,8 +929,13 @@ def test_blockscale_defaults_take_the_legacy_block_m_and_ksplit(monkeypatch):
 
     res = _default_resolve(monkeypatch, 1, QuantType.per_1x128)
     assert (res.metadata.block_m, res.metadata.ksplit) == (16, 14)
+    _assert_default_1stage(_default_resolve(monkeypatch, 33, QuantType.per_1x128))
+    monkeypatch.setenv("AITER_XBFLOAT16", "1")
     res = _default_resolve(monkeypatch, 33, QuantType.per_1x128)
-    assert res.plan is None and "fmoe_fp8_blockscale_g1u1 is not ported" in res.declined
+    _assert_default_1stage(res, xbf16=True)
+    res = _default_resolve(monkeypatch, 33, QuantType.per_1x128, arch="gfx942")
+    _assert_default_1stage(res)  # xbf16 is gfx950 only
+    monkeypatch.delenv("AITER_XBFLOAT16")
 
     import aiter
 
@@ -895,6 +947,117 @@ def test_blockscale_defaults_take_the_legacy_block_m_and_ksplit(monkeypatch):
     assert calls == [(ActivationType.Silu.value, False, 32, 256, 7168)]
     assert res.plan.structure()[0][2] == "ck.gemm1"
     assert (res.metadata.block_m, res.metadata.ksplit) == (64, 0)
+
+
+_ROW_1STAGE = {
+    "block_m": 64,
+    "ksplit": 0,
+    "run_1stage": 1,
+    "kernelName1": "_ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_pf2_silu_32x128E",
+    "kernelName2": float("nan"),
+    "flat": 0.0,
+    "xbf16": 0,
+}
+
+
+def _tuned_1stage(monkeypatch, row, **kw):
+    from aiter.moev2.migration import a8w8_blockscale
+
+    monkeypatch.setattr(tuned, "lookup", lambda problem: row)
+    p = _problem(quant=QuantType.per_1x128, **kw)
+    return resolver.resolve(p, a8w8_blockscale.SEGMENTS)
+
+
+def test_a_tuned_1stage_row_runs_fused_moe_1stage_as_legacy_builds_it(monkeypatch):
+    res = _tuned_1stage(monkeypatch, _ROW_1STAGE)
+    assert res.plan.structure()[0] == ("sort", "asm.fmoe_1stage")
+    md = res.metadata
+    assert md.stage1.func.__name__ == "fused_moe_1stage" and md.stage2 is None
+    assert md.stage1.keywords["kernelName"] == _ROW_1STAGE["kernelName1"]
+    assert md.stage1.keywords["xbf16"] is False and md.stage1.keywords["flat"] == 0
+    assert (md.run_1stage, md.block_m, md.ksplit) == (1, 64, 0)
+    assert res.logs[-1][1].startswith(
+        f"[fused_moe] using 1stage (kernelName1={_ROW_1STAGE['kernelName1']!r}, "
+        "kernelName2=nan) for "
+    )
+    for row, xbf16 in (
+        ({**_ROW_1STAGE, "xbf16": 1}, True),
+        # Without the column, legacy reads it from the kernel name.
+        (
+            {
+                k: v
+                for k, v in _ROW_1STAGE.items()
+                if k != "xbf16" and k != "kernelName1"
+            }
+            | {"kernelName1": "_ZN5aiter47fmoe_bf16_blockscaleBf16_g1u1_vs_silu_1tgE"},
+            True,
+        ),
+        ({**_ROW_1STAGE, "kernelName2": "Null"}, False),
+    ):
+        res = _tuned_1stage(monkeypatch, row)
+        assert res.metadata.stage1.keywords["xbf16"] is xbf16, row
+        assert ("1stage xbf16 (" in res.logs[-1][1]) is xbf16
+
+
+def test_a_flat_1stage_row_runs_on_the_flat_pass_through(monkeypatch):
+    for flat in (1.0, 2.0):
+        res = _tuned_1stage(monkeypatch, {**_ROW_1STAGE, "flat": flat}, is_ep=True)
+        assert res.plan.structure()[0] == ("sort.flat", "asm.fmoe_1stage")
+        assert res.metadata.flat == int(flat)
+        assert res.metadata.stage1.keywords["flat"] == int(flat)
+    res = _tuned_1stage(monkeypatch, _ROW_1STAGE)
+    assert res.plan.structure()[0] == ("sort", "asm.fmoe_1stage")
+
+
+def test_only_the_1stage_fmoe_reads_the_flat_pass_through():
+    from aiter.moev2.migration import a4w4
+
+    plans = resolver.feasible_plans(_a4w4_problem(), a4w4.SEGMENTS)[0]
+    names = {tuple(s.name for s in plan) for plan in plans}
+    assert {n for n in names if "sort.flat" in n} == {("sort.flat", "asm.fmoe_1stage")}
+    assert {n for n in names if "asm.fmoe_1stage" in n} == {
+        ("sort", "asm.fmoe_1stage"),
+        ("sort.flat", "asm.fmoe_1stage"),
+    }
+
+
+def test_1stage_rows_outside_the_plain_form_go_back_to_legacy(monkeypatch):
+    stage2 = "moe_ck2stages_gemm2_256x64x128x128_1x4_MulABScaleExpertWeightA8W8blkscale_v3_Nswizzle0_Quant4_MulRoutedWeight1_F8_F8_B16"
+    res = _tuned_1stage(monkeypatch, {**_ROW_1STAGE, "kernelName2": stage2})
+    assert res.declined.startswith("1-stage row with kernelName1=")
+
+
+def test_a_1stage_row_for_another_activation_is_discarded(monkeypatch):
+    monkeypatch.setattr(resolver, "ONE_STAGE_ACTIVATIONS", ("gelu",))
+    res = _tuned_1stage(monkeypatch, _ROW_1STAGE)
+    assert res.logs[0] == (
+        logging.WARNING,
+        (
+            "[fused_moe] discarding 1-stage tuned config for unsupported activation "
+            "ActivationType.Silu; using default heuristics"
+        ),
+    )
+    assert res.plan.source == "default"
+
+
+def test_the_bypass_ranks_a_problem_with_a_1stage_row(monkeypatch):
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
+    res = _tuned_1stage(monkeypatch, _ROW_1STAGE, token=16)
+    assert res.plan.source == "override"
+    assert res.plan.structure()[0][2] == "ck.gemm1"
+    assert "(kernelName1='', kernelName2='')" in res.logs[-1][1]
+
+
+def test_the_relookup_logs_a_1stage_choice(monkeypatch, caplog):
+    from aiter.moev2.migration import a8w8_ptok
+
+    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    tuned.clear_cache()
+    p = _problem(token=16, quant=QuantType.per_Token)
+    with caplog.at_level(logging.INFO, logger="aiter"):
+        res = a8w8_ptok.LOCAL.relookup(p, 64)
+    assert res.plan.structure()[0] == ("sort", "asm.fmoe_1stage")
+    assert "[fused_moe] using 1stage default for" in caplog.text
 
 
 def test_a_tuned_asm_blockscale_row_runs_the_packed_stage1(monkeypatch):
@@ -931,16 +1094,19 @@ def test_the_packed_stage1_buffer_splits_like_legacy():
     assert scale.data_ptr() == a2[token:].data_ptr()
 
 
-def test_g1u0_is_not_claimed_and_has_no_ck_plan():
-    """CK stage 1 always splits w1 into gate and up; g1u0 calls stay on legacy."""
+def test_g1u0_has_no_ck_plan():
+    """CK stage 1 always splits w1 into gate and up; g1u0 calls outside the 1-stage
+    `fmoe` keys stay on legacy."""
     from aiter.moev2.migration import a8w8_pt, a16w16
 
     p = _problem(quant=QuantType.No, fp8=dtypes.bf16)
     assert resolver.resolve(p, a16w16.SEGMENTS).plan is not None
     g1u0 = dataclasses.replace(p, layout=dataclasses.replace(p.layout, g1u1=False))
-    assert not a16w16.takes(g1u0)
+    assert a16w16.takes(g1u0)
     res = resolver.resolve(g1u0, a16w16.SEGMENTS)
-    assert res.plan is None and "no listed structure is feasible" in res.declined
+    assert res.plan is None and res.declined in _NO_G1U0_PLAN, res.declined
+    plans = resolver.feasible_plans(g1u0, a16w16.SEGMENTS)[0]
+    assert all(s.name != "ck.gemm1" for plan in plans for s in plan)
     fp8 = _problem()
     assert a8w8_pt.takes(fp8)
     assert not a8w8_pt.takes(
@@ -1401,6 +1567,32 @@ def test_claims_split_mxfp4_weights_by_activation_format(monkeypatch):
         ({"activation": ActivationType.Relu2.value, **fp4}, False),
     ):
         assert a4w4.claims({**call, **change}) == claimed, change
+
+
+def test_a8w4_leaves_legacy_grouped_gfx1250_calls_to_legacy(monkeypatch):
+    from aiter.moev2.migration import a8w4, local
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    for name in ("AITER_USE_GROUPED_GEMM", "GPU_ARCHS", "AITER_FORCE_GFX1250"):
+        monkeypatch.delenv(name, raising=False)
+    call = {
+        **_a4w4_op_call(),
+        "quant_dtype_a": dtypes.fp8,
+        "gate_mode": GateMode.INTERLEAVE.value,
+        "w1_scale": torch.empty(1),
+        "w2_scale": torch.empty(1),
+    }
+    assert a8w4.claims(call)
+    monkeypatch.setenv("AITER_USE_GROUPED_GEMM", "1")
+    assert a8w4.claims(call)  # gfx950 alone: the grouped branch returns None
+    monkeypatch.setenv("GPU_ARCHS", "gfx950;gfx1250")
+    assert not a8w4.claims(call)
+    assert a8w4.claims({**call, "gate_mode": GateMode.SEPARATED.value})
+    assert a8w4.claims({**call, "w2_scale": None})
+    monkeypatch.setenv("AITER_DISABLE_GROUPED_A8W4", "1")
+    assert a8w4.claims(call)
 
 
 def test_a4w4_tuned_rows_pick_the_mxmoe_and_layout_v2_segments(monkeypatch):

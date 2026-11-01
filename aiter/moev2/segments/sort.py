@@ -5,9 +5,10 @@
 The backend is chosen as in the legacy `moe_sorting`, from the same environment variables:
 Opus by default, CK with AITER_USE_CK_MOE_SORTING=1, FlyDSL with
 AITER_USE_FLYDSL_MOE_SORTING=1. This module covers the plain sort (no local topk ids, no
-auxiliary outputs, not FLAT), the auxiliary sort of the MXFP4 kernels (`output_aux`)
-and the decode sort fused with the MXFP4 activation quant. The legacy `moe_sorting` and
-`_is_fused_decode_sort_quant_enabled` stay in aiter/fused_moe.py, where tests patch their
+auxiliary outputs), the pass-through of the 1-stage FLAT kernels, the auxiliary sort of
+the MXFP4 kernels (`output_aux`) and the decode sort fused with the MXFP4 activation
+quant. The legacy `moe_sorting` and `_is_fused_decode_sort_quant_enabled` stay in
+aiter/fused_moe.py, where tests patch their
 globals. `hooks.set_sort_impl` replaces `moe_sorting` here, and
 `hooks.disable_fused_decode_sort_quant` the fused decode kernel.
 """
@@ -353,6 +354,40 @@ def _flydsl_moe_sorting(
     return ret
 
 
+# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
+# topk_weights through the sorted_* kernarg slots and accumulate via
+# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
+
+
+def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
+    device = topk_ids.device
+    M = topk_ids.shape[0]
+    # FLAT kernels zero their own output rows on-device and need an
+    # extra M*8-byte per-token coordination region appended to moe_buf.
+    # We over-allocate as a flat byte buffer and expose only the row part.
+    #
+    # The trailing region does not need initialisation; the kernel
+    # tolerates arbitrary contents on the first reference per dispatch.
+    elem_size = torch.empty(0, dtype=moebuf_dtype).element_size()
+    row_bytes = M * model_dim * elem_size
+    flag_bytes = 8
+    flat_buf = torch.empty(row_bytes + flag_bytes, dtype=torch.uint8, device=device)
+    moe_buf = flat_buf[:row_bytes].view(moebuf_dtype).view(M, model_dim)
+    topk_ids_i32 = (
+        topk_ids
+        if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()
+        else topk_ids.to(dtypes.i32).contiguous()
+    )
+    topk_weights_f32 = (
+        topk_weights
+        if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
+        else topk_weights.to(dtypes.fp32).contiguous()
+    )
+    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
+    # but must be valid device pointers -- alias topk_ids as scratch.
+    return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -475,16 +510,18 @@ def moe_sorting(
     dispatch_policy=0,
     return_local_topk_ids=False,
     accumulate=True,
+    flat=False,
     output_aux=False,
     output=None,
 ):
     """`(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)`, then
     `m_indices` and `reverse_sorted` with `output_aux`, then the local topk ids with
-    `return_local_topk_ids`."""
+    `return_local_topk_ids`. With `flat`, the unsorted topk in those slots."""
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
         and not return_local_topk_ids
+        and not flat
         and not output_aux
         and dispatch_policy == 0
     ):
@@ -499,6 +536,13 @@ def moe_sorting(
             num_local_tokens,
             accumulate=accumulate,
             output=output,
+        )
+    # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
+    # `output` cannot be written in place: FLAT needs extra bytes appended to moe_buf.
+    if flat:
+        assert output is None, "FLAT over-allocates moe_buf; the caller copies"
+        return _moe_prepare_unsorted_input(
+            topk_ids, topk_weights, model_dim, moebuf_dtype
         )
     try:
         return _moe_sorting_impl(
@@ -531,6 +575,7 @@ def moe_sorting(
 
 class Sort(Segment):
     name = "sort"
+    flat = False  # the FLAT pass-through (`SortFlat`)
     covers = (Op.SORT, Op.SORT)
     structure_params = frozenset({"block_m"})
     capabilities = (
@@ -625,4 +670,44 @@ class SortAux(Sort):
             output_aux=output_aux,
             output=output,
             **kwargs,
+        )
+
+
+class SortFlat(Sort):
+    """The FLAT pass-through: the 1-stage FLAT kernels route in the kernel, so the topk
+    ids and weights go in the sorted slots and `moe_buf` has 8 spare bytes. Like the
+    legacy FLAT sort, it drops `expert_mask` and `num_local_tokens` (todo 5.25).
+    """
+
+    name = "sort.flat"
+    flat = True
+
+    def produces(self, p, params):
+        return Buf("sorted", None, "unsorted", block_m=params.get("block_m"))
+
+    def run(
+        self,
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size,
+        expert_mask,
+        num_local_tokens,
+        dispatch_policy,
+        output,
+    ):
+        return hooks.sort_impl(moe_sorting)(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            dispatch_policy,
+            flat=True,
+            output=output,
         )
