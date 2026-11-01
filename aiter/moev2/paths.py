@@ -162,10 +162,10 @@ def active() -> tuple:
 
 
 def _select() -> tuple:
-    _load_builtin()
     selection = envs.moev2_selection()
     if selection == "off":
         return ()
+    _load_builtin()
     if selection == "on":
         return tuple(_REGISTRY.values())
     if selection == "default":

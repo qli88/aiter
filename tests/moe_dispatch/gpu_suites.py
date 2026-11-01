@@ -150,11 +150,15 @@ def compare(path, log_dir):
     """Lines of `path`'s suites under `off` and under the path; the second item is
     False when v2 fails a suite legacy passes."""
     from aiter.jit.utils.chip_info import get_gfx
+    from aiter.moev2 import paths
 
+    if path not in paths.registered():
+        # AITER_MOEV2=<path> would run legacy in both modes.
+        return [f"  {path} is not implemented: nothing to compare"], False
     arch = get_gfx()
     log_dir = pathlib.Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    lines, ok = [], True
+    lines, ok, ran = [], True, 0
     for i, suite in enumerate(suites_for(path)):
         line = shlex.join(suite.cmd)
         if arch not in suite.archs or suite.gpus > 1:
@@ -165,8 +169,11 @@ def compare(path, log_dir):
             log = log_dir / f"{path}.{i}.{mode}.log"
             result[mode] = "pass" if _run(suite, mode, log) else "FAIL"
         ok &= not (result["off"] == "pass" and result[path] == "FAIL")
+        ran += 1
         lines.append(f"  off {result['off']}, v2 {result[path]}: {line}")
-    return lines, ok
+    if not ran:
+        lines.append(f"  no suite of {path} runs on {arch} with one GPU")
+    return lines, ok and ran > 0
 
 
 def main(argv=None):

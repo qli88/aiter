@@ -10,7 +10,6 @@ path). `LocalDispatch` resolves each legacy dispatch key once, as the cached leg
 MXFP4 weights, `run_one_stage` for a 1-stage plan, which has no second lookup).
 """
 
-import functools
 import os
 from dataclasses import replace
 
@@ -23,6 +22,7 @@ from ..dispatch import overrides, resolver, tuned
 from ..execute import executor
 from ..policy import quant_remap, resolve_activation_dtype
 from ..problem import FrozenMap
+from ..segments.flydsl_fhmoe import _validate_fhmoe_metadata_consistency
 from ..segments.mxmoe import _is_mxfp4_inline_sort, _mxfp4_inline_sort_unsupported
 from ..shapes import get_inter_dim, get_padded_M
 
@@ -57,6 +57,13 @@ def activation_dtype(call):
         gfx=get_gfx_runtime(),
         gate_up_interleave=getattr(w1, "gate_up_interleave", None),
     )
+
+
+def same_arch(archs) -> bool:
+    """The build arch (`get_gfx()`, the last `GPU_ARCHS` entry) is the device's and in
+    `archs`: legacy picks 1-stage keys and ASM kernels by `get_gfx()`, v2 by the
+    device."""
+    return get_gfx() == get_gfx_runtime() and get_gfx_runtime() in archs
 
 
 def claims(
@@ -108,7 +115,7 @@ def claims(
         return False
     if ActivationType(call["activation"]) not in activations:
         return False
-    if get_gfx() not in archs or get_gfx_runtime() not in archs:
+    if not same_arch(archs):
         return False
     w1, w2 = call["w1"], call["w2"]
     if (
@@ -247,10 +254,14 @@ class LocalDispatch:
         )
         if dispatched is None:
             return paths.DECLINED
+        self._check_fhmoe(dispatched[0])
         if c.quant_type == QuantType.per_1x32:
-            dispatched = self._inline_sort_fallback(c, args, kwargs, dispatched)
-            if dispatched is None:
+            fallback = self._inline_sort_fallback(c, args, kwargs, dispatched)
+            if fallback is None:
                 return paths.DECLINED
+            if fallback is not dispatched:
+                self._check_fhmoe(fallback[0])
+            dispatched = fallback
         resolution, problem = dispatched
         if (
             self.fhmoe
@@ -268,7 +279,10 @@ class LocalDispatch:
         after_sort = None
         if problem is not None:
             token = get_padded_M(c["hidden_states"].shape[0])
-            after_sort = functools.partial(self.relookup, problem, token)
+
+            def after_sort():
+                self._check_fhmoe(self.relookup(problem, token))
+
         run = (
             executor.run_mxfp4
             if c.quant_type == QuantType.per_1x32
@@ -277,6 +291,13 @@ class LocalDispatch:
         return run(
             c, resolution.metadata, resolution.plan, q_dtype_a, after_sort=after_sort
         )
+
+    def _check_fhmoe(self, resolution):
+        """`_use_fhmoe_wrappers`, which legacy applies to every FHMoE lookup: the stage
+        1 `tile_m` and stage 2 sorting block equal `block_m`, else NotImplementedError.
+        """
+        if self.fhmoe and resolution.plan is not None:
+            _validate_fhmoe_metadata_consistency(resolution.metadata)
 
     def _inline_sort_fallback(self, c, args, kwargs, dispatched):
         """`_fused_moe_impl`: a tuned inline-sort row this call cannot run is discarded,

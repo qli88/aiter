@@ -18,7 +18,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import paths
@@ -37,6 +37,7 @@ from ..segments.flydsl_fhmoe import (
     _is_dsv4_i384_metadata,
     _is_fhmoe_metadata_compatible,
     _validate_fhmoe_contract,
+    _validate_fhmoe_metadata_consistency,
 )
 from ..segments.mxfp4 import mxfp4, mxfp8
 from ..segments.quant import QuantA1, QuantInter
@@ -73,7 +74,7 @@ _PROBE_ERRORS = (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueE
 def claims(call) -> bool:
     if overrides.online_tune():
         return False
-    if get_gfx() not in ARCHS or get_gfx_runtime() not in ARCHS:
+    if not local.same_arch(ARCHS):
         return False
     return not (call["w1"].dtype == dtypes.fp4x2 and local.legacy_grouped_gfx1250(call))
 
@@ -124,7 +125,7 @@ def _probe_metadata(
 ):
     """The FHMoE metadata of a probe key (the legacy `get_2stage_cfgs` arguments the
     capability checks pass); raises NotImplementedError where `_use_fhmoe_wrappers`
-    does (no FHMoE plan)."""
+    does (no FHMoE plan, or stage tiles that differ from `block_m`)."""
     args = (
         token,
         model_dim,
@@ -151,7 +152,9 @@ def _probe_metadata(
             "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts require the "
             "two-stage FlyDSL path"
         )
-    return dispatched[0].metadata
+    metadata = dispatched[0].metadata
+    _validate_fhmoe_metadata_consistency(metadata)
+    return metadata
 
 
 @tuned.cached

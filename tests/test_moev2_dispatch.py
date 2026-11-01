@@ -1362,6 +1362,39 @@ def test_a16w4_cktile_alias_rows(monkeypatch):
     assert res.plan is None
 
 
+def test_a4w4_cktile_alias_rows_follow_the_legacy_branch_order(monkeypatch):
+    silu = functools.partial(_a4w4_problem, shape=(7168, 512, 256, 8), is_shuffled=True)
+    row = {"block_m": 16, "ksplit": 2, "run_1stage": 0}
+    row.update(kernelName1=_ALIAS, kernelName2=_ALIAS)
+    # The heuristic FlyDSL branch comes before CK-Tile split-K.
+    res = _a4w4_resolve(monkeypatch, silu(), row)
+    assert "the heuristic FlyDSL branch takes the alias tuned row" in res.declined
+    monkeypatch.setenv("AITER_FLYDSL_FORCE", "0")
+    res = _a4w4_resolve(monkeypatch, _a4w4_problem(
+        shape=(4096, 512, 64, 4), activation=ActivationType.Gelu, is_shuffled=True
+    ), row)  # fmt: skip
+    assert res.metadata.stage1.keywords["split_k"] == res.metadata.ksplit == 2
+    # AITER_KSPLIT=-1: the branches see ksplit 0 (no split-K branch, ASM stage 1).
+    monkeypatch.setenv("AITER_KSPLIT", "-1")
+    res = _a4w4_resolve(monkeypatch, _a4w4_problem(
+        shape=(4096, 512, 64, 4), activation=ActivationType.Gelu, is_shuffled=True
+    ), row)  # fmt: skip
+    assert "alias tuned row outside the CK-Tile branches" in res.declined
+    monkeypatch.delenv("AITER_KSPLIT")
+    # Legacy's tuned FlyDSL branch runs CK stage 1 under the alias name; its CK-Tile
+    # branches run CK-Tile stage 2 whatever the row names.
+    ck2 = (
+        "moe_ck2stages_gemm2_256x32x128x128_1x4_MulABScaleExpertWeightShuffled_v3_"
+        "Nswizzle0_Quant3_MulRoutedWeight1_FP4X2_FP4X2_B16"
+    )
+    for kn2, reason in (
+        ("flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic", "with a FlyDSL stage 2"),
+        (ck2, "that is not CK-Tile"),
+    ):
+        row["kernelName2"] = kn2
+        assert reason in _a4w4_resolve(monkeypatch, silu(), row).declined
+
+
 def test_a16w4_defaults(monkeypatch):
     # SiTUv2: the FlyDSL a16w4 heuristic.
     res = _a16w4_resolve(monkeypatch, _a16w4_problem())
@@ -1820,6 +1853,7 @@ def test_fhmoe_capability_checks_match_legacy_on_the_shipped_table(monkeypatch):
         "gate_mode": GateMode.INTERLEAVE,
         "doweight_stage1": False,
     }
+
     for m in (1, 7, 64, 1000, 8192, 70000):
         assert fhmoe.supports_dsv4_i384_fhmoe(m) == (
             legacy_fhmoe.supports_dsv4_i384_fhmoe(m)

@@ -364,13 +364,13 @@ class AsmStage1Cktile(AsmStage1):
         )
 
     def declines_row(self, p, row):
-        from .ck_tile import cktile_branch, flydsl_mxfp4
+        from .ck_tile import cktile_branch, flydsl_mxfp4, tuned_ksplit
 
         kn2 = str(row.get("kernelName2", "") or "").strip()
         if kn2.startswith("flydsl_"):
             # The tuned FlyDSL branch runs CK stage 1 under the name.
             return "cktile_* kernelName1 with a FlyDSL stage 2"
-        ksplit = int(row.get("ksplit", 0))
+        ksplit = tuned_ksplit(row)
         if flydsl_mxfp4(p) or cktile_branch(p, ksplit, tuned_row=True) is not None:
             return "a default MXFP4 branch takes the cktile_* row"
         return None

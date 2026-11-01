@@ -269,6 +269,26 @@ def test_gpu_suites_cover_exactly_the_planned_paths():
     assert set(gpu_suites.PATHS) == set(paths.PLANNED)
 
 
+def test_local_paths_need_the_build_arch_to_be_the_device(monkeypatch):
+    from aiter.moev2.migration import local
+
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx942")
+    assert local.same_arch(("gfx942", "gfx950"))
+    # GPU_ARCHS="gfx942;gfx950" on a gfx942: legacy picks 1-stage keys for gfx950.
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx950")
+    assert not local.same_arch(("gfx942", "gfx950"))
+
+
+def test_gpu_suites_do_not_compare_a_path_that_is_not_implemented(tmp_path):
+    from moe_dispatch import gpu_suites
+
+    missing = sorted(set(paths.PLANNED) - set(paths.registered()))
+    assert missing
+    lines, ok = gpu_suites.compare(missing[0], tmp_path)
+    assert not ok and "not implemented" in lines[0]
+
+
 def test_legacy_fused_moe_is_a_plain_function():
     assert inspect.isfunction(legacy.fused_moe)
     assert not hasattr(legacy.fused_moe, "cache_info")

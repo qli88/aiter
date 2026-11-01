@@ -122,3 +122,30 @@ def test_known_declines_match_path_reason_and_problem():
     )
     padding = "ranking a4w4[...]: CK 2-stage, padding ignored is not ported"
     assert known_declines.find("a4w4", _problem(), padding) is None
+    # A g1u0 key declined for another reason is not a g1u0 decline.
+    assert known_declines.find("a16w16", g1u0, "x") is None
+    assert known_declines.find("a16w16", g1u0, "no feasible plan") is not None
+    one_stage = MoeProblem.from_legacy_key(
+        64, 7168, 256, 256, 8, dtypes.bf16, dtypes.bf16, dtypes.bf16, QuantType.No,
+        False, ActivationType.Silu, False, 0, 0, arch="gfx942", cu_num=304,
+    )  # fmt: skip
+    assert known_declines.find("a16w16", one_stage, "no feasible plan") is None
+
+
+def test_known_declines_name_the_row_families():
+    sys.path.insert(0, str(_HERE))
+    from moe_dispatch import known_declines
+
+    padded = MoeProblem.from_legacy_key(
+        64, 7168, 256, 256, 8, dtypes.bf16, dtypes.fp4x2, dtypes.fp4x2,
+        QuantType.per_1x32, True, ActivationType.Silu, False, 128, 0,
+        arch="gfx950", cu_num=256,
+    )  # fmt: skip
+    layout = (
+        "no segments run kernelName1=flydsl_moe1_x, kernelName2=flydsl_moe2_layout_y"
+    )
+    assert known_declines.find("a4w4", padded, layout) is not None
+    mxmoe = "no segments run kernelName1=flydsl_mxmoe_g1_x, kernelName2=flydsl_moe2_y"
+    assert known_declines.find("a4w4", padded, mxmoe) is not None
+    plain = "no segments run kernelName1=flydsl_moe1_x, kernelName2=flydsl_moe2_y"
+    assert known_declines.find("a4w4", padded, plain) is None
