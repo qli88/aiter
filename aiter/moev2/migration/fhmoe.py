@@ -85,12 +85,12 @@ def takes(problem) -> bool:
     return (
         local.key_args_supported(
             problem,
+            ARCHS,
             activations=("silu",),
             gate_modes=(GateMode.SEPARATED, GateMode.INTERLEAVE),
             act_params=True,
             shared="fused_row",
         )
-        and problem.arch in ARCHS
         and not problem.features & _CONTRACT_EXCLUDES
         and problem.quant_type == QuantType.per_1x32
         and problem.w1 in (mxfp4(), mxfp8())

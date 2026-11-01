@@ -157,6 +157,7 @@ def legacy_grouped_gfx1250(call) -> bool:
 
 def key_args_supported(
     problem,
+    archs,
     *,
     activations=("silu", "gelu"),
     gate_modes=SEPARATED,
@@ -165,12 +166,16 @@ def key_args_supported(
     shared=None,
 ) -> bool:
     """False for keys with arguments or a layout the path does not support (see
-    `claims`; bias and padding are left to the segments' `Cap`s). `shared`: the
-    placement of the shared expert the path runs (None: no shared expert)."""
+    `claims`, whose `archs` it checks too; bias and padding are left to the segments'
+    `Cap`s). `shared`: the placement of the shared expert the path runs (None: no shared
+    expert)."""
     activation = problem.activation
     placement = None if problem.shared is None else problem.shared.placement
     return (
-        placement == shared
+        problem.arch in archs
+        and placement == shared
+        # A dedicated tuned table comes only with `fhmoe_`.
+        and (shared is not None or problem.extras.get("tuned_table") is None)
         and (g1u0 or problem.layout.g1u1)
         and activation.kind in activations
         and problem.gate_mode in gate_modes

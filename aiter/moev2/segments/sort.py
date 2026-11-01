@@ -681,6 +681,7 @@ class SortFlat(Sort):
     """
 
     name = "sort.flat"
+    tuned_only = True
     flat = True
 
     def produces(self, p, params):
