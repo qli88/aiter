@@ -124,37 +124,96 @@ REACHES = ("ranked", "tuned", "hibernating")
 
 
 class Segment:
-    """Base class of every segment.
+    """Base class of every segment: the reference for its attributes and methods.
 
-    `name`: unique, used in plans and logs. `prefixes`: the kernel-name families
-    (`kernel_names.FAMILIES`) whose tuned rows this segment runs. `covers`: the first and
-    last op of the chain it implements. `capabilities`: the `Cap`s it supports.
-    `structure_params`: parameters that change the boundary buffers (e.g. `block_m`), so
-    every segment of a plan must agree on them. `reach` (`REACHES`, checked by
-    `coverage.segment_errors`): how dispatch gets to the segment without a tuned row. A
-    tuned row runs the segment that owns its kernel name whatever its reach. "ranked":
-    in some ranking entry; tuned rows may run it too, and are not checked (a retune that
-    drops its last row leaves it reachable). "tuned": in no ranking entry, so run only
-    through tuned rows, as in legacy; some shipped tuned row runs it. "hibernating": in
-    no ranking entry and run by no shipped row, only by a table passed with
-    AITER_CONFIG_FMOE or by a test; it needs a GPU test
-    (tests/moe_dispatch/hibernating.py). The remaining attributes describe stateful and
-    collective segments; no ported segment sets them yet.
+    Attributes, grouped by who reads them. Adding one means documenting it here.
+
+    Identity and dispatch (read by the resolver and `coverage.py`):
+
+    - `name`: unique; plans, logs, `AITER_MOE_EXPLAIN` and the known-decline list name
+      the segment by it. Convention: `<family>.<stage>[_variant]`, e.g. `ck.gemm1`.
+    - `prefixes`: the kernel-name families (`kernel_names.FAMILIES`) whose tuned rows the
+      segment runs (`owns`). Empty for segments no tuned row names (sort, quant).
+    - `covers`: `(first, last)` ops of the chain (`dispatch.ops.Op`) it implements; the
+      next segment of a plan starts at the op after `last`. A stage 1 covers
+      `(GEMM1, ACT)`, or `(GEMM1, QUANT_INTER)` when it writes GEMM2's input format
+      itself; a stage 2 `(GEMM2, REDUCE)`; the 1-stage ASM kernels `(QUANT_A1, REDUCE)`;
+      a whole-graph implementation `(SORT, REDUCE)`.
+    - `capabilities`: the `Cap`s it supports. A problem no `Cap` covers rejects the
+      segment (`reject_reason`); no `Cap` at all accepts nothing.
+    - `reach` (`REACHES`, checked by `coverage.segment_errors`): how dispatch gets to the
+      segment without a tuned row. A tuned row runs the segment that owns its kernel
+      name whatever its reach. "ranked": in some ranking entry; tuned rows may run it
+      too, and are not checked (a retune that drops its last row leaves it reachable).
+      "tuned": in no ranking entry, so run only through tuned rows, as in legacy; some
+      shipped tuned row runs it. "hibernating": in no ranking entry and run by no
+      shipped row, only by a table passed with AITER_CONFIG_FMOE or by a test; it needs
+      a GPU test (tests/moe_dispatch/hibernating.py).
+
+    Plan parameters (declared for the tuner and the engine; nothing reads them yet):
+
+    - `structure_params`: parameters that change a boundary buffer, a wire format or a
+      buffer size (sort `block_m`, a dispatch scheme, a capacity), so every segment of a
+      plan and every rank must agree on them; the tuner enumerates their values as
+      separate structures. Today `block_m` is a plan field (`MOEMetadata.block_m`).
+    - `rank_local_params`: True if the local parameters (tiles, a bundle entry) may be
+      picked from the rank's own tokens, because they never change the wire. False: all
+      ranks use the same ones.
+
+    Runtime and collective behavior (for `MoeEngine`, phase 4; nothing reads them yet):
+
+    - `stateful`: keeps state across calls (symmetric memory, compiled bundles,
+      workspaces), so the engine creates, prepares and releases one instance per
+      structure.
+    - `zero_tokens_ok`: runs, and joins its collectives, on a rank with no tokens. EP
+      problems exclude segments without it: idle data-parallel ranks still call every
+      layer.
+    - `hints`: optional per-call inputs that only help speed, e.g. `"next_topk_ids"`
+      (`MegaMoEGfx1250` prefetches the next layer's plan). The engine passes a hint only
+      to segments that declare it; ignoring one is always correct, and hints are never
+      part of the key.
+    - `output_lifetime`: "caller" (the result is the caller's) or "until_next_forward"
+      (a view of an internal buffer that the next forward overwrites; the engine copies
+      it into `out=` when given).
+    - `lossy_values`: structure values that change numerics, e.g.
+      `{"p2p_quant": {"fp8_1x32"}}`; `comm_precision` filters them out.
+      `default_lossy`: the subset the kernel uses by default today (allowed under
+      `comm_precision="kernel_default"`).
+
+    Methods. Every segment implements `reads`, `produces` and `build`, and declares
+    `name`, `covers` and `capabilities`. The rest have defaults:
+
+    - Feasibility: `reject_reason` (from the `Cap`s; override only for checks a `Cap`
+      cannot express) and `accepts`.
+    - Boundaries: `reads(p)`, the `Buf`s it reads, and `produces(p, params)`, the `Buf` it
+      hands on. The resolver chains segments whose formats match.
+    - Tuned rows: `owns` (from `prefixes`), `check_row` (the row is discarded, as legacy
+      discards it, with an optional warning), `declines_row` (migration only: the row
+      goes back to the legacy code), `row_params` (what the row sets besides the kernel
+      names).
+    - Without a tuned row: `default_kernels` (a stage 1 naming both stages' kernels),
+      `default_params`.
+    - Stage 2 only: `stage2_kernel` (a rename of the tuned name, e.g. fp4 to fp8).
+    - Launch: `build(p, params)` binds the kernel wrapper, `metadata_fields` the
+      `MOEMetadata` fields it sets, `call_args(c)` the arguments taken from the call.
     """
 
+    # Identity and dispatch.
     name: str = ""
-    prefixes: tuple = ()
-    covers: tuple = (Op.SORT, Op.SORT)
-    capabilities: tuple = ()
-    reach: str = "ranked"
-    stateful: bool = False
-    structure_params: frozenset = frozenset()
-    rank_local_params: bool = False
-    zero_tokens_ok: bool = True
-    hints: frozenset = frozenset()
-    output_lifetime: str = "caller"
-    lossy_values: FrozenMap = FrozenMap()
-    default_lossy: FrozenMap = FrozenMap()
+    prefixes: tuple = ()  # kernel_names.FAMILIES whose tuned rows it runs
+    covers: tuple = (Op.SORT, Op.SORT)  # (first, last) op of the chain
+    capabilities: tuple = ()  # Caps; none accepts nothing
+    reach: str = "ranked"  # REACHES: "ranked", "tuned", "hibernating"
+    # Plan parameters.
+    structure_params: frozenset = frozenset()  # change a boundary, wire or buffer size
+    rank_local_params: bool = False  # local params may follow the rank's own tokens
+    # Runtime and collective behavior.
+    stateful: bool = False  # keeps state across calls; one instance per structure
+    zero_tokens_ok: bool = True  # runs and joins collectives with 0 tokens
+    hints: frozenset = frozenset()  # optional speed-only inputs, e.g. "next_topk_ids"
+    output_lifetime: str = "caller"  # or "until_next_forward" (a workspace view)
+    lossy_values: FrozenMap = FrozenMap()  # structure values that change numerics
+    default_lossy: FrozenMap = FrozenMap()  # the lossy values the kernel uses today
 
     def reject_reason(self, p: MoeProblem) -> str | None:
         """None if some capability covers `p`, else the reason of the closest one."""
