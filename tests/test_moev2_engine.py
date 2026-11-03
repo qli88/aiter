@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """`aiter.moev2.engine.MoeEngine`: lifecycle, buckets, per-call checks, the cross-rank
 plan agreement, and local MoE through the migration paths (CPU with meta weights; on a
-GPU, the same launches and output as `aiter.moev2.fused_moe`)."""
+GPU, the same launches and output as `aiter.moev2.api.fused_moe`)."""
 
+import dataclasses
 import pathlib
 import sys
 import types
@@ -17,13 +18,14 @@ from aiter.moev2.engine import (
     EngineState,
     EngineStateError,
     LocalTemplate,
+    MemoryBudgetExceeded,
     MoeEngine,
     MoeWeights,
     PlanDisagreement,
     PlanSource,
     StepInfo,
 )
-from aiter.moev2.segments.base import Segment
+from aiter.moev2.segments.base import MemoryNeed, Segment
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -34,9 +36,13 @@ class _Stateful(Segment):
     name = "test.stateful"
     stateful = True
 
-    def __init__(self):
+    def __init__(self, device=0, symmetric=0):
         self.calls = []
         self.failure = None
+        self.need = MemoryNeed(device, symmetric)
+
+    def workspace_bytes(self):
+        return self.need
 
     def prepare(self, ctx):
         self.calls.append(("prepare", ctx.world_size))
@@ -269,6 +275,104 @@ def test_plan_hash_follows_the_plans():
         return e.plan_hash
 
     assert prepared("a") == prepared("a") != prepared("b")
+
+
+class _TwoSegmentSource(_Source):
+    """Buckets up to 4 use `small`, larger buckets `large` (one instance each)."""
+
+    def __init__(self, small, large):
+        super().__init__()
+        self.small, self.large = small, large
+
+    def resolve(self, bucket, graph_capture):
+        plan = super().resolve(bucket, graph_capture)
+        segment = self.small if bucket <= 4 else self.large
+        return dataclasses.replace(plan, stateful=(segment,))
+
+
+def test_memory_counts_each_stateful_instance_once():
+    small, large = _Stateful(device=10, symmetric=100), _Stateful(device=1, symmetric=7)
+    e = MoeEngine.create(_TwoSegmentSource(small, large), max_tokens=64)
+    with pytest.raises(EngineStateError):
+        e.memory()
+    e.prepare()
+    assert e.memory() == MemoryNeed(device=11, symmetric=107)
+    assert small.calls == large.calls == [("prepare", 1)]
+
+    def plan_hash(symmetric):
+        other = MoeEngine.create(
+            _TwoSegmentSource(_Stateful(10, symmetric), _Stateful(1, 7)), max_tokens=64
+        )
+        other.prepare()
+        return other.plan_hash
+
+    assert plan_hash(100) == e.plan_hash != plan_hash(200)
+
+
+def test_memory_budget_is_checked_before_any_segment_allocates():
+    small, large = _Stateful(device=10, symmetric=100), _Stateful(device=1, symmetric=7)
+    e = MoeEngine.create(
+        _TwoSegmentSource(small, large), max_tokens=64, memory_budget=117
+    )
+    with pytest.raises(MemoryBudgetExceeded, match="need 118 bytes per rank"):
+        e.prepare()
+    assert small.calls == large.calls == [] and e.state == EngineState.CREATED
+    e = MoeEngine.create(
+        _TwoSegmentSource(small, large), max_tokens=64, memory_budget=118
+    )
+    e.prepare()
+    assert e.state == EngineState.READY
+
+
+def _coordinator_worker(rank, init_file, budgets, results):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2
+    )
+    try:
+        # What aiter's GroupCoordinator offers the engine.
+        coordinator = types.SimpleNamespace(
+            cpu_group=dist.new_group([0, 1], backend="gloo"),
+            rank_in_group=rank,
+            world_size=2,
+            device=torch.device("cpu"),
+        )
+        segment = _Stateful(device=5, symmetric=50)
+        e = MoeEngine.create(
+            _Source(stateful=(segment,)),
+            max_tokens=8,
+            parallel=types.SimpleNamespace(world_size=2),
+            comm=coordinator,
+            memory_budget=budgets[rank],
+        )
+        assert e.ctx.comm is coordinator and e.ctx.rank == rank
+        assert e.ctx.device == torch.device("cpu")
+        try:
+            e.prepare()
+            results[rank] = ("ok", e.plan_hash, segment.calls)
+        except PlanDisagreement as exc:
+            results[rank] = ("disagree", str(exc), segment.calls)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("budgets", [(None, None), (100, 55)])
+def test_ranks_agree_over_a_group_coordinator(tmp_path, budgets):
+    import torch.multiprocessing as mp
+
+    results = mp.get_context("spawn").Manager().dict()
+    mp.spawn(
+        _coordinator_worker, args=(str(tmp_path / "init"), budgets, results), nprocs=2
+    )
+    if budgets[0] == budgets[1]:
+        assert results[0] == results[1] and results[0][0] == "ok"
+        assert results[0][2] == [("prepare", 2)]
+    else:
+        # Different budgets could let one rank refuse while its peer enters a
+        # collective prepare, so the ranks must agree on the budget too.
+        expected = "ranks 0 and 1 resolved different MoE plans: memory_budget 100 vs 55"
+        assert results[0] == results[1] == ("disagree", expected, [])
 
 
 def _agreement_worker(rank, init_file, tags, results):

@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from .segments.base import MemoryNeed
 from .shapes import _PADDED_M_TIERS, get_padded_M
 
 
@@ -98,11 +99,12 @@ class MoeWeights:
 class EngineContext:
     """What the engine hands to the stateful segments of its plans (`prepare`)."""
 
-    comm: object | None  # the torch.distributed group; None on one process
+    comm: object | None  # as passed to `create`: a torch group or a GroupCoordinator
     rank: int
     world_size: int
     device: torch.device | None
-    memory_budget: int | None  # bytes the engine may use; None: no limit
+    memory_budget: int | None  # bytes per rank the engine may use; None: no limit
+    process_group: object | None = None  # the engine's own collectives; None: `comm`
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,10 @@ class PlanDisagreement(RuntimeError):
     """The ranks of the communicator resolved different plans."""
 
 
+class MemoryBudgetExceeded(RuntimeError):
+    """The stateful segments of the plans need more than `memory_budget`."""
+
+
 @dataclass(frozen=True)
 class BucketPlan:
     """What a `PlanSource` resolves for one bucket.
@@ -138,8 +144,8 @@ class BucketPlan:
     topk_weights, weights, side_inputs, hints, out)`: runs a call; with `out` and
     `output_lifetime="caller"` it writes the result there. `warmup()`: runs the bucket
     once before graph capture (None: nothing to warm up). `stateful`: the stateful
-    segments of the plan, whose lifecycle the engine drives. `side_inputs`: the names
-    `forward` must pass; `hints`: the hints the plan can use.
+    segments of the plan, whose lifecycle (and `workspace_bytes`) the engine drives.
+    `side_inputs`: the names `forward` must pass; `hints`: the hints the plan can use.
     """
 
     bucket: int
@@ -216,6 +222,7 @@ class MoeEngine:
         self._plans: dict = {}
         self._stateful: tuple = ()
         self._record: dict | None = None
+        self._memory = MemoryNeed()
         self._failure: tuple = ()
 
     @classmethod
@@ -233,7 +240,12 @@ class MoeEngine:
         """An engine for `template` (a `PlanSource`, e.g. `LocalTemplate`).
 
         `parallel`: the problem's `ParallelSpec` (None: local); EP and TP need `comm`, the
-        group the plans run on and agree over. `max_tokens`: the largest token count
+        group the plans run on and agree over: a torch process group, or an aiter
+        `GroupCoordinator` (the engine agrees over its gloo `cpu_group` and takes its
+        `device` when `device` is None; the segments get the coordinator).
+        `memory_budget`: bytes per rank the stateful segments may use (device and
+        symmetric heap together); `prepare()` raises `MemoryBudgetExceeded` above
+        it. `max_tokens`: the largest token count
         `forward` takes (in EP/TP, the largest `StepInfo.max_tokens_across_ranks`).
         The buckets of counts up to `capture_max_tokens` are resolved for graph capture
         and warmed up by `capture()` (`captured`).
@@ -245,8 +257,13 @@ class MoeEngine:
             )
         if parallel is not None and comm is None:
             raise ValueError("a ParallelSpec needs the group it runs on: pass comm=")
-        rank, world_size = 0, 1
-        if comm is not None:
+        rank, world_size, process_group = 0, 1, None
+        if comm is not None and hasattr(comm, "cpu_group"):
+            rank, world_size = int(comm.rank_in_group), int(comm.world_size)
+            process_group = comm.cpu_group
+            if device is None:
+                device = getattr(comm, "device", None)
+        elif comm is not None:
             import torch.distributed as dist
 
             rank = dist.get_rank(comm)
@@ -260,7 +277,9 @@ class MoeEngine:
             raise ValueError(
                 f"capture_max_tokens must be >= 0, got {capture_max_tokens}"
             )
-        ctx = EngineContext(comm, rank, world_size, device, memory_budget)
+        ctx = EngineContext(
+            comm, rank, world_size, device, memory_budget, process_group
+        )
         return cls(template, ctx, parallel, max_tokens, capture_max_tokens)
 
     @property
@@ -287,14 +306,27 @@ class MoeEngine:
         """The weight layout `forward` expects (`MoeWeights` must be in it)."""
         return self.template.weight_layout()
 
+    def memory(self) -> MemoryNeed:
+        """Bytes per rank of the prepared stateful segments, each instance once."""
+        self._require("memory", *_PREPARED_STATES, EngineState.FAILED)
+        return self._memory
+
     # Lifecycle.
 
     def prepare(self) -> None:
         """Resolve a plan per bucket, check that every rank has the same plans, then
-        prepare the stateful segments (compile, allocate; may be collective)."""
+        prepare the stateful segments (compile, allocate; may be collective). Their
+        memory (`memory()`) is checked against `memory_budget` before any allocates."""
         self._require("prepare", EngineState.CREATED)
         try:
             plans = self._resolve_buckets()
+            stateful = []
+            for plan in plans.values():
+                for segment in plan.stateful:
+                    if all(segment is not s for s in stateful):
+                        stateful.append(segment)
+            needs = [s.workspace_bytes() for s in stateful]
+            memory = sum(needs, MemoryNeed())
             record = {
                 "aiter": _aiter_version(),
                 "digests": dict(self.template.digests()),
@@ -302,6 +334,8 @@ class MoeEngine:
                     [b, b in self.captured, plan.description, plan.identity]
                     for b, plan in plans.items()
                 ],
+                "memory": [memory.device, memory.symmetric],
+                "memory_budget": self.ctx.memory_budget,
             }
         except Exception as exc:
             if self._collective():
@@ -310,14 +344,18 @@ class MoeEngine:
             raise
         if self._collective():
             _check_agreement(self._gather(record))
-        stateful = []
-        for plan in plans.values():
-            for segment in plan.stateful:
-                if all(segment is not s for s in stateful):
-                    stateful.append(segment)
+        budget = self.ctx.memory_budget
+        if budget is not None and memory.total > budget:
+            raise MemoryBudgetExceeded(
+                f"the stateful segments need {memory.total} bytes per rank "
+                f"({memory.device} device, {memory.symmetric} symmetric heap), above "
+                f"memory_budget={budget}: "
+                + ", ".join(f"{s!r} {n.total}" for s, n in zip(stateful, needs))
+            )
         for segment in stateful:
             segment.prepare(self.ctx)
         self._plans, self._stateful, self._record = plans, tuple(stateful), record
+        self._memory = memory
         self._state = EngineState.PREPARED if self.captured else EngineState.READY
 
     def _resolve_buckets(self) -> dict:
@@ -463,7 +501,8 @@ class MoeEngine:
         import torch.distributed as dist
 
         gathered = [None] * self.ctx.world_size
-        dist.all_gather_object(gathered, record, group=self.ctx.comm)
+        group = self.ctx.process_group or self.ctx.comm
+        dist.all_gather_object(gathered, record, group=group)
         return gathered
 
 
@@ -495,7 +534,12 @@ def _difference(reference, other, rank) -> str:
         if mine != theirs:
             shown = 2 if mine[2] != theirs[2] else 3
             return head + f"bucket {mine[0]}: {mine[shown]} vs {theirs[shown]}"
-    return head + "different buckets"
+    if reference["buckets"] != other["buckets"]:
+        return head + "different buckets"
+    for key in ("memory", "memory_budget"):
+        if reference[key] != other[key]:
+            return head + f"{key} {reference[key]} vs {other[key]}"
+    return head + "different records"
 
 
 def _canonical(value):

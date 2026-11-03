@@ -120,6 +120,21 @@ class DefaultKernels:
     options: FrozenMap = NO_OPTIONS
 
 
+@dataclass(frozen=True)
+class MemoryNeed:
+    """Bytes per rank: `device` memory and `symmetric` (peer-visible) heap memory."""
+
+    device: int = 0
+    symmetric: int = 0
+
+    def __add__(self, other: "MemoryNeed") -> "MemoryNeed":
+        return MemoryNeed(self.device + other.device, self.symmetric + other.symmetric)
+
+    @property
+    def total(self) -> int:
+        return self.device + self.symmetric
+
+
 REACHES = ("ranked", "tuned", "hibernating")
 
 
@@ -197,7 +212,9 @@ class Segment:
     - Launch: `build(p, params)` binds the kernel wrapper, `metadata_fields` the
       `MOEMetadata` fields it sets, `call_args(c)` the arguments taken from the call.
     - Lifecycle, for stateful segments (`MoeEngine` calls them on the segments a plan
-      lists in `BucketPlan.stateful`, each instance once): `prepare(ctx)` compiles and
+      lists in `BucketPlan.stateful`, each instance once): `workspace_bytes()` is the
+      `MemoryNeed` that `prepare` will allocate, known before it does (the engine sums
+      it and checks `memory_budget` first); `prepare(ctx)` compiles and
       allocates (may be collective); `health()` is None, or why the segment failed;
       `reset()` restarts its cross-rank state (collective); `release()` frees it on a
       healthy group (collective); `abort()` frees this rank's state without
@@ -285,6 +302,10 @@ class Segment:
         """For a stage: arguments from the call (`executor.Call`) its launch adds to the
         ones `build` binds, before the executor adds its own (`run_mxfp4`)."""
         return {}
+
+    def workspace_bytes(self) -> MemoryNeed:
+        """For a stateful segment: what `prepare` allocates, per rank."""
+        return MemoryNeed()
 
     def prepare(self, ctx) -> None:
         """For a stateful segment: compile and allocate (`ctx`: `engine.EngineContext`)."""
