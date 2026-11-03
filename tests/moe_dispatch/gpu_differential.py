@@ -10,6 +10,8 @@ the same output up to the GEMM2 atomics, and log the same dispatch lines on a fi
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt --synth-table
 
+`--path comm_fused` runs the TP8 tests/moe_dispatch/comm_fused_differential.py instead.
+
 Shipped tables have per-tensor rows for gfx942 only (and bf16 rows for gfx942 and a few
 gfx950 shapes). `--synth-table` adds the path's gfx942 CK rows, copied to the running
 arch, to the arch's own rows in a temporary AITER_CONFIG_FMOE, so the tuned CK branch runs
@@ -864,6 +866,11 @@ def main(argv=None):
     parser.add_argument("--synth-limit", type=int, default=48)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.path == "comm_fused":
+        sys.path.insert(0, str(_HERE.parent))
+        from moe_dispatch import comm_fused_differential
+
+        return comm_fused_differential.main()
     if args.child or not args.synth_table:
         return _child(args)
 

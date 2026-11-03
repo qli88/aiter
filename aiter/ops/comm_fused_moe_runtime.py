@@ -96,6 +96,34 @@ class CommFusedMoeRuntime:
         sorted work; full-topk calls do not launch this preparation.
         """
 
+        from aiter.moev2 import paths as moev2_paths
+
+        if moev2_paths.any_active():
+            call = {
+                "runtime": self,
+                "shared_partial": shared_partial,
+                "before_stage2": before_stage2,
+                "before_stage2_for_rows": before_stage2_for_rows,
+                "before_shared_add": before_shared_add,
+                "stage2_stream": stage2_stream,
+                "reduce_scatter_sizes": reduce_scatter_sizes,
+                "reuse_is_synchronized": reuse_is_synchronized,
+                "routes_may_be_missing": routes_may_be_missing,
+                "moe_args": moe_args,
+            }
+            v2_path = moev2_paths.route_to_v2(call, "comm_fused")
+            if v2_path is not None:
+                import aiter.fused_moe as legacy
+                from aiter.moev2 import hooks as moev2_hooks
+
+                with moev2_hooks.legacy_globals(
+                    legacy.kernel_bench_callable,
+                    legacy._fused_decode_sort_quant_disabled,
+                ):
+                    out = v2_path.run(call)
+                if out is not moev2_paths.DECLINED:
+                    return out
+
         if before_stage2 is not None and before_stage2_for_rows is not None:
             raise ValueError(
                 "before_stage2 and before_stage2_for_rows are mutually exclusive"

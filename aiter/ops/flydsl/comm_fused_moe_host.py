@@ -1521,8 +1521,7 @@ class _LazyRunners:
         workspace_sizes = tuple(
             _runner_workspace_bytes(config) for _, config in ordered_configs
         )
-        _, arena_bytes = _packed_offsets(workspace_sizes)
-        arena_bytes = _symmetric_allocation_bytes(arena_bytes)
+        arena_bytes = runner_arena_bytes(configs)
         if arena_bytes > FLAT_VA_RANK_STRIDE:
             raise ValueError(
                 f"comm-fused workspace arena requires {arena_bytes} bytes per rank, "
@@ -1604,28 +1603,37 @@ class _LazyRunners:
         return output_rows
 
 
-def create_flydsl_comm_fused_runners(
-    *,
-    tp_group,
-    model_dim,
-    inter_dim,
-    experts,
-    topk,
-    comm: str = "ar",
-    add_shared: bool = True,
-):
+def runner_arena_bytes(configs: dict[int, PipelineConfig]) -> int:
+    """Bytes per rank of the packed symmetric arena of a runner set."""
+
+    workspace_sizes = tuple(
+        _runner_workspace_bytes(config) for _, config in sorted(configs.items())
+    )
+    _, arena_bytes = _packed_offsets(workspace_sizes)
+    return _symmetric_allocation_bytes(arena_bytes)
+
+
+def comm_fused_shape(
+    *, tp_size, model_dim, inter_dim, experts, topk, comm: str = "ar", add_shared=True
+) -> ShapeKey:
     if comm not in _COMM_MODES:
         raise ValueError(f"comm must be one of {_COMM_MODES}, got {comm!r}")
-    shape = ShapeKey(
+    return ShapeKey(
         get_gfx_runtime(),
         model_dim,
         inter_dim,
         experts,
         topk,
-        int(tp_group.world_size),
+        int(tp_size),
         add_shared=add_shared,
         comm=comm,
     )
+
+
+def comm_fused_configs(shape: ShapeKey) -> tuple[dict[int, PipelineConfig], bool]:
+    """The runner config per token bucket of `shape`, and whether the Window MXFP8
+    fallback is on (part of the runner-set cache key)."""
+
     configs = winners_for(shape)
     if not configs:
         raise KeyError(f"unsupported comm_fused shape {shape}")
@@ -1650,6 +1658,29 @@ def create_flydsl_comm_fused_runners(
             )
             for tokens, config in configs.items()
         }
+    return configs, mxfp8_fallback
+
+
+def create_flydsl_comm_fused_runners(
+    *,
+    tp_group,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    comm: str = "ar",
+    add_shared: bool = True,
+):
+    shape = comm_fused_shape(
+        tp_size=tp_group.world_size,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        comm=comm,
+        add_shared=add_shared,
+    )
+    configs, mxfp8_fallback = comm_fused_configs(shape)
     key = (
         id(tp_group),
         shape,

@@ -349,7 +349,9 @@ def claiming_paths(call):
         elif path.entry == "fhmoe":
             fhmoe = fhmoe_call(call) if fhmoe is None else fhmoe
             path_call = fhmoe
-        else:
+        elif path.entry == "api":
             path_call = call
+        else:
+            continue
         if path_call is not None and path.claims(path_call):
             yield path, path_call

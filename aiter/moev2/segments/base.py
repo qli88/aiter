@@ -8,6 +8,7 @@ It declares what it can run as `Cap`s; anything a problem has that no `Cap` decl
 input never reaches a kernel that would silently ignore it.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..dispatch.ops import Op
@@ -208,7 +209,10 @@ class Segment:
       names).
     - Without a tuned row: `default_kernels` (a stage 1 naming both stages' kernels),
       `default_params`.
-    - Stage 2 only: `stage2_kernel` (a rename of the tuned name, e.g. fp4 to fp8).
+    - Stage 2 only: `stage2_kernel` (a rename of the tuned name, e.g. fp4 to fp8);
+      `stage2_launch(c)`, None, or what the executor calls instead of the plan's stage 2
+      kernel: `launch(ordinary_stage2=, stage2_args=, stage2_kwargs=)` returning the
+      output (`comm_fused.stage2_rs`, whose runner reads the per-call `c["comm_fused"]`).
     - Launch: `build(p, params)` binds the kernel wrapper, `metadata_fields` the
       `MOEMetadata` fields it sets, `call_args(c)` the arguments taken from the call.
     - Lifecycle, for stateful segments (`MoeEngine` calls them on the segments a plan
@@ -302,6 +306,11 @@ class Segment:
         """For a stage: arguments from the call (`executor.Call`) its launch adds to the
         ones `build` binds, before the executor adds its own (`run_mxfp4`)."""
         return {}
+
+    def stage2_launch(self, c) -> Callable | None:
+        """For a stage 2 that replaces the kernel launch: the callable the executor
+        runs in its place (see the class docstring); None launches the kernel."""
+        return None
 
     def workspace_bytes(self) -> MemoryNeed:
         """For a stateful segment: what `prepare` allocates, per rank."""

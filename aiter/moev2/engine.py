@@ -23,6 +23,8 @@ arguments and log lines are those of the functional API. Its per-call steps (the
 activation format from the token count, the inline-sort fallback, the lookup after
 sorting) stay per call; `prepare()` resolves what they pick for every count of a
 bucket (`LocalTemplate.resolve`), so a bucket can hold one plan per activation format.
+`migration.comm_fused.CommFusedTemplate` is the source of `CommFusedMoeRuntime`'s plans
+(TP); some token counts have no plan there, which `supports` tells the caller.
 """
 
 from __future__ import annotations
@@ -146,6 +148,7 @@ class BucketPlan:
     once before graph capture (None: nothing to warm up). `stateful`: the stateful
     segments of the plan, whose lifecycle (and `workspace_bytes`) the engine drives.
     `side_inputs`: the names `forward` must pass; `hints`: the hints the plan can use.
+    `supports(tokens)`: whether `run` serves that count of the bucket (None: every one).
     """
 
     bucket: int
@@ -159,6 +162,7 @@ class BucketPlan:
     output_lifetime: str = "caller"
     zero_tokens_ok: bool = True
     graph_capturable: bool = True
+    supports: Callable | None = None
 
 
 class PlanSource:
@@ -305,6 +309,14 @@ class MoeEngine:
     def weight_layout(self):
         """The weight layout `forward` expects (`MoeWeights` must be in it)."""
         return self.template.weight_layout()
+
+    def supports(self, tokens: int) -> bool:
+        """Whether `forward` serves `tokens` (in EP/TP, the agreed count)."""
+        self._require("supports", *_PREPARED_STATES)
+        if tokens > self.max_tokens:
+            return False
+        plan = self._plans[bucket_of(tokens)]
+        return plan.supports is None or bool(plan.supports(tokens))
 
     def memory(self) -> MemoryNeed:
         """Bytes per rank of the prepared stateful segments, each instance once."""
@@ -650,13 +662,15 @@ class LocalTemplate(PlanSource):
     options: Mapping = field(default_factory=dict)
     side_inputs: frozenset = frozenset()
 
+    allowed_side_inputs = LOCAL_SIDE_INPUTS
+
     def __post_init__(self):
         self.side_inputs = frozenset(self.side_inputs)
-        unknown_side = sorted(self.side_inputs - LOCAL_SIDE_INPUTS)
+        unknown_side = sorted(self.side_inputs - self.allowed_side_inputs)
         if unknown_side:
             raise ValueError(
-                f"side_inputs {unknown_side} are not per-call fused_moe tensors "
-                f"({sorted(LOCAL_SIDE_INPUTS)})"
+                f"side_inputs {unknown_side} are not per-call inputs "
+                f"({sorted(self.allowed_side_inputs)})"
             )
         known = set(_fused_moe_defaults())
         bad = sorted(
@@ -710,7 +724,10 @@ class LocalTemplate(PlanSource):
             weights = torch.empty(
                 (bucket, self.topk), dtype=torch.float32, device=device
             )
-            side = {name: torch.empty(1, device=device) for name in self.side_inputs}
+            side = {
+                name: torch.empty(1, device=device)
+                for name in self.side_inputs & LOCAL_SIDE_INPUTS
+            }
         return self._call(x, ids, weights, self.weights, side, None)
 
     def resolve(self, bucket: int, graph_capture: bool) -> BucketPlan:

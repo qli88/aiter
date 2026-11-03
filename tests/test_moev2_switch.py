@@ -237,11 +237,12 @@ def test_builtin_paths():
         a16w4,
         a16w16,
         a16wi4,
+        comm_fused,
         fhmoe,
         mxfp8,
     )
 
-    modules = (
+    local = (
         a8w8_pt,
         a16w16,
         a8w8_ptok,
@@ -253,12 +254,16 @@ def test_builtin_paths():
         mxfp8,
         fhmoe,
     )
+    modules = local + (comm_fused,)
     assert paths._BUILTIN_MODULES == tuple(m.__name__ for m in modules)
-    for module in modules:
+    for module in local:
         entry = "fhmoe" if module is fhmoe else "op"
         assert module.PATH.name == module.NAME and module.PATH.entry == entry
         assert module.PATH.dispatch_record is not None
         assert module.PATH.segments and module.PATH.takes is not None
+    # The comm-fused stage 1 is the a8w4 path's; the runner set is not resolved.
+    assert comm_fused.PATH.entry == "comm_fused"
+    assert comm_fused.PATH.dispatch_record is None and not comm_fused.PATH.segments
     # No path graduates: each runs only when enabled with AITER_MOEV2.
     assert not any(m.PATH.graduated for m in modules)
 

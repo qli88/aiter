@@ -4,7 +4,8 @@
 
 The CPU test compares dispatch plans and log lines on every snapshot key a v2 path
 claims. The GPU test runs tests/moe_dispatch/gpu_differential.py for each registered
-path: same kernels on the same inputs, same outputs and log lines as legacy.
+path: same kernels on the same inputs, same outputs and log lines as legacy (for
+`comm_fused`, the TP8 tests/moe_dispatch/comm_fused_differential.py, on 8 GPUs).
 """
 
 import pathlib
@@ -44,6 +45,8 @@ def test_outputs_match_legacy(path_name):
 
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
+    if path_name == "comm_fused" and torch.cuda.device_count() < 8:
+        pytest.skip("the comm_fused differential runs TP8: needs 8 GPUs")
     proc = subprocess.run(
         [
             sys.executable,

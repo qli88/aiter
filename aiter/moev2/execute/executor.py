@@ -729,8 +729,7 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
             sorted_weights,
             c.global_E,
         )
-    _stage2_call = functools.partial(
-        metadata.stage2,
+    stage2_args = (
         a2,
         w1,
         w2,
@@ -739,12 +738,25 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
         num_valid_ids,
         moe_out,
         topk,
+    )
+    stage2_kwargs = dict(
         w2_scale=_e8m0_view(w2, c["w2_scale"]),
         a2_scale=a2_scale,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
+    launch = plan.starting(Op.GEMM2).segment.stage2_launch(c)
+    if launch is None:
+        _stage2_call = functools.partial(metadata.stage2, *stage2_args, **stage2_kwargs)
+        hooks.record_kernel("stage2", _stage2_call)
+        _stage2_call()
+        return _return_output(moe_out, output)
+    _stage2_call = functools.partial(
+        launch,
+        ordinary_stage2=metadata.stage2,
+        stage2_args=stage2_args,
+        stage2_kwargs=stage2_kwargs,
+    )
     hooks.record_kernel("stage2", _stage2_call)
-    _stage2_call()
-    return _return_output(moe_out, output)
+    return _return_output(_stage2_call(), output)

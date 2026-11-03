@@ -434,8 +434,9 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
     over what the kernels define: the sort buffers up to `num_valid_ids` (the rest is
     `torch.empty`), MX scales in sorted order at the routed rows and the `K / 32` groups
     (`_sorted_scale_defined`), other buffers in sorted order at the routed rows (stage 1
-    skips block padding), `[token, topk, inter]` buffers at the routed slots that
-    are local (stage 1 skips the others), and nothing for the output buffer, for the
+    skips block padding), `[token, topk, inter]` buffers at the slots in the sorted ids
+    (stage 1 writes no others: not the slots of experts that are not local, nor the
+    repeats of an expert in one token's top-k), and nothing for the output buffer, for the
     `out` argument of a stage 1 that writes a buffer of its own (`_own_stage1_buffer`),
     nor for the output of a split-K stage 1 (accumulated with atomics).
     """
@@ -480,11 +481,15 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
         for name in ("sorted_weights", "m_indices"):
             if launch.keywords.get(name) is not None:
                 roles[launch.keywords[name].data_ptr()] = "ids"
-    topk_ids, expert_mask = call["topk_ids"], call.get("expert_mask")
-    slots = None if expert_mask is None else expert_mask[topk_ids.long()].bool()
+    topk_ids = call["topk_ids"]
+    slots = None
     sorted_ids = stage1.args[at["ids"]] if at else None
     if sorted_ids is not None:
-        routed_rows = (sorted_ids[:num_valid] & 0xFFFFFF) < topk_ids.shape[0]
+        routed = sorted_ids[:num_valid]
+        routed_rows = (routed & 0xFFFFFF) < topk_ids.shape[0]
+        slots = torch.zeros(topk_ids.shape, dtype=torch.bool, device=topk_ids.device)
+        routed = routed[routed_rows].long()
+        slots[routed & 0xFFFFFF, routed >> 24] = True
     model_dim = call["hidden_states"].shape[-1]
     _, _, inter_dim = get_inter_dim(call["w1"].shape, call["w2"].shape)
     problems = {}

@@ -19,6 +19,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import api, paths
 from ..dispatch import overrides, resolver, tuned
+from ..dispatch.ops import Op
 from ..execute import executor
 from ..policy import quant_remap, resolve_activation_dtype
 from ..problem import FrozenMap
@@ -197,6 +198,18 @@ def key_args_supported(
     )
 
 
+def with_stage2(plan, choice):
+    """`plan` with `choice` (a `SegmentChoice` covering GEMM2..REDUCE) as its stage 2."""
+    if choice.segment.covers != (Op.GEMM2, Op.REDUCE):
+        raise ValueError(f"{choice.segment!r} does not cover GEMM2..REDUCE")
+    segments = tuple(
+        choice if s.segment.covers[0] == Op.GEMM2 else s for s in plan.segments
+    )
+    if choice not in segments:
+        raise ValueError(f"plan has no stage 2: {plan.describe()}")
+    return replace(plan, segments=segments)
+
+
 class LocalDispatch:
     """`fhmoe`: the calls come from `fhmoe_` (the shared expert in the problem, the
     selected block size enforced)."""
@@ -242,14 +255,21 @@ class LocalDispatch:
             return primary, None
         return primary, problem
 
-    def run(self, call, q_dtype_a=None, config_file=None):
-        """`q_dtype_a`, `config_file`: as `api.dispatch_key` takes them."""
+    def run(self, call, q_dtype_a=None, config_file=None, stage2=None):
+        """`q_dtype_a`, `config_file`: as `api.dispatch_key` takes them. `stage2`: a
+        `SegmentChoice` that replaces the plan's stage 2 (`comm_fused.stage2_rs`)."""
         c = executor.prologue(call, quant_remap)
         args, kwargs, q_dtype_a = api.dispatch_key(c, q_dtype_a, config_file)
         dispatched = self._plan_of(c, args, kwargs, q_dtype_a, warn=True)
         if dispatched is None:
             return paths.DECLINED
         resolution, problem = dispatched
+        if stage2 is not None:
+            if resolution.metadata.run_1stage:
+                raise RuntimeError("_stage2_override requires a two-stage MoE config")
+            if c.quant_type != QuantType.per_1x32:
+                raise NotImplementedError("a replaced stage 2 needs per_1x32")
+            resolution = replace(resolution, plan=with_stage2(resolution.plan, stage2))
         if (
             self.fhmoe
             and c.block_size_M is not None
