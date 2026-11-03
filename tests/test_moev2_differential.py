@@ -6,7 +6,9 @@ The CPU test compares dispatch plans and log lines on every snapshot key a v2 pa
 claims. The GPU test runs tests/moe_dispatch/gpu_differential.py for each registered
 path: same kernels on the same inputs, same outputs and log lines as legacy (for
 `comm_fused`, the TP8 tests/moe_dispatch/comm_fused_differential.py, on 8 GPUs; for
-`grouped_gfx1250`, the GPU test of tests/test_moev2_grouped_gfx1250.py, on gfx1250).
+`mega_moe_v2`, the EP8 tests/moe_dispatch/mega_moe_v2_differential.py, on 8 gfx950
+GPUs; for `grouped_gfx1250`, the GPU test of tests/test_moev2_grouped_gfx1250.py, on
+gfx1250).
 """
 
 import pathlib
@@ -48,6 +50,11 @@ def test_outputs_match_legacy(path_name):
         pytest.skip("needs a GPU")
     if path_name == "comm_fused" and torch.cuda.device_count() < 8:
         pytest.skip("the comm_fused differential runs TP8: needs 8 GPUs")
+    if path_name == "mega_moe_v2":
+        from aiter.jit.utils.chip_info import get_gfx
+
+        if get_gfx() != "gfx950" or torch.cuda.device_count() < 8:
+            pytest.skip("the mega_moe_v2 differential runs EP8 on gfx950")
     if path_name == "mega_moe_gfx1250":
         pytest.skip(
             "no multi-GPU gfx1250 differential yet; the CPU gate is "

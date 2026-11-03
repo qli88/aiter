@@ -116,6 +116,36 @@ class MegaMoEV2:
         if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
+    def bind(self, w1, w1_scale, w2, w2_scale):
+        """Run the next launches with these weights (another layer's experts, in the
+        constructor's layout). Every launch reads them, so this only swaps tensors; a
+        tensor that is not contiguous raises instead of being copied. The scales may be
+        longer (the a16w4 scale shuffle pads K to a multiple of 8)."""
+        epr, hidden, inter = self.epr, self.model_dim, self.inter_dim
+        for name, tensor, numel, padded in (
+            ("w1", w1, epr * 2 * inter * hidden // 2, False),
+            ("w1_scale", w1_scale, epr * 2 * inter * hidden // 32, True),
+            ("w2", w2, epr * hidden * inter // 2, False),
+            ("w2_scale", w2_scale, epr * hidden * inter // 32, True),
+        ):
+            if (
+                tensor.device != self.dev
+                or not tensor.is_contiguous()
+                or tensor.element_size() != 1
+                or tensor.numel() < numel
+                or (tensor.numel() != numel and not padded)
+            ):
+                size = f"at least {numel}" if padded else f"{numel}"
+                raise ValueError(
+                    f"{name}: need a contiguous tensor of {size} one-byte elements on "
+                    f"{self.dev}; got {tuple(tensor.shape)} {tensor.dtype} on "
+                    f"{tensor.device}"
+                )
+        self._s1_w1 = w1.view(torch.uint8)
+        self._s1_w1_scale = w1_scale.view(torch.uint8)
+        self.w2 = w2
+        self.w2_scale = w2_scale
+
     def preload_aot_bundles(self):
         """Load the paired Stage1 and Stage2 production bundles."""
         self.preload_stage1_bundle()
@@ -775,6 +805,11 @@ class MegaMoEV2:
     ):
         """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
         None defers to AITER_MEGA_COMBINE_MASK (default off)."""
+        out = self._moev2(
+            False, x_bf16, None, wts, topk_ids, stream, slice_output, mask_invalid_slots
+        )
+        if out is not None:
+            return out
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -822,6 +857,11 @@ class MegaMoEV2:
     def forward_prequant(
         self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
     ):
+        out = self._moev2(
+            True, x_q, scales, wts, topk_ids, stream, slice_output, mask_invalid_slots
+        )
+        if out is not None:
+            return out
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -829,6 +869,29 @@ class MegaMoEV2:
             x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
             mask_invalid_slots=mask_invalid_slots,
         )
+
+    def _moev2(self, prequant, x, scales, wts, topk_ids, stream, slice_output, mask_invalid_slots):
+        """The output of the moev2 path that claims this call, or None to run here."""
+        from aiter.moev2 import paths as moev2_paths
+
+        if not moev2_paths.any_active():
+            return None
+        call = {
+            "mega": self,
+            "prequant": prequant,
+            "x": x,
+            "scales": scales,
+            "wts": wts,
+            "topk_ids": topk_ids,
+            "stream": stream,
+            "slice_output": slice_output,
+            "mask_invalid_slots": mask_invalid_slots,
+        }
+        v2_path = moev2_paths.route_to_v2(call, "mega_v2")
+        if v2_path is None:
+            return None
+        out = v2_path.run(call)
+        return None if out is moev2_paths.DECLINED else out
 
     forward_bf16 = forward
     __call__ = forward
