@@ -26,6 +26,16 @@ def _bound_split(M, bound, below, at_or_above):
     return at_or_above if bound <= 0 else None
 
 
+def _bf16_fp8_bound() -> int:
+    return int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+
+
+def activation_dtype_bounds() -> tuple:
+    """The token counts where `resolve_activation_dtype` can change its answer: counts
+    below a bound and counts at or above it may get different dtypes."""
+    return (_bf16_fp8_bound(), _SWIGLU_MXFP4_BF16_BOUND)
+
+
 def resolve_activation_dtype(
     quant_type: QuantType | int,
     q_dtype_w: torch.dtype,
@@ -67,7 +77,7 @@ def resolve_activation_dtype(
         and has_a1_scale
     ):
         q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    bf16_fp8_bound = _bf16_fp8_bound()
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16

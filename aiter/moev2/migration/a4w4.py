@@ -107,6 +107,7 @@ PATH = paths.Path(
     LOCAL.run,
     dispatch_record=LOCAL.dispatch_record,
     entry="op",
+    resolve=LOCAL.resolve_call,
     segments=SEGMENTS,
     takes=takes,
 )

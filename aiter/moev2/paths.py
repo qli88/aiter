@@ -79,6 +79,10 @@ class Path:
     `segments`: the segments the path resolves plans from. `takes(problem)`: the
     `MoeProblem`s the path runs (its segments may accept more). The ranking checks use
     both.
+    `resolve(call)`: the `Resolution` `run(call)` would dispatch on, without running
+    it (shapes, dtypes and weight tags only, so meta tensors do), or None if the path
+    declines the key. `MoeEngine.prepare` resolves its buckets with it; None for paths
+    the engine does not run.
     """
 
     name: str
@@ -90,6 +94,7 @@ class Path:
     entry: str = "api"
     segments: tuple = ()
     takes: Callable[[object], bool] | None = None
+    resolve: Callable[[Mapping], object] | None = None
 
     def __post_init__(self):
         if self.entry not in ENTRIES:

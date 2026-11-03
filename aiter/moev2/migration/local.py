@@ -246,22 +246,9 @@ class LocalDispatch:
         """`q_dtype_a`, `config_file`: as `api.dispatch_key` takes them."""
         c = executor.prologue(call, quant_remap)
         args, kwargs, q_dtype_a = api.dispatch_key(c, q_dtype_a, config_file)
-        if executor.a16w4_unsupported(c, q_dtype_a) is not None:
-            # Legacy raises NotImplementedError before its dispatch.
-            return paths.DECLINED
-        dispatched = self.dispatch(
-            args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num()
-        )
+        dispatched = self._plan_of(c, args, kwargs, q_dtype_a, warn=True)
         if dispatched is None:
             return paths.DECLINED
-        self._check_fhmoe(dispatched[0])
-        if c.quant_type == QuantType.per_1x32:
-            fallback = self._inline_sort_fallback(c, args, kwargs, dispatched)
-            if fallback is None:
-                return paths.DECLINED
-            if fallback is not dispatched:
-                self._check_fhmoe(fallback[0])
-            dispatched = fallback
         resolution, problem = dispatched
         if (
             self.fhmoe
@@ -292,6 +279,36 @@ class LocalDispatch:
             c, resolution.metadata, resolution.plan, q_dtype_a, after_sort=after_sort
         )
 
+    def resolve_call(self, call, q_dtype_a=None, config_file=None):
+        """The resolution `run(call)` runs, inline-sort fallback included, through the
+        same cache (its log lines are emitted once, here or by the first `run` of the
+        key; the fallback's warning only by `run`), or None when `run` declines. The
+        lookup after sorting, which only checks, is left to `run`."""
+        c = executor.prologue(call, quant_remap)
+        args, kwargs, q_dtype_a = api.dispatch_key(c, q_dtype_a, config_file)
+        dispatched = self._plan_of(c, args, kwargs, q_dtype_a, warn=False)
+        return None if dispatched is None else dispatched[0]
+
+    def _plan_of(self, c, args, kwargs, q_dtype_a, warn):
+        """`(resolution, problem)` that `run` executes for `c`, or None: it declines."""
+        if executor.a16w4_unsupported(c, q_dtype_a) is not None:
+            # Legacy raises NotImplementedError before its dispatch.
+            return None
+        dispatched = self.dispatch(
+            args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num()
+        )
+        if dispatched is None:
+            return None
+        self._check_fhmoe(dispatched[0])
+        if c.quant_type == QuantType.per_1x32:
+            fallback = self._inline_sort_fallback(c, args, kwargs, dispatched, warn)
+            if fallback is None:
+                return None
+            if fallback is not dispatched:
+                self._check_fhmoe(fallback[0])
+            dispatched = fallback
+        return dispatched
+
     def _check_fhmoe(self, resolution):
         """`_use_fhmoe_wrappers`, which legacy applies to every FHMoE lookup: the stage
         1 `tile_m` and stage 2 sorting block equal `block_m`, else NotImplementedError.
@@ -299,7 +316,7 @@ class LocalDispatch:
         if self.fhmoe and resolution.plan is not None:
             _validate_fhmoe_metadata_consistency(resolution.metadata)
 
-    def _inline_sort_fallback(self, c, args, kwargs, dispatched):
+    def _inline_sort_fallback(self, c, args, kwargs, dispatched, warn=True):
         """`_fused_moe_impl`: a tuned inline-sort row this call cannot run is discarded,
         and the key resolved again without inline-sort rows. None: that key declines."""
         metadata = dispatched[0].metadata
@@ -331,7 +348,7 @@ class LocalDispatch:
         fallback = self.dispatch(
             args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num()
         )
-        if fallback is not None:
+        if fallback is not None and warn:
             logger.warning(
                 f"[fused_moe] inline-sort config is unsupported ({reason}); "
                 "using default heuristics"

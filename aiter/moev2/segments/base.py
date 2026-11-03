@@ -196,6 +196,12 @@ class Segment:
     - Stage 2 only: `stage2_kernel` (a rename of the tuned name, e.g. fp4 to fp8).
     - Launch: `build(p, params)` binds the kernel wrapper, `metadata_fields` the
       `MOEMetadata` fields it sets, `call_args(c)` the arguments taken from the call.
+    - Lifecycle, for stateful segments (`MoeEngine` calls them on the segments a plan
+      lists in `BucketPlan.stateful`, each instance once): `prepare(ctx)` compiles and
+      allocates (may be collective); `health()` is None, or why the segment failed;
+      `reset()` restarts its cross-rank state (collective); `release()` frees it on a
+      healthy group (collective); `abort()` frees this rank's state without
+      communicating.
     """
 
     # Identity and dispatch.
@@ -279,6 +285,21 @@ class Segment:
         """For a stage: arguments from the call (`executor.Call`) its launch adds to the
         ones `build` binds, before the executor adds its own (`run_mxfp4`)."""
         return {}
+
+    def prepare(self, ctx) -> None:
+        """For a stateful segment: compile and allocate (`ctx`: `engine.EngineContext`)."""
+
+    def health(self) -> str | None:
+        return None
+
+    def reset(self) -> None:
+        pass
+
+    def release(self) -> None:
+        pass
+
+    def abort(self) -> None:
+        pass
 
     def __repr__(self):
         return f"<segment {self.name}>"

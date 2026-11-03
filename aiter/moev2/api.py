@@ -284,6 +284,12 @@ def fhmoe_call(call) -> dict | None:
     }
 
 
+NO_PATH = (
+    "no aiter.moev2 path handles this fused_moe call yet; "
+    "use aiter.fused_moe.fused_moe (the legacy code)"
+)
+
+
 def fused_moe(
     hidden_states,
     w1,
@@ -324,7 +330,17 @@ def fused_moe(
     clamp_shared: bool = True,
 ):
     """Same contract as `aiter.fused_moe.fused_moe`, served by aiter.moev2."""
-    call = dict(locals())
+    for path, path_call in claiming_paths(dict(locals())):
+        out = path.run(path_call)
+        if out is not paths.DECLINED:
+            return out
+    raise NotImplementedError(NO_PATH)
+
+
+def claiming_paths(call):
+    """`(path, path_call)` for each registered path that claims the `fused_moe` call
+    (`call` maps its parameter names), in the order `fused_moe` tries them; `path_call`
+    is the call in the arguments of the path's entry."""
     op = fhmoe = None
     for path in paths.registered().values():
         if path.entry == "op":
@@ -336,10 +352,4 @@ def fused_moe(
         else:
             path_call = call
         if path_call is not None and path.claims(path_call):
-            out = path.run(path_call)
-            if out is not paths.DECLINED:
-                return out
-    raise NotImplementedError(
-        "no aiter.moev2 path handles this fused_moe call yet; "
-        "use aiter.fused_moe.fused_moe (the legacy code)"
-    )
+            yield path, path_call
