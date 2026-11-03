@@ -11,6 +11,8 @@ calls legacy's `grouped_gemm_gfx1250_a8w4` serves (except the ones it leaves to
 legacy: `stage2_scatter`, a FlyDSL dispatch context, a device other than gfx1250).
 """
 
+import dataclasses
+
 import pytest
 import torch
 from moe_dispatch.arch_sim import simulated_arch
@@ -249,6 +251,10 @@ def _same(a, b):
             isinstance(b, dict)
             and a.keys() == b.keys()
             and all(_same(a[k], b[k]) for k in a)
+        )
+    if dataclasses.is_dataclass(a) and not isinstance(a, type):
+        return type(a) is type(b) and all(
+            _same(getattr(a, f.name), getattr(b, f.name)) for f in dataclasses.fields(a)
         )
     return type(a) is type(b) and a == b
 

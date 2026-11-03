@@ -43,6 +43,17 @@ def _flydsl_dispatch_context():
     return getattr(_MEGA_DISPATCH_TLS, "ctx", None)
 
 
+# Default of the `dispatch_context` arguments below: the context the thread set with
+# set_flydsl_dispatch_context. A caller that holds the context passes it (or None).
+_THREAD_CONTEXT = object()
+
+
+def _dispatch_context_or_thread(dispatch_context):
+    if dispatch_context is _THREAD_CONTEXT:
+        return _flydsl_dispatch_context()
+    return dispatch_context
+
+
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
     key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), str(w.dtype))
@@ -427,6 +438,8 @@ def _build_g2l_lut(
     device,
     nvt: torch.Tensor | None = None,
     topk: int | None = None,
+    *,
+    dispatch_context=_THREAD_CONTEXT,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Build the EP global->local expert LUT (and zero the route counter).
 
@@ -454,6 +467,7 @@ def _build_g2l_lut(
     one kernel is the portable win; fully removing it would require precomputing
     the LUT at ``expert_mask`` creation and threading it through the op schema.
     """
+    dispatch_context = _dispatch_context_or_thread(dispatch_context)
     n = expert_mask.numel()
     # nvr is only folded in when both the dynamic-token scalar and topk are known.
     _want_nvr = nvt is not None and topk is not None
@@ -481,7 +495,7 @@ def _build_g2l_lut(
             _get_compiled_g2l_lut(
                 max_experts=512 if n <= 512 else 1024,
                 clear_counter=not (
-                    _flydsl_dispatch_context() is not None
+                    dispatch_context is not None
                     and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
                 ),
@@ -602,6 +616,7 @@ def _grouped_a8w4_tdm_moe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     a1_scale=None,
+    dispatch_context=_THREAD_CONTEXT,
 ):
     import functools
 
@@ -617,7 +632,8 @@ def _grouped_a8w4_tdm_moe(
     device = hidden_states.device
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
-    _compact_ctx = _flydsl_dispatch_context()
+    dispatch_context = _dispatch_context_or_thread(dispatch_context)
+    _compact_ctx = dispatch_context
     _compact = bool(
         _compact_ctx is not None and getattr(_compact_ctx, "compact_layout", False)
     )
@@ -720,7 +736,7 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _direct_ep_mask = _flydsl_dispatch_context() is not None and os.environ.get(
+        _direct_ep_mask = dispatch_context is not None and os.environ.get(
             "AITER_TDM_DIRECT_EP_MASK", "1"
         ) in (
             "1",
@@ -759,7 +775,12 @@ def _grouped_a8w4_tdm_moe(
             _ep_nvr = torch.empty(1, dtype=torch.int32, device=device)
         else:
             _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
-                expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
+                expert_mask,
+                E,
+                device,
+                nvt=_ep_nvt,
+                topk=int(topk),
+                dispatch_context=dispatch_context,
             )
             _ep_nvr = (
                 _g2l_nvr if _g2l_nvr is not None else (_ep_nvt * int(topk)).contiguous()
@@ -813,7 +834,7 @@ def _grouped_a8w4_tdm_moe(
         and not _fuse_ep_route_quant
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
-        and _flydsl_dispatch_context() is not None
+        and dispatch_context is not None
         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
@@ -1405,6 +1426,7 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
+    dispatch_context=_THREAD_CONTEXT,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1415,6 +1437,9 @@ def grouped_gemm_gfx1250_a8w4(
 
     Returns ``None`` when the shape/dtype/arch is not served here, so the caller
     can fall back to the generic MoE.
+
+    ``dispatch_context``: MegaMoE's FlyDSL dispatch context (its compact plan, and
+    the direct EP mask), or None; by default the one set_flydsl_dispatch_context set.
     """
 
     def _grouped_dbg(msg: str, stacklevel: int = 1):
@@ -1517,7 +1542,7 @@ def grouped_gemm_gfx1250_a8w4(
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    _cctx = _flydsl_dispatch_context()
+    _cctx = _dispatch_context_or_thread(dispatch_context)
     _csv_tokens = token_num
     if _cctx is not None and getattr(_cctx, "compact_layout", False):
         # Dummy topk_ids are (1, topk) so fused_moe does not treat compact_cap
@@ -1713,6 +1738,7 @@ def grouped_gemm_gfx1250_a8w4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
+            dispatch_context=_cctx,
             **_tdm_kw,
         )
 

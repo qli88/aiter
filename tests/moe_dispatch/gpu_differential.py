@@ -11,7 +11,8 @@ the same output up to the GEMM2 atomics, and log the same dispatch lines on a fi
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt --synth-table
 
 `--path comm_fused` runs the TP8 tests/moe_dispatch/comm_fused_differential.py instead;
-`--path grouped_gfx1250` the GPU test of tests/test_moev2_grouped_gfx1250.py (gfx1250).
+`--path grouped_gfx1250` the GPU test of tests/test_moev2_grouped_gfx1250.py (gfx1250);
+`--path mega_moe_gfx1250` has none yet (multi-GPU gfx1250) and fails.
 
 Shipped tables have per-tensor rows for gfx942 only (and bf16 rows for gfx942 and a few
 gfx950 shapes). `--synth-table` adds the path's gfx942 CK rows, copied to the running
@@ -882,6 +883,12 @@ def main(argv=None):
             f"{test}::test_gpu_outputs_match_legacy",
         ]
         return subprocess.run(cmd, cwd=_REPO, check=False).returncode
+    if args.path == "mega_moe_gfx1250":
+        print(
+            "mega_moe_gfx1250: no multi-GPU gfx1250 differential yet; the CPU gate is "
+            "tests/test_moev2_mega_moe_gfx1250.py"
+        )
+        return 1
     if args.child or not args.synth_table:
         return _child(args)
 

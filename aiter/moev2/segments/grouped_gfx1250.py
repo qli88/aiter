@@ -6,8 +6,10 @@ the gather-reduce), legacy's `grouped_gemm_gfx1250_a8w4`.
 It runs interleaved (GUGU) g1u1 MXFP4 weights with fp4 or fp8 activations. Its tile
 table (`tuned_grouped_fmoe.csv`, `AITER_CONFIG_GROUPED_FMOE`) and the `AITER_TDM_*`
 tile overrides are read inside the launch, as in legacy; no `tuned_fmoe.csv` row names
-it. Output: the routed result (`routed_out`). The `p2p_scatter` output that feeds the
-gfx1250 combine (`stage2_scatter`) is step 4.6b.
+it. Two outputs, one launch: `GROUPED` writes the routed result (`routed_out`, local
+MoE); `GROUPED_P2P` reads the tokens `comm.dispatch_gfx1250` received and writes
+`p2p_scatter`: GEMM2 scatters into the peers' combine slots (`stage2_scatter`), which
+`comm.combine_gfx1250` reduces (the `MegaMoEGfx1250` pipeline).
 """
 
 import os
@@ -20,6 +22,16 @@ from ..dispatch.ops import Op
 from ..problem import ScaleSpec
 from .base import Cap, Segment
 from .mxfp4 import mxfp4, mxfp8
+
+# `comm.combine_gfx1250`'s payload formats, by `combine_quant` (the `p2p_scatter` format).
+COMBINE_FORMATS = {
+    "none": ScaleSpec(dtypes.bf16),
+    "mxfp8": mxfp8(),
+    "mxfp4": mxfp4(),
+}
+# The layouts of the dispatched tokens it reads: one row per received token, or the
+# rows grouped per expert by the compact plan (`stage1_fused`).
+TOKEN_LAYOUTS = frozenset({"token_major", "compact_plan"})
 
 ACTIVATIONS = (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
 # The weight dtypes it reads as MXFP4: ATOM's loader keeps the packed bytes as uint8.
@@ -38,14 +50,15 @@ def dispatch_context():
     return _grouped()._flydsl_dispatch_context()
 
 
+def disabled() -> bool:
+    """The AITER_DISABLE_GROUPED_A8W4=1 kill switch."""
+    return os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1"
+
+
 def enabled() -> bool:
     """`grouped_gemm_gfx1250_a8w4`'s switches: AITER_USE_GROUPED_GEMM (on by default on
     a gfx1250 build) and the AITER_DISABLE_GROUPED_A8W4 kill switch."""
-    grouped = _grouped()
-    return (
-        grouped._use_grouped_gemm_enabled()
-        and os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") != "1"
-    )
+    return _grouped()._use_grouped_gemm_enabled() and not disabled()
 
 
 def build_arch_named() -> bool:
@@ -67,42 +80,61 @@ def build_arch_named() -> bool:
 
 class GroupedGfx1250(Segment):
     """No resolver dispatches it (no ranking entry or `tuned_fmoe.csv` row names it):
-    path `grouped_gfx1250` runs it where legacy's branch does, so it owns no kernel-name
-    family and `reach` is not checked."""
+    path `grouped_gfx1250` runs `GROUPED` where legacy's branch does, path
+    `mega_moe_gfx1250` runs `GROUPED_P2P` between the gfx1250 dispatch and combine. It
+    owns no kernel-name family and `reach` is not checked.
+
+    `p2p`: the output is `p2p_scatter` (it covers SORT..GEMM2; the combine reduces), in
+    the format of the plan's `combine_quant` (also a parameter of this segment, as the
+    epilogue packs it); its local parameter is `recv_token_bound` (the received rows
+    the GEMM is shown, static per bucket)."""
 
     name = "grouped_gfx1250"
-    covers = (Op.SORT, Op.REDUCE)
+
+    def __init__(self, p2p: bool = False):
+        self.p2p = p2p
+        self.covers = (Op.SORT, Op.GEMM2) if p2p else (Op.SORT, Op.REDUCE)
+        if p2p:
+            self.structure_params = frozenset({"combine_quant"})
 
     @property
     def capabilities(self):
+        features = {
+            "bias1",
+            "bias2",
+            "doweight_stage1",
+            "ep_mask",
+            "num_local_tokens",
+            "act_scales",
+        }
+        if self.p2p:
+            features = (features - {"doweight_stage1"}) | {"scatter"}
         return (
             Cap(
                 arch=frozenset({"gfx1250"}),
                 act_in=frozenset({mxfp4(), mxfp8()}),
                 w1=frozenset({mxfp4()}),
                 w2=frozenset({mxfp4()}),
-                out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
+                out_dtype=frozenset(
+                    {dtypes.bf16} if self.p2p else {dtypes.bf16, dtypes.fp16}
+                ),
                 activation=frozenset({"silu", "swiglu", "situv2"}),
                 gate_mode=frozenset({"interleave"}),
                 g1u1=frozenset({True}),
-                features=frozenset(
-                    {
-                        "bias1",
-                        "bias2",
-                        "doweight_stage1",
-                        "ep_mask",
-                        "num_local_tokens",
-                        "act_scales",
-                    }
-                ),
+                features=frozenset(features),
                 pads=True,
+                parallel=self.p2p,
             ),
         )
 
     def reads(self, p):
+        if self.p2p:
+            return (Buf("tokens", None, layout=TOKEN_LAYOUTS),)
         return (CALL_INPUT,)
 
     def produces(self, p, params):
+        if self.p2p:
+            return Buf("p2p_scatter", COMBINE_FORMATS[params.combine_quant])
         return Buf("routed_out", ScaleSpec(p.out_dtype))
 
     def build(self, p, params):
@@ -134,9 +166,12 @@ class GroupedGfx1250(Segment):
         return None
 
     @staticmethod
-    def launch(c, q_dtype_a, stage2_scatter=None):
+    def launch(c, q_dtype_a, stage2_scatter=None, dispatch_context=None):
         """`_fused_moe_impl`'s call of `grouped_gemm_gfx1250_a8w4`; its result (None
-        where `unsupported` gives a reason; every None comes before a launch)."""
+        where `unsupported` gives a reason; every None comes before a launch).
+        `stage2_scatter`: the combine slots GEMM2 writes (`p2p_scatter`);
+        `dispatch_context`: the FlyDSL dispatch's context (its compact plan), which
+        legacy passes through `set_flydsl_dispatch_context`."""
         beta, linear_beta = c["beta"], c["linear_beta"]
         return _grouped().grouped_gemm_gfx1250_a8w4(
             c["hidden_states"],
@@ -167,7 +202,9 @@ class GroupedGfx1250(Segment):
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
+            dispatch_context=dispatch_context,
         )
 
 
 GROUPED = GroupedGfx1250()
+GROUPED_P2P = GroupedGfx1250(p2p=True)

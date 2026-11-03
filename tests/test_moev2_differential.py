@@ -48,6 +48,11 @@ def test_outputs_match_legacy(path_name):
         pytest.skip("needs a GPU")
     if path_name == "comm_fused" and torch.cuda.device_count() < 8:
         pytest.skip("the comm_fused differential runs TP8: needs 8 GPUs")
+    if path_name == "mega_moe_gfx1250":
+        pytest.skip(
+            "no multi-GPU gfx1250 differential yet; the CPU gate is "
+            "tests/test_moev2_mega_moe_gfx1250.py"
+        )
     proc = subprocess.run(
         [
             sys.executable,

@@ -55,3 +55,24 @@ def mxmoe_fallback() -> bool:
     """`AITER_MXMOE_FALLBACK` (default 1): MXFP4 SiTUv2 without a tuned row defaults to
     the heuristic MXMOE kernels."""
     return os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"
+
+
+# The gfx1250 Mega MoE structure, where the template leaves it unset (as the
+# `MegaMoEGfx1250` constructor reads them).
+
+
+def mega_dispatch_backend() -> str:
+    """`MEGA_DISPATCH` (default "flydsl"): the gfx1250 dispatch backend, or "mori"."""
+    return os.environ.get("MEGA_DISPATCH", "flydsl")
+
+
+def mega_dispatch_wire() -> str:
+    """`MEGA_DISPATCH_WIRE` (default, and when empty, "bf16"): the gfx1250 dispatch
+    wire, "fp8" or "fp4"."""
+    return os.environ.get("MEGA_DISPATCH_WIRE") or "bf16"
+
+
+def mega_combine_quant() -> str:
+    """`MEGA_COMBINE_QUANT` (default "none"): the quantized gfx1250 combine payload the
+    pipeline builds, "mxfp8" or "mxfp4"."""
+    return os.environ.get("MEGA_COMBINE_QUANT", "none")

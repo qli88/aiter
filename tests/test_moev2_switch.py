@@ -240,6 +240,7 @@ def test_builtin_paths():
         comm_fused,
         fhmoe,
         grouped_gfx1250,
+        mega_moe_gfx1250,
         mxfp8,
     )
 
@@ -255,7 +256,7 @@ def test_builtin_paths():
         mxfp8,
         fhmoe,
     )
-    modules = local + (comm_fused, grouped_gfx1250)
+    modules = local + (comm_fused, grouped_gfx1250, mega_moe_gfx1250)
     assert paths._BUILTIN_MODULES == tuple(m.__name__ for m in modules)
     for module in local:
         entry = "fhmoe" if module is fhmoe else "op"
@@ -269,6 +270,10 @@ def test_builtin_paths():
     assert grouped_gfx1250.PATH.entry == "op"
     assert grouped_gfx1250.PATH.dispatch_record is None
     assert not grouped_gfx1250.PATH.segments
+    # The mega pipeline owns its instance; the hook passes it, there is no resolver.
+    assert mega_moe_gfx1250.PATH.entry == "mega_gfx1250"
+    assert mega_moe_gfx1250.PATH.dispatch_record is None
+    assert not mega_moe_gfx1250.PATH.segments
     # No path graduates: each runs only when enabled with AITER_MOEV2.
     assert not any(m.PATH.graduated for m in modules)
 

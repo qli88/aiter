@@ -253,17 +253,21 @@ class SymmetricArena:
 
     def __init__(self, communicator, regions):
         self._communicator = communicator
-        self._offsets = {}
-        self._sizes = {}
-        offset = 0
-        for name, size in regions:
-            offset = _align_up(offset, self._ALIGNMENT)
-            self._offsets[name] = offset
-            self._sizes[name] = size
-            offset += size
-        self._total_bytes = max(_align_up(offset, self._ALIGNMENT), self._ALIGNMENT)
+        self._offsets, self._sizes, self._total_bytes = self.layout(regions)
         self._memory = communicator.alloc_mem(self._total_bytes)
         self._window = communicator.register_window(self._memory.ptr, self._total_bytes)
+
+    @classmethod
+    def layout(cls, regions) -> tuple[dict, dict, int]:
+        """(offsets, sizes, total bytes) of ``regions``, without allocating."""
+        offsets, sizes = {}, {}
+        offset = 0
+        for name, size in regions:
+            offset = _align_up(offset, cls._ALIGNMENT)
+            offsets[name] = offset
+            sizes[name] = size
+            offset += size
+        return offsets, sizes, max(_align_up(offset, cls._ALIGNMENT), cls._ALIGNMENT)
 
     @property
     def handle(self) -> int:
@@ -547,6 +551,95 @@ class Routing:
         return self.reverse_source_view
 
 
+@dataclass(frozen=True)
+class PipelineLayout:
+    """The compact-plan geometry and the symmetric arena regions of a pipeline."""
+
+    compact_plan: bool
+    compact_tile_m: int
+    compact_cap: int
+    compact_wire_row: int
+    hist_stride: int
+    max_routes: int
+    regions: tuple  # (name, bytes), in arena order
+
+
+def pipeline_layout(
+    config: MegaMoEConfig,
+    *,
+    activation: ActivationType,
+    quant_type: QuantType,
+    inter_dim: int,
+) -> PipelineLayout:
+    """What ``MegaMoEGfx1250`` lays out for ``config``; the arena it allocates is
+    ``SymmetricArena.layout(regions)[2]`` bytes."""
+    max_recv = config.max_recv
+    compact_plan = config.stage1_fused
+    compact_tile_m = _compact_gemm_align_m(
+        config,
+        activation=activation,
+        quant_type=quant_type,
+        inter_dim=inter_dim,
+    )
+    compact_cap = config.compact_row_cap(compact_tile_m) if compact_plan else max_recv
+    recv_rows = compact_cap if compact_plan else max_recv
+    compact_wire_row = (
+        _align_up(
+            config.dispatch_token_nbytes + config.dispatch_scale_nbytes,
+            128,
+        )
+        if compact_plan
+        else config.dispatch_token_nbytes
+    )
+    from .compact_plan import compact_done_nbytes, compact_hist_stride
+
+    max_routes = config.max_tokens_per_rank * config.topk
+    hist_stride = compact_hist_stride(
+        npes=config.world_size,
+        experts_per_rank=config.experts_per_rank,
+        max_routes=max_routes,
+    )
+    arena_regions = [
+        ("tok_off", 4),
+        ("recv_num", config.world_size * 4),
+        ("recv_to_src_token", max_recv * 4),
+        ("out_idx", max_recv * config.topk * 4),
+        ("out_wts", max_recv * config.topk * 4),
+        ("disp_out", recv_rows * compact_wire_row),
+        ("cross_device_barrier", config.world_size * 8),
+    ]
+    if config.dispatch_scale_dst_nbytes and not compact_plan:
+        arena_regions.append(
+            ("disp_out_scales", recv_rows * config.dispatch_scale_dst_nbytes)
+        )
+    if compact_plan:
+        arena_regions.extend(
+            [
+                ("ep_rowmap", (recv_rows + 1) * 8),
+                ("compact_hist", 2 * hist_stride * 4),
+                ("compact_done", compact_done_nbytes()),
+            ]
+        )
+    # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
+    # holds a step on any of them and a quantized one just packs into the
+    # front of it at its own pitch.
+    arena_regions.append(
+        (
+            "comb_inp",
+            config.max_tokens_per_rank * config.topk * config.combine_slot_stride_bytes,
+        )
+    )
+    return PipelineLayout(
+        compact_plan=compact_plan,
+        compact_tile_m=compact_tile_m,
+        compact_cap=compact_cap,
+        compact_wire_row=compact_wire_row,
+        hist_stride=hist_stride,
+        max_routes=max_routes,
+        regions=tuple(arena_regions),
+    )
+
+
 class MegaMoEGfx1250:
     """A8W4 EP MoE with GEMM2 P2P scatter fused into combine."""
 
@@ -677,6 +770,7 @@ class MegaMoEGfx1250:
                 ),
             ),
             communicator,
+            device,
         )
 
     def forward(
@@ -719,6 +813,33 @@ class MegaMoEGfx1250:
         Omitting it means bf16 -- naming a format at construction only builds
         it, each step still has to ask for it.
         """
+        from aiter.moev2 import paths as moev2_paths
+
+        if moev2_paths.any_active():
+            call = {
+                "mega": self,
+                "hidden_states": hidden_states,
+                "topk_weights": topk_weights,
+                "topk_ids": topk_ids,
+                "w1": w1,
+                "w2": w2,
+                "w1_scale": w1_scale,
+                "w2_scale": w2_scale,
+                "bias1": bias1,
+                "bias2": bias2,
+                "a1_scale": a1_scale,
+                "a2_scale": a2_scale,
+                "recv_token_bound": recv_token_bound,
+                "next_topk_ids": next_topk_ids,
+                "next_recv_token_bound": next_recv_token_bound,
+                "combine_quant": combine_quant,
+            }
+            v2_path = moev2_paths.route_to_v2(call, "mega_gfx1250")
+            if v2_path is not None:
+                out = v2_path.run(call)
+                if out is not moev2_paths.DECLINED:
+                    return out
+
         combine_quant_bits = self._resolve_combine_quant(combine_quant)
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
             raise ValueError("hidden_states must be contiguous bfloat16")
@@ -1088,83 +1209,29 @@ class MegaMoEGfx1250:
             self._compact_cap,
         )
 
-    def _initialize_pipeline(self, config: MegaMoEConfig, communicator):
+    def _initialize_pipeline(self, config: MegaMoEConfig, communicator, device):
         self._config = config
         self._closed = False
         # tokoff-ext slot allocator (built in _build_mori_dispatch when the
         # mori dispatch backend is on); None otherwise so close() is uniform.
         self._tokoff_ext = None
-        device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
-        self._compact_plan = config.stage1_fused
-        self._compact_tile_m = _compact_gemm_align_m(
+        layout = pipeline_layout(
             config,
             activation=self.activation,
             quant_type=self.quant_type,
             inter_dim=self.inter_dim,
         )
-        self._compact_cap = (
-            config.compact_row_cap(self._compact_tile_m)
-            if self._compact_plan
-            else max_recv
-        )
-        recv_rows = self._compact_cap if self._compact_plan else max_recv
-        self._compact_wire_row = (
-            _align_up(
-                config.dispatch_token_nbytes + config.dispatch_scale_nbytes,
-                128,
-            )
-            if self._compact_plan
-            else config.dispatch_token_nbytes
-        )
-        from .compact_plan import (
-            PLAN_BLOCKS,
-            compact_done_nbytes,
-            compact_hist_stride,
-        )
+        self._compact_plan = layout.compact_plan
+        self._compact_tile_m = layout.compact_tile_m
+        self._compact_cap = layout.compact_cap
+        self._compact_wire_row = layout.compact_wire_row
+        from .compact_plan import PLAN_BLOCKS
 
         segs = config.world_size * config.experts_per_rank
-        max_routes = config.max_tokens_per_rank * config.topk
-        hist_stride = compact_hist_stride(
-            npes=config.world_size,
-            experts_per_rank=config.experts_per_rank,
-            max_routes=max_routes,
-        )
-        self._compact_hist_stride = hist_stride
-        self._compact_max_routes = max_routes
-        arena_regions = [
-            ("tok_off", 4),
-            ("recv_num", config.world_size * 4),
-            ("recv_to_src_token", max_recv * 4),
-            ("out_idx", max_recv * config.topk * 4),
-            ("out_wts", max_recv * config.topk * 4),
-            ("disp_out", recv_rows * self._compact_wire_row),
-            ("cross_device_barrier", config.world_size * 8),
-        ]
-        if config.dispatch_scale_dst_nbytes and not self._compact_plan:
-            arena_regions.append(
-                ("disp_out_scales", recv_rows * config.dispatch_scale_dst_nbytes)
-            )
-        if self._compact_plan:
-            arena_regions.extend(
-                [
-                    ("ep_rowmap", (recv_rows + 1) * 8),
-                    ("compact_hist", 2 * hist_stride * 4),
-                    ("compact_done", compact_done_nbytes()),
-                ]
-            )
-        # Cut to the bf16 pitch whatever wire runs: it is the widest, so this
-        # holds a step on any of them and a quantized one just packs into the
-        # front of it at its own pitch.
-        arena_regions.append(
-            (
-                "comb_inp",
-                config.max_tokens_per_rank
-                * config.topk
-                * config.combine_slot_stride_bytes,
-            )
-        )
-        self._arena = SymmetricArena(communicator, arena_regions)
+        self._compact_hist_stride = layout.hist_stride
+        self._compact_max_routes = layout.max_routes
+        self._arena = SymmetricArena(communicator, layout.regions)
         self._compact_scale_row = (
             config.dispatch_scale_nbytes
             if self._compact_plan
