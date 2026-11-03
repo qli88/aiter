@@ -10,7 +10,6 @@ path). `LocalDispatch` resolves each legacy dispatch key once, as the cached leg
 MXFP4 weights, `run_one_stage` for a 1-stage plan, which has no second lookup).
 """
 
-import os
 from dataclasses import replace
 
 from aiter import ActivationType, QuantType, dtypes, logger
@@ -23,6 +22,7 @@ from ..dispatch.ops import Op
 from ..execute import executor
 from ..policy import quant_remap, resolve_activation_dtype
 from ..problem import FrozenMap
+from ..segments import grouped_gfx1250
 from ..segments.flydsl_fhmoe import _validate_fhmoe_metadata_consistency
 from ..segments.mxmoe import _is_mxfp4_inline_sort, _mxfp4_inline_sort_unsupported
 from ..shapes import get_inter_dim, get_padded_M
@@ -142,24 +142,12 @@ def legacy_grouped_gfx1250(call) -> bool:
     """`grouped_gemm_gfx1250_a8w4` runs the call instead of returning None (its checks
     before the launch, for a per_1x32 g1u1 call of fp8 activations into MXFP4 weights
     with Silu, Swiglu or SiTUv2)."""
-    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
-
-    if GateMode(call["gate_mode"]) != GateMode.INTERLEAVE:
-        return False
-    if not grouped._use_grouped_gemm_enabled():
-        return False
-    if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
-        return False
-    if call["w1_scale"] is None or call["w2_scale"] is None:
-        return False
-    gfx_env = ";".join(
-        str(os.environ.get(k, "")).lower()
-        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
-    )
     return (
-        get_gfx() == "gfx1250"
-        or "gfx1250" in gfx_env
-        or os.environ.get("AITER_FORCE_GFX1250", "0") in grouped._TRUTHY_ENV
+        GateMode(call["gate_mode"]) == GateMode.INTERLEAVE
+        and grouped_gfx1250.enabled()
+        and call["w1_scale"] is not None
+        and call["w2_scale"] is not None
+        and grouped_gfx1250.build_arch_named()
     )
 
 

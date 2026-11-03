@@ -104,6 +104,11 @@ PATHS = {
     ),
     "fhmoe": (_pytest("op_tests/test_fhmoe.py", archs=("gfx950",)),),
     "comm_fused": (_torchrun("op_tests/multigpu_tests/test_comm_fused_moe.py"),),
+    "grouped_gfx1250": (
+        _pytest(
+            "op_tests/flydsl_tests/test_flydsl_grouped_gemm.py", archs=("gfx1250",)
+        ),
+    ),
     "mega_moe_v2": (
         _torchrun(
             "op_tests/multigpu_tests/test_mega_moe_v2.py",

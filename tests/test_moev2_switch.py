@@ -239,6 +239,7 @@ def test_builtin_paths():
         a16wi4,
         comm_fused,
         fhmoe,
+        grouped_gfx1250,
         mxfp8,
     )
 
@@ -254,7 +255,7 @@ def test_builtin_paths():
         mxfp8,
         fhmoe,
     )
-    modules = local + (comm_fused,)
+    modules = local + (comm_fused, grouped_gfx1250)
     assert paths._BUILTIN_MODULES == tuple(m.__name__ for m in modules)
     for module in local:
         entry = "fhmoe" if module is fhmoe else "op"
@@ -264,6 +265,10 @@ def test_builtin_paths():
     # The comm-fused stage 1 is the a8w4 path's; the runner set is not resolved.
     assert comm_fused.PATH.entry == "comm_fused"
     assert comm_fused.PATH.dispatch_record is None and not comm_fused.PATH.segments
+    # The grouped gfx1250 branch runs before the 2-stage lookup: no key, no resolver.
+    assert grouped_gfx1250.PATH.entry == "op"
+    assert grouped_gfx1250.PATH.dispatch_record is None
+    assert not grouped_gfx1250.PATH.segments
     # No path graduates: each runs only when enabled with AITER_MOEV2.
     assert not any(m.PATH.graduated for m in modules)
 

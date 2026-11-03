@@ -5,7 +5,8 @@
 The CPU test compares dispatch plans and log lines on every snapshot key a v2 path
 claims. The GPU test runs tests/moe_dispatch/gpu_differential.py for each registered
 path: same kernels on the same inputs, same outputs and log lines as legacy (for
-`comm_fused`, the TP8 tests/moe_dispatch/comm_fused_differential.py, on 8 GPUs).
+`comm_fused`, the TP8 tests/moe_dispatch/comm_fused_differential.py, on 8 GPUs; for
+`grouped_gfx1250`, the GPU test of tests/test_moev2_grouped_gfx1250.py, on gfx1250).
 """
 
 import pathlib

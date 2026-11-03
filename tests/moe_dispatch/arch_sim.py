@@ -27,6 +27,12 @@ ARCHS = {
     "gfx950": ("gfx950", 256),
     "gfx1201": ("gfx1201", 32),
 }
+# Archs `simulated_arch` takes that the dispatch snapshot does not cover: their MoE
+# branches run before `get_2stage_cfgs` (the grouped gfx1250 kernel), so the tests
+# compare whole calls instead (tests/test_moev2_grouped_gfx1250.py).
+CALL_ONLY_ARCHS = {
+    "gfx1250": ("gfx1250", 256),
+}
 
 _KEEP_ENV = {
     "AITER_ROOT_DIR",
@@ -109,7 +115,7 @@ def simulated_arch(name):
     from aiter.jit.utils import chip_info
     from aiter.utility import dtypes
 
-    gfx, cu_num = ARCHS[name]
+    gfx, cu_num = {**ARCHS, **CALL_ONLY_ARCHS}[name]
     fakes = {
         "get_gfx": lambda: gfx,
         "get_gfx_runtime": lambda: gfx,

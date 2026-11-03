@@ -29,6 +29,7 @@ TRACKED = (
     "aiter.fused_moe_registry",
     "aiter.ops.comm_fused_moe_runtime",
     "aiter.ops.flydsl.comm_fused_moe_host",
+    "aiter.ops.flydsl.grouped_moe_gfx1250",
     "aiter.ops.flydsl.mega_moe_tp",
     "aiter.ops.flydsl.kernels.mega_moe",
     "aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2",

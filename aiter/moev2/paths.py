@@ -38,6 +38,7 @@ PLANNED = (
     "mxfp8",
     "fhmoe",
     "comm_fused",
+    "grouped_gfx1250",
     "mega_moe_v2",
     "mega_moe_tp",
     "mega_moe_gfx1250",
@@ -124,6 +125,7 @@ _BUILTIN_MODULES: tuple = (
     "aiter.moev2.migration.mxfp8",
     "aiter.moev2.migration.fhmoe",
     "aiter.moev2.migration.comm_fused",
+    "aiter.moev2.migration.grouped_gfx1250",
 )
 
 _REGISTRY: dict[str, Path] = {}
