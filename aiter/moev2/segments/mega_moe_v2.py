@@ -76,6 +76,115 @@ class MegaV2Spec:
         )
 
 
+def _num_cu() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+def instance_need(spec: MegaV2Spec, weights, num_cu: int) -> MemoryNeed:
+    """The bytes `MegaMoEV2(...)` of this spec allocates and holds, as its constructor
+    (and its `FlyDSLDispatchCombineIntraNodeOp` and group-major op) does: MORI
+    symmetric-heap tensors (`symmetric`, their bytes without the heap's alignment) and
+    device tensors (`device`, with the copies of weights that are not contiguous, which
+    the first `bind` frees). `num_cu`: the device's CU count."""
+    from aiter.ops.flydsl.kernels import flydsl_dispatch_combine_intranode_op as op_mod
+    from aiter.ops.flydsl.kernels.mega_moe import dispatch as disp
+
+    config = _config()
+    plan = spec.bundle_plan()
+    W, H, I, K = spec.world_size, spec.model_dim, spec.inter_dim, spec.topk
+    epr, mtpr = spec.experts // W, spec.max_tok_per_rank
+    fp4 = spec.quant == "a4w4"
+    compact = not plan.fixed_slot_dispatch
+    unit = 128 if compact else 32
+    scale_dim = H // 32
+    indexed = compact and mtpr >= config.INDEXED_PAYLOAD_MIN_MTPR
+    a_dtype = torch.float4_e2m1fn_x2 if fp4 else torch.float8_e4m3fn
+    cfg = op_mod.FlyDSLDispatchCombineConfig(
+        rank=0,
+        world_size=W,
+        hidden_dim=H,
+        max_num_inp_token_per_rank=mtpr,
+        num_experts_per_rank=epr,
+        num_experts_per_token=K,
+        combine_dtype=torch.bfloat16,
+        dispatch_dtype=a_dtype,
+        scale_dim=scale_dim,
+        scale_type_size=1,
+        enable_std_moe=False,
+        enable_group_major=True,
+        gm_unit_size=unit,
+        gm_scheme=spec.mega_scheme,
+        gm_compact=compact,
+        gm_indexed_payload=indexed,
+        max_total_recv_tokens=W,
+    )
+    sym = dev = 0
+
+    # FlyDSLDispatchCombineIntraNodeOp: _alloc_buffers, the P2P tables, the flag.
+    mt, mr, mr_worst = mtpr, cfg.effective_max_recv, cfg.max_recv
+    legacy_tb = H * cfg.max_token_type_size if cfg.max_token_type_size > 0 else 0
+    disp_tb = max(cfg.dispatch_token_bytes, legacy_tb)
+    comb_tb = max(cfg.combine_token_bytes, legacy_tb)
+    sym += 2 * ((mr * disp_tb + 1) // 2) + mr * K * 8
+    sym += mr * cfg.scale_bytes if cfg.scale_bytes > 0 else 1
+    sym += 4 + W * 4 + mr * 4
+    sym += 2 * ((max(mr_worst, mt * K) * comb_tb + 1) // 2) + mr_worst * K * 4
+    sym += 2 * ((mt * comb_tb + 1) // 2) + mt * K * 4 + W * 8
+    dev += W * 4 + 3 * 4 + mt * K * 4 + 4 + 4 + 8 + 8
+    dev += 10 * W * 8 + 8
+
+    # FlyDSLDispatchGroupMajorOp (its total_recv is replaced by the op's).
+    ll_cap = -(-W * mtpr // unit) * unit
+    scale_n_i32 = (scale_dim + 3) // 4 if scale_dim > 0 else 0
+    row_bytes = op_mod._token_bytes_for(a_dtype, H)
+    if compact:
+        nvm = W * mtpr * K + (epr + 2) * unit
+    else:
+        nvm = epr * ll_cap + 256
+    max_blocks = -(-nvm // unit)
+    payload_rows = W * mtpr + 1 if indexed else nvm
+    sym += W * 4 + epr * 8 + payload_rows * row_bytes
+    sym += max(1, payload_rows * scale_n_i32) * 4 + nvm * 12 + W * 4
+    dev += 8 + 8 + W * 4
+    tables = 8
+    if compact:
+        sym += epr * 8 + W * 8 + W * W * epr * 4 + W * 4
+        dev += 8 + 4 + 3 * W * epr * 4
+        tables += 6
+    dev += tables * W * 8
+
+    # MegaMoEV2: _build_fused_stage1 (metadata, workspace, buffers, the dispatch table).
+    metadata_blocks = -(-nvm // 32)
+    dev += max(max_blocks, metadata_blocks) * 8 + metadata_blocks * 4 + 4 + 8
+    prepare_cu = max(entry.config.stage1.num_dispatch_cu for entry in plan.entries)
+    keys = (prepare_cu + 1) * (num_cu + 1)
+    slots = config.fixed_stage1_epoch_slot_count(num_cu)
+    experts = W * epr
+    segments = experts + W
+    tile_blocks = 2 * metadata_blocks
+    dev += segments * 4 * (3 + num_cu) + mtpr * K * 8 + 8 + slots * 12
+    dev += keys * 16 + 8 + 128 * 4 + 4 + epr * 4 + 4 + W * 8 + 2 * W * 4
+    sym += W * segments * 4 + 2 * W * 4 + experts * 8 + 2 * W * 4 + W * 4
+    sym += 4 * tile_blocks * 4 + 8 + 4
+    dev += 10 * W * 8
+    dev += nvm * (I // 2 if fp4 else I)
+    dev += -(-nvm // 256) * 256 * (-(-(I // 32) // 8) * 8) + I
+    dev += mtpr * (H // 2 if fp4 else H) + mtpr * scale_dim
+    dev += disp.DISPATCH_TABLE_SIZE * 8
+
+    # _build_fused_stage2: the combine placeholder.
+    dev += H * 2
+
+    dev += sum(
+        t.nbytes
+        for t in (weights.w1, weights.w1_scale, weights.w2, weights.w2_scale)
+        if not t.is_contiguous()
+    )
+    return MemoryNeed(device=dev, symmetric=sym)
+
+
 def _structure(plan) -> Params:
     p2p = sorted({entry.config.p2p_quant for entry in plan.entries})
     return Params(
@@ -90,8 +199,8 @@ class MegaMoEV2Segment(Segment):
     to prepare), `for_spec(spec, weights)` creates one at `prepare(ctx)` on the engine's
     group with one layer's weights (the constructor needs them; each forward binds its
     own). Legacy has no health, reset or close, so neither has the segment; `release()`
-    drops the instance, and `workspace_bytes()` is not known before it is built (todo
-    2.24)."""
+    drops the instance. `workspace_bytes()`: what the constructor will allocate
+    (`instance_need`); nothing for an adopted one (the hook's)."""
 
     name = "mega_moe_v2"
     covers = (Op.COMM_IN, Op.COMM_OUT)
@@ -144,7 +253,9 @@ class MegaMoEV2Segment(Segment):
         return self
 
     def workspace_bytes(self) -> MemoryNeed:
-        return MemoryNeed()
+        if self.spec is None:
+            return MemoryNeed()
+        return instance_need(self.spec, self.weights, _num_cu())
 
     def prepare(self, ctx) -> None:
         if self.mega is not None:

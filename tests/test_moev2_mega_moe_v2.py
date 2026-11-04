@@ -26,10 +26,12 @@ from aiter.moev2 import engine as eng
 from aiter.moev2 import paths
 from aiter.moev2.migration import mega_moe_v2 as path
 from aiter.moev2.segments import mega_moe_v2 as seg_mod
+from aiter.moev2.segments.base import MemoryNeed
 from aiter.moev2.segments.mega_moe_v2 import MegaMoEV2Segment
 from aiter.ops.flydsl.kernels.mega_moe import mega_moe_v2 as legacy
 
 MODEL, INTER, TOPK = 64, 32, 2
+CUS = 256
 
 
 class _Stream:
@@ -475,11 +477,13 @@ def test_engine_binds_and_runs(shared):
 
     with mock.patch.object(seg_mod, "_mega", lambda: _fake_module(built)), mock.patch(
         "aiter.moev2.routing.shared_route.append_shared_expert", append
-    ):
+    ), mock.patch.object(seg_mod, "_num_cu", return_value=CUS):
         engine = eng.MoeEngine.create(template, max_tokens=16, capture_max_tokens=16)
         engine.prepare()
         assert len(built) == 1
         mega = built[0]
+        segment = template._segments[16]
+        assert engine.memory() == seg_mod.instance_need(segment.spec, layer_a, CUS)
         engine.capture()
         assert mega.preloads == 1 and not mega.log
         assert appended == ([(4, 4)] if shared else [])
@@ -500,6 +504,48 @@ def test_engine_binds_and_runs(shared):
             engine.forward(x, ids, wts, weights=_cpu_weights(epr + 1))
         engine.release()
     assert template._segments[16].mega is None
+
+
+def test_instance_need_per_dispatch_and_weights():
+    template = _v4_template(1024)
+    fixed, compact = (template.resolve(c, False).stateful[0] for c in (128, 1024))
+    assert fixed.spec.bundle_plan().fixed_slot_dispatch
+    assert not compact.spec.bundle_plan().fixed_slot_dispatch
+    need = seg_mod.instance_need(fixed.spec, fixed.weights, CUS)
+    assert need.device > 0 and need.symmetric > 0
+    assert seg_mod.instance_need(compact.spec, compact.weights, CUS) != need
+    with mock.patch.object(seg_mod, "_num_cu", return_value=CUS):
+        assert fixed.workspace_bytes() == need
+    w = fixed.weights
+    w1 = w.w1.transpose(1, 2)
+    strided = dataclasses.replace(w, w1=w1)
+    with_copy = seg_mod.instance_need(fixed.spec, strided, CUS)
+    assert with_copy == MemoryNeed(need.device + w1.nbytes, need.symmetric)
+    assert MegaMoEV2Segment.adopt(_Fake()).workspace_bytes() == MemoryNeed()
+
+
+def test_engine_budget_refuses_before_building():
+    built = []
+    template = path.MegaMoEV2Template(
+        _cpu_weights(4),
+        world_size=1,
+        model_dim=MODEL,
+        inter_dim=INTER,
+        experts=4,
+        topk=TOPK,
+        max_tokens_per_rank=16,
+    )
+    spec = template.resolve(16, False).stateful[0].spec
+    need = seg_mod.instance_need(spec, template.weights, CUS)
+    with mock.patch.object(
+        seg_mod, "_mega", lambda: _fake_module(built)
+    ), mock.patch.object(seg_mod, "_num_cu", return_value=CUS):
+        engine = eng.MoeEngine.create(
+            template, max_tokens=16, memory_budget=need.total - 1
+        )
+        with pytest.raises(eng.MemoryBudgetExceeded, match="mega_moe_v2"):
+            engine.prepare()
+    assert not built
 
 
 def test_engine_rejects_an_instance_for_another_world():

@@ -19,6 +19,7 @@ capacities and the same outputs. Fixed-slot needs EP8 (and 48 experts per rank):
 another world size the fixed cases are skipped and the engine has one instance.
 """
 
+import contextlib
 import dataclasses
 import functools
 import os
@@ -37,6 +38,8 @@ SEED = 123
 # "graph" (captured, poisoned, replayed), "engine". Options: "mask" (the last
 # `mask` rows of each rank routed to -1, mask_invalid_slots=True), "full"
 # (slice_output=False), "error" ("tokens": above the capacity; "dtype": fp32 tokens).
+# "memory": what `engine.prepare()` allocated building the template's instances (device
+# tensors, MORI symmetric tensors) must be `engine.memory()`; option "quant" (a8w4).
 UNEVEN = (0, 1, 5, 128, 17, 64, 3, 100)
 UNEVEN_COMPACT = (0, 1, 300, 1024, 17, 640, 3, 999)
 CASES = {
@@ -66,6 +69,9 @@ CASES = {
     "engine uneven": ("compact", (UNEVEN, UNEVEN_COMPACT), "engine", {}),
     "engine shared M=1, 100, 1000": ("shared", (1, 100, 1000), "engine", {}),
     "engine M=50 masked tail": ("compact", (50,), "engine", {"mask": 3}),
+    "memory routed": ("compact", None, "memory", {}),
+    "memory shared": ("shared", None, "memory", {}),
+    "memory routed a4w4": ("compact", None, "memory", {"quant": "a4w4"}),
 }
 
 
@@ -126,6 +132,7 @@ class _Session:
     layers: dict
     instances: dict
     engines: dict = dataclasses.field(default_factory=dict)
+    allocated: dict = dataclasses.field(default_factory=dict)
     capture_stream: object = None  # one for every capture: launches name their stream
     graph_pool: object = None  # and one pool: launches name what a capture allocates
     pool_holder: object = None  # a graph that keeps the pool's memory between captures
@@ -390,14 +397,14 @@ def _hook_case(session, name, instance, tokens, variant, opts):
     return f"note: {note}" if note else None
 
 
-def _engine(session, shared, mask=None):
+def _engine(session, shared, mask=None, quant="a8w4"):
     import torch.distributed as dist
 
     from aiter.moev2 import engine as eng
     from aiter.moev2.migration.mega_moe_v2 import MegaMoEV2Template
     from aiter.moev2.problem import ParallelSpec
 
-    key = ("shared" if shared else "routed", mask)
+    key = ("shared" if shared else "routed", mask, quant)
     if key in session.engines:
         return session.engines[key]
     net = session.net
@@ -410,6 +417,7 @@ def _engine(session, shared, mask=None):
         experts=net["experts"],
         topk=net["topk"],
         max_tokens_per_rank=1024,
+        quant=quant,
         swiglu_limit=net["swiglu_limit"],
         fuse_shared_expert=shared,
         mask_invalid_slots=mask,
@@ -429,10 +437,58 @@ def _engine(session, shared, mask=None):
         parallel=parallel,
         comm=dist.group.WORLD,
     )
-    engine.prepare()
+    with _allocations() as allocated:
+        engine.prepare()
+    session.allocated[key] = allocated
     engine.capture()
     session.engines[key] = engine
     return engine
+
+
+@contextlib.contextmanager
+def _allocations():
+    """`MemoryNeed` of what the block allocated and still holds: device bytes (torch's
+    requested bytes) and MORI symmetric bytes (`mori_shmem_create_tensor`)."""
+    import torch
+
+    from aiter.moev2.segments.base import MemoryNeed
+    from aiter.ops.flydsl.kernels import flydsl_dispatch_combine_intranode_op as op_mod
+
+    def requested():
+        torch.cuda.synchronize()
+        return torch.cuda.memory_stats()["requested_bytes.all.current"]
+
+    create = op_mod.mori_shmem_create_tensor
+    symmetric = []
+
+    def counted(shape, dtype):
+        tensor = create(shape, dtype)
+        symmetric.append(tensor.nbytes)
+        return tensor
+
+    result = {}
+    before = requested()
+    op_mod.mori_shmem_create_tensor = counted
+    try:
+        yield result
+    finally:
+        op_mod.mori_shmem_create_tensor = create
+        result["need"] = MemoryNeed(
+            device=requested() - before, symmetric=sum(symmetric)
+        )
+
+
+def _memory_case(session, name, instance, quant):
+    shared = instance == "shared"
+    try:
+        engine = _engine(session, shared, quant=quant)
+    except Exception as exc:  # noqa: BLE001
+        return f"{name}: engine: {type(exc).__name__}: {exc}"
+    allocated = session.allocated[("shared" if shared else "routed", None, quant)]
+    allocated = allocated["need"]
+    if engine.memory() != allocated:
+        return f"{name}: engine.memory() {engine.memory()}, allocated {allocated}"
+    return f"note: {engine.memory()} for capacities {engine.template.capacities}"
 
 
 def _engine_case(session, name, instance, counts, opts):
@@ -539,6 +595,8 @@ def run_case(session, name):
     instance, tokens, variant, opts = CASES[name]
     if instance not in session.instances:
         return f"note: skipped, no {instance} instance at EP{WORLD}"
+    if variant == "memory":
+        return _memory_case(session, name, instance, opts.get("quant", "a8w4"))
     if variant == "engine":
         return _engine_case(session, name, instance, tokens, opts)
     return _hook_case(session, name, instance, tokens, variant, opts)
