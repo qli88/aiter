@@ -247,6 +247,9 @@ class MegaMoeTP:
         scale[, rows]), each [tp * m, ...] with rank r's rows at r * m. engine.tn_local
         (default True): only this rank's rows are written (the others are undefined);
         False: every rank's."""
+        res = self._moev2(x_local, topk_weights, topk_ids, out, tail, bf16)
+        if res is not None:
+            return res
         if self._big(self._local(x_local.shape[0])):
             # the small engine's input checks (up to max_local_tokens), then the big-M
             # kernel's input types (int32 ids, f32 weights, contiguous; no-ops if so)
@@ -273,6 +276,27 @@ class MegaMoeTP:
                 res = (*res, self._bigm_rows(tail[1], tail[2], local))
             return res
         return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
+
+    def _moev2(self, x_local, topk_weights, topk_ids, out, tail, bf16):
+        """The output of the moev2 path that claims this call, or None to run here."""
+        from aiter.moev2 import paths as moev2_paths
+
+        if not moev2_paths.any_active():
+            return None
+        call = {
+            "mtp": self,
+            "x": x_local,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "out": out,
+            "tail": tail,
+            "bf16": bf16,
+        }
+        v2_path = moev2_paths.route_to_v2(call, "mega_tp")
+        if v2_path is None:
+            return None
+        res = v2_path.run(call)
+        return None if res is moev2_paths.DECLINED else res
 
     def _local(self, rows: int) -> int:
         """local tokens of a forward of these input rows (ar: replicated, rows / tp per rank)"""

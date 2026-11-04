@@ -64,8 +64,10 @@ DECLINED = _Declined()
 # "mega_gfx1250" at the top of `MegaMoEGfx1250.forward`, with `mega` (the instance) and
 # its arguments by name; "mega_v2" at the top of `MegaMoEV2.forward` and
 # `forward_prequant`, with `mega`, `prequant` (which of the two), `x` (`x_bf16` or
-# `x_q`), `scales` (None for `forward`) and the other arguments by name.
-ENTRIES = ("api", "op", "fhmoe", "comm_fused", "mega_gfx1250", "mega_v2")
+# `x_q`), `scales` (None for `forward`) and the other arguments by name; "mega_tp" at
+# the top of `MegaMoeTP.forward`, with `mtp` (the instance), `x` (`x_local`) and the
+# other arguments by name.
+ENTRIES = ("api", "op", "fhmoe", "comm_fused", "mega_gfx1250", "mega_v2", "mega_tp")
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,7 @@ _BUILTIN_MODULES: tuple = (
     "aiter.moev2.migration.grouped_gfx1250",
     "aiter.moev2.migration.mega_moe_gfx1250",
     "aiter.moev2.migration.mega_moe_v2",
+    "aiter.moev2.migration.mega_moe_tp",
 )
 
 _REGISTRY: dict[str, Path] = {}

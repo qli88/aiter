@@ -241,6 +241,7 @@ def test_builtin_paths():
         fhmoe,
         grouped_gfx1250,
         mega_moe_gfx1250,
+        mega_moe_tp,
         mega_moe_v2,
         mxfp8,
     )
@@ -257,7 +258,13 @@ def test_builtin_paths():
         mxfp8,
         fhmoe,
     )
-    modules = local + (comm_fused, grouped_gfx1250, mega_moe_gfx1250, mega_moe_v2)
+    modules = local + (
+        comm_fused,
+        grouped_gfx1250,
+        mega_moe_gfx1250,
+        mega_moe_v2,
+        mega_moe_tp,
+    )
     assert paths._BUILTIN_MODULES == tuple(m.__name__ for m in modules)
     for module in local:
         entry = "fhmoe" if module is fhmoe else "op"
@@ -278,6 +285,9 @@ def test_builtin_paths():
     assert mega_moe_v2.PATH.entry == "mega_v2"
     assert mega_moe_v2.PATH.dispatch_record is None
     assert not mega_moe_v2.PATH.segments
+    assert mega_moe_tp.PATH.entry == "mega_tp"
+    assert mega_moe_tp.PATH.dispatch_record is None
+    assert not mega_moe_tp.PATH.segments
     # No path graduates: each runs only when enabled with AITER_MOEV2.
     assert not any(m.PATH.graduated for m in modules)
 

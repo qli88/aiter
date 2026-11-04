@@ -29,6 +29,7 @@ bucket (`LocalTemplate.resolve`), so a bucket can hold one plan per activation f
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import enum
 import functools
@@ -136,6 +137,18 @@ class MemoryBudgetExceeded(RuntimeError):
     """The stateful segments of the plans need more than `memory_budget`."""
 
 
+class PeerPrepareError(RuntimeError):
+    """A stateful segment's `prepare` raised on another rank (that rank raises its own
+    error)."""
+
+
+def _abort_quietly(segment) -> None:
+    """`segment.abort()` while a prepare error is raised: an abort error never
+    replaces it."""
+    with contextlib.suppress(Exception):
+        segment.abort()
+
+
 @dataclass(frozen=True)
 class BucketPlan:
     """What a `PlanSource` resolves for one bucket.
@@ -147,8 +160,11 @@ class BucketPlan:
     `output_lifetime="caller"` it writes the result there. `warmup()`: runs the bucket
     once before graph capture (None: nothing to warm up). `stateful`: the stateful
     segments of the plan, whose lifecycle (and `workspace_bytes`) the engine drives.
-    `side_inputs`: the names `forward` must pass; `hints`: the hints the plan can use.
-    `supports(tokens)`: whether `run` serves that count of the bucket (None: every one).
+    `side_inputs`: the names `forward` must pass; `optional_side_inputs`: the names it
+    may pass; `hints`: the hints the plan can use. `supports(tokens)`: whether `run`
+    serves that count of the bucket (None: every one); `supports_optional(tokens,
+    names)`: whether it serves it with those optional side inputs (None: always). A
+    result may be a tuple whose first element is the output (e.g. a fused tail's).
     """
 
     bucket: int
@@ -158,11 +174,13 @@ class BucketPlan:
     warmup: Callable | None = None
     stateful: tuple = ()
     side_inputs: frozenset = frozenset()
+    optional_side_inputs: frozenset = frozenset()
     hints: frozenset = frozenset()
     output_lifetime: str = "caller"
     zero_tokens_ok: bool = True
     graph_capturable: bool = True
     supports: Callable | None = None
+    supports_optional: Callable | None = None
 
 
 class PlanSource:
@@ -310,13 +328,24 @@ class MoeEngine:
         """The weight layout `forward` expects (`MoeWeights` must be in it)."""
         return self.template.weight_layout()
 
-    def supports(self, tokens: int) -> bool:
-        """Whether `forward` serves `tokens` (in EP/TP, the agreed count)."""
+    def supports(self, tokens: int, side_inputs=()) -> bool:
+        """Whether `forward` serves `tokens` (in EP/TP, the agreed count) with these
+        `side_inputs` names among its optional ones (e.g. a fused tail's)."""
         self._require("supports", *_PREPARED_STATES)
         if tokens > self.max_tokens:
             return False
         plan = self._plans[bucket_of(tokens)]
-        return plan.supports is None or bool(plan.supports(tokens))
+        names = frozenset(
+            (side_inputs,) if isinstance(side_inputs, str) else side_inputs or ()
+        )
+        if names - plan.side_inputs - plan.optional_side_inputs:
+            return False
+        if plan.supports is not None and not plan.supports(tokens):
+            return False
+        optional = names & plan.optional_side_inputs
+        if optional and plan.supports_optional is not None:
+            return bool(plan.supports_optional(tokens, optional))
+        return True
 
     def memory(self) -> MemoryNeed:
         """Bytes per rank of the prepared stateful segments, each instance once."""
@@ -328,7 +357,10 @@ class MoeEngine:
     def prepare(self) -> None:
         """Resolve a plan per bucket, check that every rank has the same plans, then
         prepare the stateful segments (compile, allocate; may be collective). Their
-        memory (`memory()`) is checked against `memory_budget` before any allocates."""
+        memory (`memory()`) is checked against `memory_budget` before any allocates. A
+        segment whose `prepare` raises on some ranks raises on all (the others:
+        `PeerPrepareError`); the segments prepared until then are aborted and the
+        engine stays CREATED."""
         self._require("prepare", EngineState.CREATED)
         try:
             plans = self._resolve_buckets()
@@ -346,6 +378,7 @@ class MoeEngine:
                     [b, b in self.captured, plan.description, plan.identity]
                     for b, plan in plans.items()
                 ],
+                "stateful": [s.name for s in stateful],
                 "memory": [memory.device, memory.symmetric],
                 "memory_budget": self.ctx.memory_budget,
             }
@@ -364,11 +397,48 @@ class MoeEngine:
                 f"memory_budget={budget}: "
                 + ", ".join(f"{s!r} {n.total}" for s, n in zip(stateful, needs))
             )
-        for segment in stateful:
-            segment.prepare(self.ctx)
+        for i, segment in enumerate(stateful):
+            try:
+                self._prepare_segment(segment)
+            except Exception:
+                for done in reversed(stateful[:i]):
+                    _abort_quietly(done)
+                raise
         self._plans, self._stateful, self._record = plans, tuple(stateful), record
         self._memory = memory
         self._state = EngineState.PREPARED if self.captured else EngineState.READY
+
+    def _prepare_segment(self, segment) -> None:
+        """`segment.prepare`; in EP/TP every rank then learns every rank's outcome, so a
+        failure on some ranks raises on all of them before any runs on (a failure inside
+        the segment's own collective is the segment's to report). A rank whose prepare
+        succeeded aborts the segment before raising."""
+        try:
+            segment.prepare(self.ctx)
+            error = None
+        except Exception as exc:
+            if not self._collective():
+                raise
+            error = exc
+        if not self._collective():
+            return
+        try:
+            outcomes = self._gather(
+                None if error is None else f"{type(error).__name__}: {error}"
+            )
+        except Exception as gather_error:
+            if error is not None:
+                raise error from gather_error
+            _abort_quietly(segment)
+            raise
+        if error is not None:
+            raise error
+        for rank, outcome in enumerate(outcomes):
+            if outcome is not None:
+                _abort_quietly(segment)
+                raise PeerPrepareError(
+                    f"rank {rank} could not prepare {segment.name}: {outcome}"
+                )
 
     def _resolve_buckets(self) -> dict:
         plans = {}
@@ -414,10 +484,11 @@ class MoeEngine:
     ) -> torch.Tensor:
         """Run one layer. `step` is required in EP/TP: the bucket comes from
         `step.max_tokens_across_ranks`, never from a hidden collective. `side_inputs`:
-        exactly the ones the plan reads; `hints`: optional, passed only to plans that
-        use them. With `out`, the result is written there and `out` is returned;
-        without it, a plan whose output lives in a workspace returns a view that the
-        next `forward` of this engine overwrites."""
+        the ones the plan reads, and any of its optional ones (`supports` tells which
+        counts serve them); `hints`: optional, passed only to plans that use them. With
+        `out`, the result is written there and `out` is returned (a tuple result: as
+        its first element); without it, a plan whose output lives in a workspace
+        returns a view that the next `forward` of this engine overwrites."""
         if self._state not in (EngineState.READY, EngineState.ACTIVE):
             needs = {
                 EngineState.CREATED: "; call prepare() first",
@@ -446,19 +517,29 @@ class MoeEngine:
             raise ValueError(f"{agreed} tokens exceed max_tokens={self.max_tokens}")
         plan = self._plans[bucket_of(agreed)]
         side = dict(side_inputs or {})
-        unknown = sorted(set(side) - plan.side_inputs)
+        unknown = sorted(set(side) - plan.side_inputs - plan.optional_side_inputs)
         missing = sorted(plan.side_inputs - set(side))
         if unknown or missing:
+            optional = (
+                f" (optional {sorted(plan.optional_side_inputs)})"
+                if plan.optional_side_inputs
+                else ""
+            )
             raise ValueError(
-                f"side_inputs: the plan reads {sorted(plan.side_inputs)}; "
+                f"side_inputs: the plan reads {sorted(plan.side_inputs)}{optional}; "
                 f"missing {missing}, not read {unknown}"
             )
         used = {k: v for k, v in (hints or {}).items() if k in plan.hints}
         self.template.check_weights(weights)
         result = plan.run(x, topk_ids, topk_weights, weights, side, used, out)
-        if out is not None and result is not out:
-            out.copy_(result)
-            result = out
+        if out is not None:
+            if isinstance(result, tuple):
+                if result[0] is not out:
+                    out.copy_(result[0])
+                    result = (out, *result[1:])
+            elif result is not out:
+                out.copy_(result)
+                result = out
         self._state = EngineState.ACTIVE
         return result
 
@@ -624,6 +705,15 @@ def _fused_moe_defaults() -> dict:
         for name, p in inspect.signature(api.fused_moe).parameters.items()
         if p.default is not inspect.Parameter.empty
     }
+
+
+def file_digest(path) -> str:
+    """The sha256 of a file (a tuned table), or "missing"."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return "missing"
 
 
 def _weights_signature(weights: MoeWeights) -> dict:
@@ -823,13 +913,7 @@ class LocalTemplate(PlanSource):
     def digests(self) -> dict:
         from .dispatch import tuned
 
-        path = tuned.default_table_file()
-        try:
-            with open(path, "rb") as f:
-                digest = hashlib.sha256(f.read()).hexdigest()
-        except OSError:
-            digest = "missing"
-        return {"tuned_table": digest}
+        return {"tuned_table": file_digest(tuned.default_table_file())}
 
     def check_weights(self, weights: MoeWeights) -> None:
         theirs = _weights_signature(weights)

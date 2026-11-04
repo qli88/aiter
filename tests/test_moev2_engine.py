@@ -229,12 +229,65 @@ def test_side_inputs_must_match_and_hints_are_filtered():
     assert source.runs[-1][1:3] == ({"a1_scale": 1}, {"next": 5})
 
 
+def test_optional_side_inputs_and_what_supports_them():
+    source = _Source(
+        side_inputs=frozenset({"a1_scale"}),
+        optional_side_inputs=frozenset({"res", "norm"}),
+        supports=lambda tokens: tokens != 5,
+        supports_optional=lambda tokens, names: tokens > 2 and names == {"res"},
+    )
+    e = MoeEngine.create(source, max_tokens=8)
+    e.prepare()
+    _forward(e, side_inputs={"a1_scale": 1})
+    _forward(e, side_inputs={"a1_scale": 1, "res": 2})
+    assert source.runs[-1][1] == {"a1_scale": 1, "res": 2}
+    with pytest.raises(ValueError, match="optional \\['norm', 'res'\\]"):
+        _forward(e, side_inputs={"res": 2})
+    with pytest.raises(ValueError, match="not read \\['other'\\]"):
+        _forward(e, side_inputs={"a1_scale": 1, "other": 2})
+    assert e.supports(3) and e.supports(3, side_inputs=("a1_scale",))
+    assert e.supports(3, side_inputs=("res",)) and not e.supports(2, ("res",))
+    assert e.supports(3, side_inputs="res") and not e.supports(2, "res")
+    assert e.supports(2, side_inputs=None)
+    assert not e.supports(3, side_inputs=("res", "norm"))
+    assert not e.supports(3, side_inputs=("other",))
+    assert not e.supports(5) and not e.supports(5, side_inputs=("res",))
+    assert not e.supports(9, side_inputs=("res",))
+
+
 def test_out_receives_the_result():
     e = MoeEngine.create(_Source(output_lifetime="until_next_forward"), max_tokens=8)
     e.prepare()
     out = torch.zeros(3, 4)
     assert _forward(e, out=out) is out
     assert torch.equal(out, torch.full((3, 4), 2.0))
+
+
+class _TupleSource(_Source):
+    def __init__(self, write_out):
+        super().__init__()
+        self.write_out = write_out
+
+    def resolve(self, bucket, graph_capture):
+        def run(x, topk_ids, topk_weights, weights, side, hints, out):
+            y = x * 2
+            if out is not None and self.write_out:
+                y = out.copy_(y)
+            return y, x + 1
+
+        return BucketPlan(bucket, f"tuple {bucket}", run)
+
+
+@pytest.mark.parametrize("write_out", [True, False])
+def test_out_receives_the_first_element_of_a_tuple_result(write_out):
+    e = MoeEngine.create(_TupleSource(write_out), max_tokens=8)
+    e.prepare()
+    out = torch.zeros(3, 4)
+    y, extra = _forward(e, out=out)
+    assert y is out and torch.equal(out, torch.full((3, 4), 2.0))
+    assert torch.equal(extra, torch.full((3, 4), 2.0))
+    y, extra = _forward(e)
+    assert torch.equal(y, torch.full((3, 4), 2.0))
 
 
 def test_stateful_segments_follow_the_engine():
@@ -420,6 +473,71 @@ def test_ranks_agree_on_their_plans(tmp_path, tags):
             "disagree",
             "ranks 0 and 1 resolved different MoE plans: bucket 1: a 1 vs b 1",
         )
+
+
+class _FailsOnRank(_Stateful):
+    def __init__(self, rank):
+        super().__init__()
+        self.fail_on = rank
+
+    def prepare(self, ctx):
+        super().prepare(ctx)
+        if ctx.rank == self.fail_on:
+            raise ValueError("no arena")
+
+
+def _prepare_failure_worker(rank, init_file, results):
+    import datetime
+
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=60),
+    )
+    try:
+        before, failing, after = _Stateful(), _FailsOnRank(1), _Stateful()
+        e = MoeEngine.create(
+            _Source(stateful=(before, failing, after)),
+            max_tokens=8,
+            parallel=types.SimpleNamespace(world_size=2),
+            comm=dist.group.WORLD,
+        )
+        try:
+            e.prepare()
+            outcome = ("ok",)
+        except Exception as exc:  # noqa: BLE001
+            outcome = (type(exc).__name__, str(exc))
+        results[rank] = (
+            *outcome,
+            e.state.value,
+            [s.calls for s in (before, failing, after)],
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_a_segment_prepare_failing_on_one_rank_raises_on_every_rank(tmp_path):
+    import torch.multiprocessing as mp
+
+    results = mp.get_context("spawn").Manager().dict()
+    mp.spawn(_prepare_failure_worker, args=(str(tmp_path / "init"), results), nprocs=2)
+    prepared = ("prepare", 2)
+    assert results[1] == (
+        "ValueError",
+        "no arena",
+        "created",
+        [[prepared, "abort"], [prepared], []],
+    )
+    assert results[0] == (
+        "PeerPrepareError",
+        "rank 1 could not prepare test.stateful: ValueError: no arena",
+        "created",
+        [[prepared, "abort"], [prepared, "abort"], []],
+    )
 
 
 # Local MoE through the migration paths.
