@@ -12,8 +12,8 @@ KINDS = ("tokens", "sorted", "inter", "routed_out", "p2p_scatter", "out")
 @dataclass(frozen=True)
 class Buf:
     # fmt None: "sorted" (routing, not values), the caller's own hidden_states, or, in
-    # `Segment.reads`, any format. In `Segment.reads` only, layout None: any layout; a
-    # frozenset: any of those layouts.
+    # `Segment.reads`/`reads_with`, any format. There only, layout None: any layout; a
+    # frozenset: any of those layouts; block_m None: any block_m.
     kind: str
     fmt: ScaleSpec | None
     layout: str | frozenset | None = "default"  # "aux_sorted", "v2_sorted", ...
@@ -28,8 +28,10 @@ class Buf:
         if have is None:
             return f"reads {self}, which no earlier segment produces"
         layouts = self.layout if isinstance(self.layout, frozenset) else {self.layout}
-        if (self.layout is not None and have.layout not in layouts) or (
-            self.fmt is not None and have.fmt != self.fmt
+        if (
+            (self.layout is not None and have.layout not in layouts)
+            or (self.fmt is not None and have.fmt != self.fmt)
+            or (self.block_m is not None and have.block_m != self.block_m)
         ):
             return f"reads {self}, gets {have}"
         return None

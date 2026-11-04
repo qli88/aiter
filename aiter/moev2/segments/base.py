@@ -166,12 +166,15 @@ class Segment:
       shipped row, only by a table passed with AITER_CONFIG_FMOE or by a test; it needs
       a GPU test (tests/moe_dispatch/hibernating.py).
 
-    Plan parameters (declared for the tuner and the engine; nothing reads them yet):
+    Plan parameters (declared for the tuner and the engine):
 
     - `structure_params`: parameters that change a boundary buffer, a wire format or a
       buffer size (sort `block_m`, a dispatch scheme, a capacity), so every segment of a
       plan and every rank must agree on them; the tuner enumerates their values as
       separate structures. Today `block_m` is a plan field (`MOEMetadata.block_m`).
+      After the kernels are chosen, the resolver hands a segment the plan's value of
+      each one it declares and does not set, and fails the plan when a segment sets
+      one to another value than the plan or another segment.
     - `rank_local_params`: True if the local parameters (tiles, a bundle entry) may be
       picked from the rank's own tokens, because they never change the wire. False: all
       ranks use the same ones.
@@ -202,7 +205,11 @@ class Segment:
     - Feasibility: `reject_reason` (from the `Cap`s; override only for checks a `Cap`
       cannot express) and `accepts`.
     - Boundaries: `reads(p)`, the `Buf`s it reads, and `produces(p, params)`, the `Buf` it
-      hands on. The resolver chains segments whose formats match.
+      hands on. The resolver chains segments whose formats match, before the kernels
+      are chosen (`produces` with empty params). `reads_with(p, params)`: what it reads
+      once its kernel is chosen (default `reads(p)`); after the choice the resolver
+      matches each against `produces` with the chosen params and fails the plan on a
+      mismatch.
     - Tuned rows: `owns` (from `prefixes`), `check_row` (the row is discarded, as legacy
       discards it, with an optional warning), `declines_row` (migration only: the row
       goes back to the legacy code), `row_params` (what the row sets besides the kernel
@@ -266,12 +273,18 @@ class Segment:
 
     def reads(self, p: MoeProblem) -> tuple:
         """The boundary `Buf`s this segment reads, each from the last segment before it
-        that produced that kind. `fmt=None` reads any format; `block_m` is a plan
-        parameter, shared by every segment, so it is not compared."""
+        that produced that kind. `fmt=None` reads any format, `block_m=None` any
+        block_m."""
         raise NotImplementedError(self.name)
 
+    def reads_with(self, p: MoeProblem, params: Params) -> tuple:
+        """The `Buf`s it reads with its kernel chosen (`params`): `reads(p)`, narrowed
+        where the kernel fixes a format or a `block_m`."""
+        return self.reads(p)
+
     def produces(self, p: MoeProblem, params: Params):
-        """The `Buf` this segment hands to the next one."""
+        """The `Buf` this segment hands to the next one (`params` empty before the
+        kernels are chosen: a format the kernel fixes is then None, any)."""
         raise NotImplementedError(self.name)
 
     def check_row(self, p: MoeProblem, row, kernel_name1="") -> RowRejection | None:

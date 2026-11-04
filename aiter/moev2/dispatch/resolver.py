@@ -64,7 +64,8 @@ def feasible_plans(problem, segments):
     """`(plans, rejected)`: segment tuples covering the op chain, and `{name: reason}`.
 
     In a plan, every `Buf` a segment reads matches the last one of that kind produced
-    before it. A segment that fits the chain but in no plan, because of its boundaries,
+    before it. No kernel is chosen yet: a format the kernel fixes is None (any) here,
+    and `plan_mismatch` checks it once the kernels are chosen. A segment that fits the chain but in no plan, because of its boundaries,
     is in `rejected` with the first mismatch found.
     """
     ops = chain(problem)
@@ -112,6 +113,67 @@ def feasible_plans(problem, segments):
 
 def _plan_name(structure):
     return " | ".join(s.name for s in structure)
+
+
+def _structure_value(name, value):
+    # A tuned table's block_m may be a numpy or float scalar (legacy int()s it).
+    return int(value) if name == "block_m" and value is not None else value
+
+
+def _boundary_params(shared, choice):
+    """The params a chosen segment's boundaries depend on: its own, plus the shared
+    value of each structure parameter it declares and does not set."""
+    filled = {
+        k: shared[k]
+        for k in choice.segment.structure_params
+        if k in shared and k not in choice.params
+    }
+    return choice.params.replace(**filled)
+
+
+def _plan(problem, choices, source, params):
+    return MoePlan(
+        choices,
+        source,
+        params,
+        tuple(
+            c.segment.produces(
+                problem,
+                _boundary_params(
+                    {k: _structure_value(k, v) for k, v in params.items()}, c
+                ),
+            )
+            for c in choices[:-1]
+        ),
+    )
+
+
+def plan_mismatch(problem, plan) -> str | None:
+    """Why the chosen kernels of `plan` disagree, or None: a structure parameter a
+    segment sets to another value than the plan (or, when the plan has none, the first
+    segment setting it), or a `Buf` it reads with its kernel (`reads_with`) that the
+    last one of that kind before it (`produces` with the chosen params) does not
+    match. Only the plan's `block_m` is checked: a caller's `block_size_M` overrides
+    it at run time, as in legacy."""
+    shared = {k: _structure_value(k, v) for k, v in plan.params.items()}
+    owners = dict.fromkeys(shared, "the plan")
+    for c in plan.segments:
+        for k in sorted(c.segment.structure_params & c.params.keys()):
+            value = _structure_value(k, c.params[k])
+            if k not in shared:
+                shared[k], owners[k] = value, c.segment.name
+            elif value != shared[k]:
+                return f"{c.segment.name} has {k}={value!r}, {owners[k]} {shared[k]!r}"
+    last = {CALL_INPUT.kind: CALL_INPUT}
+    for c in plan.segments:
+        params = _boundary_params(shared, c)
+        for buf in c.segment.reads_with(problem, params):
+            reason = buf.mismatch(last.get(buf.kind))
+            if reason is not None:
+                return f"{c.segment.name} {reason}"
+        out = c.segment.produces(problem, params)
+        last[out.kind] = out
+    return None
 
 
 def _owned_kernel(raw):
@@ -202,7 +264,8 @@ def _one_stage_plan(
     run_1stage=True,
     flat=0,
 ):
-    """The plan and the legacy `fused_moe_1stage` metadata of a 1-stage structure.
+    """The plan and the legacy `fused_moe_1stage` metadata of a 1-stage structure,
+    or the reason (str) its chosen kernels disagree (`plan_mismatch`).
     `run_1stage`: the tuned row's value as legacy passes it on."""
     one_stage = _one_stage(structure)
     params = Params(kernel=kernelName1, xbf16=xbf16, flat=flat)
@@ -210,12 +273,10 @@ def _one_stage_plan(
         SegmentChoice(segment, params if segment is one_stage else Params())
         for segment in structure
     )
-    plan = MoePlan(
-        choices,
-        source,
-        Params(block_m=block_m, ksplit=ksplit),
-        tuple(c.segment.produces(problem, c.params) for c in choices[:-1]),
-    )
+    plan = _plan(problem, choices, source, Params(block_m=block_m, ksplit=ksplit))
+    reason = plan_mismatch(problem, plan)
+    if reason is not None:
+        return reason
     metadata = MOEMetadata(
         one_stage.build(problem, params),
         None,
@@ -240,7 +301,8 @@ def _two_stage_plan(
     options,
     row,
 ):
-    """`row`: the tuned row the plan runs, None for a default."""
+    """The plan and its metadata, or the reason (str) its chosen kernels disagree
+    (`plan_mismatch`). `row`: the tuned row the plan runs, None for a default."""
     gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
     is_asm = kernel_names.ASM in gemm1.prefixes
     if is_asm:
@@ -263,12 +325,12 @@ def _two_stage_plan(
         fields.update(choice.segment.metadata_fields(problem, choice.params))
     block_m = fields.pop("block_m", block_m)
     ksplit = fields.pop("ksplit", ksplit)
-    plan = MoePlan(
-        tuple(choices),
-        source,
-        Params(block_m=block_m, ksplit=ksplit),
-        tuple(c.segment.produces(problem, c.params) for c in choices[:-1]),
+    plan = _plan(
+        problem, tuple(choices), source, Params(block_m=block_m, ksplit=ksplit)
     )
+    reason = plan_mismatch(problem, plan)
+    if reason is not None:
+        return reason
     stage1 = plan.starting(Op.GEMM1)
     stage2 = plan.starting(Op.GEMM2)
     metadata = MOEMetadata(
@@ -458,7 +520,7 @@ def resolve(problem, segments) -> Resolution:
                 f"[fused_moe] using 1stage{xbf16} {'default' if cfg is None else tag} for {keys} ",
             )
         )
-        plan, metadata = _one_stage_plan(
+        built = _one_stage_plan(
             problem,
             structure,
             source,
@@ -469,6 +531,9 @@ def resolve(problem, segments) -> Resolution:
             run_1stage,
             flat,
         )
+        if isinstance(built, str):
+            return declined(f"the chosen kernels disagree: {built}")
+        plan, metadata = built
         note(f"selected {plan.describe()}")
         return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))
     gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
@@ -489,7 +554,7 @@ def resolve(problem, segments) -> Resolution:
         options = default.options
         if default.warning is not None:
             logs.append((WARNING, default.warning))
-    plan, metadata = _two_stage_plan(
+    built = _two_stage_plan(
         problem,
         structure,
         source,
@@ -502,5 +567,8 @@ def resolve(problem, segments) -> Resolution:
         options,
         cfg if source == "tuned" else None,
     )
+    if isinstance(built, str):
+        return declined(f"the chosen kernels disagree: {built}")
+    plan, metadata = built
     note(f"selected {plan.describe()}")
     return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))

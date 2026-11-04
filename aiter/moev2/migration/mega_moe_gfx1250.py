@@ -196,12 +196,15 @@ PATH = paths.Path(NAME, claims, run, entry="mega_gfx1250")
 paths.register(PATH)
 
 
-def _boundaries(dispatch, dispatch_params, grouped_params, combine):
+def _boundaries(dispatch, dispatch_params, grouped_params, combine, combine_params):
     """Boundaries A and B of the plan, checked against what the next segment reads."""
     a = dispatch.produces(None, dispatch_params)
     b = GROUPED_P2P.produces(None, grouped_params)
-    for reader, have in ((GROUPED_P2P, a), (combine, b)):
-        for need in reader.reads(None):
+    for reader, params, have in (
+        (GROUPED_P2P, grouped_params, a),
+        (combine, combine_params, b),
+    ):
+        for need in reader.reads_with(None, params):
             problem = need.mismatch(have)
             if problem is not None:
                 raise ValueError(f"{reader.name} {problem}")
@@ -341,7 +344,9 @@ class MegaMoEGfx1250Template(PlanSource):
                 SegmentChoice(combine, combine_params),
             ),
             "default",
-            boundaries=_boundaries(dispatch, dispatch_params, grouped_params, combine),
+            boundaries=_boundaries(
+                dispatch, dispatch_params, grouped_params, combine, combine_params
+            ),
         )
         spec = {k: v for k, v in vars(dispatch.spec).items() if k != "communicator"}
         for name in ("situ_beta", "situ_linear_beta"):

@@ -1578,6 +1578,106 @@ def test_mxmoe_bias_flags_follow_the_kernel_names(monkeypatch):
     assert res.metadata.stage2_has_bias and not res.metadata.has_bias
 
 
+def test_chosen_kernels_must_agree_on_boundaries(monkeypatch):
+    from aiter.moev2.dispatch.buf import Buf
+    from aiter.moev2.migration import a8w4
+
+    sorted16 = Buf("sorted", None, block_m=16)
+    assert Buf("sorted", None).mismatch(sorted16) is None
+    assert "bm=32" in Buf("sorted", None, block_m=32).mismatch(sorted16)
+
+    def boundary(plan, kind):
+        return next(b for b in plan.boundaries if b.kind == kind)
+
+    # MXMOE: the stage 1 name fixes the intermediate (fp4 unless FP8OUT), a layout
+    # GEMM2 name the intermediate it reads and the sort block (sbm).
+    p = _a4w4_problem(token=8, shape=_MXMOE_SHAPE, is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, p, _MXMOE_ROW)
+    assert resolver.plan_mismatch(p, res.plan) is None
+    assert boundary(res.plan, "sorted").block_m == 16
+    assert boundary(res.plan, "inter").fmt.dtype == dtypes.fp4x2
+    fp8_in = _MXMOE_ROW["kernelName2"].replace("_afp4_", "_afp8_")
+    declined = _a4w4_resolve(monkeypatch, p, {**_MXMOE_ROW, "kernelName2": fp8_in})
+    assert declined.plan is None
+    assert declined.declined.startswith("the chosen kernels disagree: mxmoe.gemm2")
+    assert f"reads inter:{str(dtypes.fp8).removeprefix('torch.')}/" in declined.declined
+    sbm32 = _MXMOE_ROW["kernelName2"].replace("_sbm16", "_sbm32")
+    # Legacy discards the inline-sort row first; a plain stage 1 reaches the check.
+    res = _a4w4_resolve(monkeypatch, p, {**_MXMOE_ROW, "kernelName2": sbm32})
+    assert res.plan.source == "default"
+    assert any("inline-sort" in m for _, m in res.logs)
+    plain = "flydsl_mxmoe_g1_a4w4_16x128x256_hpf_nt_xcd4"
+    row = {**_MXMOE_ROW, "kernelName1": plain, "kernelName2": sbm32}
+    declined = _a4w4_resolve(monkeypatch, p, row)
+    assert declined.plan is None and "bm=32" in declined.declined
+
+    # A FlyDSL layout GEMM2 with another sbm than the sort's block_m, declined before
+    # any segment builds; an fp8 GEMM2 input renames the GEMM2 for both stages.
+    from aiter.moev2.segments import mxfp4
+
+    layout = {
+        "block_m": 32,
+        "ksplit": 0,
+        "run_1stage": 0,
+        "kernelName1": "flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w4_fp4",
+        "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x256_atomic_nt_sbm32",
+    }
+    sbm64 = {**layout, "kernelName2": layout["kernelName2"].replace("_sbm32", "_sbm64")}
+
+    def no_build(self, p, params):
+        raise AssertionError("built")
+
+    with monkeypatch.context() as m:
+        m.setattr(mxfp4.FlydslGemm1Layout, "build", no_build)
+        m.setattr(mxfp4.FlydslLayoutGemm2, "build", no_build)
+        declined = _a4w4_resolve(m, _a4w4_problem(is_shuffled=True), sbm64)
+    assert declined.declined == (
+        "the chosen kernels disagree: flydsl_layout.gemm2 reads sorted:bm=64, "
+        "gets sorted:bm=32"
+    )
+    p = _a4w4_problem(is_shuffled=True, q_dtype_a2=dtypes.fp8)
+    res = _a4w4_resolve(monkeypatch, p, layout)
+    assert res.plan.structure()[0][-1] == "flydsl_layout.gemm2"
+    assert res.metadata.stage1.keywords["out_dtype"] == "fp8"
+    assert boundary(res.plan, "inter").fmt.dtype == dtypes.fp8
+
+    # A FlyDSL stage 1 writes what its layout GEMM2 reads.
+    monkeypatch.setattr(
+        tuned,
+        "lookup",
+        lambda p: {
+            "kernelName1": "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8",
+            "kernelName2": "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x256_reduce_nt_sbm32",
+            "block_m": 32,
+            "ksplit": 0,
+        },
+    )
+    res = resolver.resolve(_a8w4_problem(), a8w4.SEGMENTS)
+    assert res.plan.structure()[0][-1] == "flydsl_layout.gemm2"
+    assert boundary(res.plan, "inter").fmt.dtype == dtypes.fp8
+
+    # Opus stage 1 runs its own block_m, which must be the plan's and the sort's.
+    monkeypatch.setattr(
+        tuned,
+        "lookup",
+        lambda p: {
+            "kernelName1": "opus_moe1_afp8_wfp4_bf16_t64x384_gs_qgb3_aff32_p2_fp8",
+            "kernelName2": "opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584",
+            "block_m": 64,
+            "ksplit": 0,
+        },
+    )
+    p = _a8w4_problem()
+    plan = resolver.resolve(p, a8w4.SEGMENTS).plan
+    assert resolver.plan_mismatch(p, plan) is None
+    other = dataclasses.replace(plan, params=plan.params.replace(block_m=32))
+    assert resolver.plan_mismatch(p, other) == "opus.gemm1 has block_m=64, the plan 32"
+    sort, *rest = plan.segments
+    sort = dataclasses.replace(sort, params=Params(block_m=32))
+    other = dataclasses.replace(plan, segments=(sort, *rest), params=Params())
+    assert resolver.plan_mismatch(p, other) == "opus.gemm1 has block_m=64, sort 32"
+
+
 def test_claims_split_mxfp4_weights_by_activation_format(monkeypatch):
     from aiter.moev2.migration import a4w4, local
     from aiter.ops.flydsl.moe_common import GateMode

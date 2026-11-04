@@ -187,7 +187,8 @@ def key_args_supported(
 
 
 def with_stage2(plan, choice):
-    """`plan` with `choice` (a `SegmentChoice` covering GEMM2..REDUCE) as its stage 2."""
+    """`plan` with `choice` (a `SegmentChoice` covering GEMM2..REDUCE) as its stage 2.
+    Not checked with `plan_mismatch`: the comm-fused stage 2 declares no `reads`."""
     if choice.segment.covers != (Op.GEMM2, Op.REDUCE):
         raise ValueError(f"{choice.segment!r} does not cover GEMM2..REDUCE")
     segments = tuple(

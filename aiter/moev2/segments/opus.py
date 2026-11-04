@@ -27,7 +27,7 @@ from ..dispatch.ops import Op
 from ..problem import ScaleSpec
 from .base import RowRejection, Segment
 from .defaults import BLOCK_SIZE_M, default_block_m
-from .mxfp4 import a8w4_caps, mxfp4_row_rejection, swiglu_bias
+from .mxfp4 import a8w4_caps, layout_gemm2_inter, mxfp4_row_rejection, swiglu_bias
 
 
 def _opus_stage2_fp8_enabled():
@@ -40,6 +40,7 @@ def _row_block_m(row):
 
 class _OpusStage1(Segment):
     prefixes = (kernel_names.OPUS,)
+    structure_params = frozenset({"block_m"})
 
     @property
     def capabilities(self):
@@ -99,7 +100,7 @@ class OpusGemm1Layout(_OpusStage1):
         )
 
     def produces(self, p, params):
-        return Buf("inter", None, "v2_sorted")
+        return Buf("inter", layout_gemm2_inter(params.get("kernel2")), "v2_sorted")
 
     def build(self, p, params):
         stage1 = super().build(p, params)
