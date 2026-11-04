@@ -40,8 +40,22 @@ SEED = 123
 # (slice_output=False), "error" ("tokens": above the capacity; "dtype": fp32 tokens).
 # "memory": what `engine.prepare()` allocated building the template's instances (device
 # tensors, MORI symmetric tensors) must be `engine.memory()`; option "quant" (a8w4).
+# Engine option "graph": each forward captured and replayed, legacy's too (vLLM's
+# padded decode). "disagree": rank 1's template differs, so every rank's `prepare()`
+# raises `PlanDisagreement` before any instance is built. "lifetime": a result written
+# to `out=` survives the next forward; one without `out` is the view the next overwrites.
 UNEVEN = (0, 1, 5, 128, 17, 64, 3, 100)
 UNEVEN_COMPACT = (0, 1, 300, 1024, 17, 640, 3, 999)
+# vLLM's EP + DP steps on one engine: padded decode (fixed-slot), uneven prefill
+# (compact), idle ranks' dummy batches (0 or 1 token) beside a busy rank or alone.
+DP_STEPS = (
+    64,
+    (1000, 300, 0, 300, 280, 0, 310, 1),
+    (100, 1, 0, 1, 0, 1, 0, 1),
+    (1, 0, 0, 0, 1, 0, 0, 0),
+    (0, 0, 0, 0, 0, 0, 0, 1024),
+    128,
+)
 CASES = {
     "fixed M=1": ("fixed", 1, "forward", {}),
     "fixed M=7": ("fixed", 7, "forward", {}),
@@ -69,6 +83,12 @@ CASES = {
     "engine uneven": ("compact", (UNEVEN, UNEVEN_COMPACT), "engine", {}),
     "engine shared M=1, 100, 1000": ("shared", (1, 100, 1000), "engine", {}),
     "engine M=50 masked tail": ("compact", (50,), "engine", {"mask": 3}),
+    "engine DP steps": ("compact", DP_STEPS, "engine", {}),
+    "engine graph M=1, 16, 128": ("compact", (1, 16, 128), "engine", {"graph": True}),
+    "engine graph M=256, 1024": ("compact", (256, 1024), "engine", {"graph": True}),
+    "engine shared graph M=64": ("shared", (64,), "engine", {"graph": True}),
+    "engine plan disagreement": ("compact", None, "disagree", {}),
+    "engine output lifetime": ("compact", 100, "lifetime", {}),
     "memory routed": ("compact", None, "memory", {}),
     "memory shared": ("shared", None, "memory", {}),
     "memory routed a4w4": ("compact", None, "memory", {"quant": "a4w4"}),
@@ -268,7 +288,7 @@ def _run(session, mode, fn, graph=False):
 
     t = session.t
     recorder = session.recorder
-    launches = []
+    launches, logs = [], []
     with moev2_mode(mode):
         try:
             if graph:
@@ -398,15 +418,26 @@ def _hook_case(session, name, instance, tokens, variant, opts):
 
 
 def _engine(session, shared, mask=None, quant="a8w4"):
+    """The engine of this kind, created, prepared and captured once."""
+    key = ("shared" if shared else "routed", mask, quant)
+    if key in session.engines:
+        return session.engines[key]
+    engine = _new_engine(session, shared, mask, quant)
+    with _allocations() as allocated:
+        engine.prepare()
+    session.allocated[key] = allocated
+    engine.capture()
+    session.engines[key] = engine
+    return engine
+
+
+def _new_engine(session, shared, mask, quant="a8w4"):
     import torch.distributed as dist
 
     from aiter.moev2 import engine as eng
     from aiter.moev2.migration.mega_moe_v2 import MegaMoEV2Template
     from aiter.moev2.problem import ParallelSpec
 
-    key = ("shared" if shared else "routed", mask, quant)
-    if key in session.engines:
-        return session.engines[key]
     net = session.net
     w1, w1_scale, w2, w2_scale = session.layers["shared_a" if shared else "a"]
     template = MegaMoEV2Template(
@@ -430,19 +461,13 @@ def _engine(session, shared, mask=None, quant="a8w4"):
         max_tokens_per_rank=1024,
         experts_per_rank=net["experts"] // WORLD + int(shared),
     )
-    engine = eng.MoeEngine.create(
+    return eng.MoeEngine.create(
         template,
         max_tokens=1024,
         capture_max_tokens=1024,
         parallel=parallel,
         comm=dist.group.WORLD,
     )
-    with _allocations() as allocated:
-        engine.prepare()
-    session.allocated[key] = allocated
-    engine.capture()
-    session.engines[key] = engine
-    return engine
 
 
 @contextlib.contextmanager
@@ -476,6 +501,86 @@ def _allocations():
         result["need"] = MemoryNeed(
             device=requested() - before, symmetric=sum(symmetric)
         )
+
+
+def _disagree_case(session, name):
+    import torch.distributed as dist
+
+    from aiter.moev2 import engine as eng
+
+    with _allocations() as allocated:
+        try:
+            engine = _new_engine(session, False, True if session.rank == 1 else None)
+            engine.prepare()
+            outcome = "prepared"
+        except eng.PlanDisagreement as exc:
+            outcome = f"PlanDisagreement: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            outcome = f"{type(exc).__name__}: {exc}"
+    outcomes = [None] * dist.get_world_size()
+    dist.all_gather_object(outcomes, outcome)
+    wrong = [
+        f"rank {r}: {o[:200]}"
+        for r, o in enumerate(outcomes)
+        if not o.startswith("PlanDisagreement")
+    ]
+    if wrong:
+        return f"{name}: " + "; ".join(wrong)
+    if allocated["need"].symmetric:
+        return f"{name}: {allocated['need'].symmetric} symmetric bytes allocated"
+    return f"note: {outcome[:160]}"
+
+
+def _lifetime_case(session, name, tokens):
+    import torch
+
+    from aiter.moev2 import engine as eng
+
+    try:
+        engine = _engine(session, False)
+    except Exception as exc:  # noqa: BLE001
+        return f"{name}: engine: {type(exc).__name__}: {exc}"
+    net = session.net
+    topk, experts = net["topk"], net["experts"]
+    first = _inputs(session, tokens, topk, experts, seed=SEED)
+    second = _inputs(session, tokens, topk, experts, seed=SEED + 1)
+    w1, w1_scale, w2, w2_scale = session.layers["a"]
+    weights = eng.MoeWeights(w1, w2, w1_scale, w2_scale)
+    step = eng.StepInfo(max_tokens_across_ranks=tokens)
+
+    def forward(route, out=None):
+        x, w, ids = route
+        return engine.forward(x, ids, w, weights=weights, step=step, out=out)
+
+    def fresh():
+        return torch.empty(
+            tokens, net["model_dim"], dtype=torch.bfloat16, device=session.device
+        )
+
+    out = fresh()
+    kept = forward(first, out=out)
+    torch.cuda.synchronize()
+    want = out.clone()
+    view = forward(second)
+    torch.cuda.synchronize()
+    second_result = view.clone()
+    again = forward(first)
+    torch.cuda.synchronize()
+    if kept is not out or not torch.equal(out, want):
+        return f"{name}: the out= result changed at the next forward"
+    if again.data_ptr() != view.data_ptr():
+        return f"{name}: a result without out= is not the view the next forward writes"
+    if torch.equal(second_result, want):
+        return f"{name}: other inputs gave the same output"
+    rewritten = view.cpu()
+    noise = forward(first, out=fresh()).cpu()
+    try:
+        note = _compare(
+            f"{name} (the view after the next forward)", want.cpu(), noise, rewritten
+        )
+    except AssertionError as exc:
+        return str(exc)
+    return f"note: {note}" if note else None
 
 
 def _memory_case(session, name, instance, quant):
@@ -549,10 +654,11 @@ def _engine_case(session, name, instance, counts, opts):
             v2 = functools.partial(
                 _engine_forward, engine, eng, layer_weights, route, agreed
             )
+            graph = bool(opts.get("graph"))
             _run(session, "off", legacy)
-            ref, _, _ = _run(session, "off", legacy)
-            ref2, _, _ = _run(session, "off", legacy)
-            out, _, _ = _run(session, "off", v2)
+            ref, _, _ = _run(session, "off", legacy, graph)
+            ref2, _, _ = _run(session, "off", legacy, graph)
+            out, _, _ = _run(session, "off", v2, graph)
             label = f"{name} layer {layer} M={local} (agreed {agreed})"
             if isinstance(ref, str) or isinstance(out, str):
                 if ref != out:
@@ -568,13 +674,23 @@ def _engine_case(session, name, instance, counts, opts):
     return f"note: {'; '.join(notes)}" if notes else None
 
 
+def _weights_of(mega):
+    """The weights a legacy instance launches with (vLLM rebinds them per layer)."""
+    return mega._s1_w1, mega._s1_w1_scale, mega.w2, mega.w2_scale
+
+
 def _vllm_forward(runtime, layer_weights, route, shared, mask):
     """vLLM's use of the class: the shared route (`shared`: rank and routed experts per
-    rank, or None), the private weight rebind, then the forward."""
+    rank, or None), the private weight rebind (its parameters are uint8), then the
+    forward."""
+    import torch
+
     x, w, d = route
     if shared is not None:
         w, d = _shared_route_reference(w, d, *shared)
-    runtime._s1_w1, runtime._s1_w1_scale, runtime.w2, runtime.w2_scale = layer_weights
+    runtime._s1_w1, runtime._s1_w1_scale, runtime.w2, runtime.w2_scale = (
+        w.view(torch.uint8) for w in layer_weights
+    )
     return runtime.forward(x.contiguous(), w, d, mask_invalid_slots=mask)
 
 
@@ -597,8 +713,17 @@ def run_case(session, name):
         return f"note: skipped, no {instance} instance at EP{WORLD}"
     if variant == "memory":
         return _memory_case(session, name, instance, opts.get("quant", "a8w4"))
+    if variant == "disagree":
+        return _disagree_case(session, name)
+    if variant == "lifetime":
+        return _lifetime_case(session, name, tokens)
     if variant == "engine":
-        return _engine_case(session, name, instance, tokens, opts)
+        bound = {k: _weights_of(m) for k, m in session.instances.items()}
+        try:
+            return _engine_case(session, name, instance, tokens, opts)
+        finally:
+            for k, m in session.instances.items():
+                m._s1_w1, m._s1_w1_scale, m.w2, m.w2_scale = bound[k]
     return _hook_case(session, name, instance, tokens, variant, opts)
 
 

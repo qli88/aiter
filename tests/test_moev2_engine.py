@@ -25,11 +25,12 @@ from aiter.moev2.engine import (
     PlanSource,
     StepInfo,
 )
+from aiter.moev2.problem import ParallelSpec
 from aiter.moev2.segments.base import MemoryNeed, Segment
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-_EP = types.SimpleNamespace(world_size=1)
+_EP = types.SimpleNamespace(world_size=1, input_replication=1)
 
 
 class _Stateful(Segment):
@@ -395,7 +396,7 @@ def _coordinator_worker(rank, init_file, budgets, results):
         e = MoeEngine.create(
             _Source(stateful=(segment,)),
             max_tokens=8,
-            parallel=types.SimpleNamespace(world_size=2),
+            parallel=types.SimpleNamespace(world_size=2, input_replication=1),
             comm=coordinator,
             memory_budget=budgets[rank],
         )
@@ -438,7 +439,7 @@ def _agreement_worker(rank, init_file, tags, results):
         e = MoeEngine.create(
             _Source(tags[rank]),
             max_tokens=8,
-            parallel=types.SimpleNamespace(world_size=2),
+            parallel=types.SimpleNamespace(world_size=2, input_replication=1),
             comm=dist.group.WORLD,
         )
         try:
@@ -503,7 +504,7 @@ def _prepare_failure_worker(rank, init_file, results):
         e = MoeEngine.create(
             _Source(stateful=(before, failing, after)),
             max_tokens=8,
-            parallel=types.SimpleNamespace(world_size=2),
+            parallel=types.SimpleNamespace(world_size=2, input_replication=1),
             comm=dist.group.WORLD,
         )
         try:
@@ -594,6 +595,12 @@ def test_local_template_serves_no_parallel_spec():
         MoeEngine.create(
             LocalTemplate(_meta_weights(), topk=2), max_tokens=8, parallel=_EP
         )
+
+
+def test_replicated_input_is_refused():
+    parallel = ParallelSpec("ep", 2, "a2a", "mega_moe_v2", 64, 4, input_replication=2)
+    with pytest.raises(ValueError, match="input_replication=2: no plan"):
+        MoeEngine.create(_Source(), max_tokens=8, parallel=parallel)
 
 
 def test_local_template_splits_a_bucket_at_an_activation_bound(monkeypatch):

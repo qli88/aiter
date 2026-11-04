@@ -264,7 +264,9 @@ class MoeEngine:
         `parallel`: the problem's `ParallelSpec` (None: local); EP and TP need `comm`, the
         group the plans run on and agree over: a torch process group, or an aiter
         `GroupCoordinator` (the engine agrees over its gloo `cpu_group` and takes its
-        `device` when `device` is None; the segments get the coordinator).
+        `device` when `device` is None; the segments get the coordinator). Its
+        `input_replication` must be 1: with TP inside each DP group, the caller splits
+        the group's tokens first (vLLM's sequence-parallel MoE).
         `memory_budget`: bytes per rank the stateful segments may use (device and
         symmetric heap together); `prepare()` raises `MemoryBudgetExceeded` above
         it. `max_tokens`: the largest token count
@@ -276,6 +278,13 @@ class MoeEngine:
             raise ValueError(
                 f"{type(template).__name__} plans run no communication; it serves "
                 "engines without a ParallelSpec"
+            )
+        if parallel is not None and parallel.input_replication != 1:
+            raise ValueError(
+                f"ParallelSpec.input_replication={parallel.input_replication}: no plan "
+                "takes groups of ranks holding the same tokens (TP inside each DP "
+                "group); split those tokens first (each rank passes its own rows, as "
+                "vLLM's sequence-parallel MoE) and pass 1"
             )
         if parallel is not None and comm is None:
             raise ValueError("a ParallelSpec needs the group it runs on: pass comm=")
