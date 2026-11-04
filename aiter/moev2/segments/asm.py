@@ -424,7 +424,10 @@ class AsmFmoe1Stage(Segment):
 
     def reads(self, p):
         # The plain sort, or the FLAT pass-through for FLAT rows.
-        return (Buf("sorted", None, frozenset({"default", "unsorted"})), CALL_INPUT)
+        return (
+            Buf("sorted", None, rows=frozenset({"expert_sorted", "flat"})),
+            CALL_INPUT,
+        )
 
     def produces(self, p, params):
         return Buf("out", ScaleSpec(p.out_dtype))

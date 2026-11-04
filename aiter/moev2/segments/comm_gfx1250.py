@@ -43,8 +43,8 @@ def _mega():
 
 
 def token_layout(stage1_fused: bool) -> str:
-    """Boundary A's layout: rows grouped per expert by the compact plan, or one row per
-    received token."""
+    """The `layout` structure parameter: boundary A's rows grouped per expert by the
+    compact plan, or one per received token (`Buf` rows `received`)."""
     return "compact_plan" if stage1_fused else "token_major"
 
 
@@ -166,7 +166,8 @@ class CommDispatchGfx1250(Segment):
         return (CALL_INPUT,)
 
     def produces(self, p, params):
-        return Buf("tokens", WIRE_FORMATS[params.dispatch_wire], layout=params.layout)
+        rows = "received" if params.layout == "token_major" else params.layout
+        return Buf("tokens", WIRE_FORMATS[params.dispatch_wire], rows=rows)
 
     def build(self, p, params):
         return self.dispatch

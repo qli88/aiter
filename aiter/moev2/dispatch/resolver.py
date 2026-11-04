@@ -65,8 +65,9 @@ def feasible_plans(problem, segments):
 
     In a plan, every `Buf` a segment reads matches the last one of that kind produced
     before it. No kernel is chosen yet: a format the kernel fixes is None (any) here,
-    and `plan_mismatch` checks it once the kernels are chosen. A segment that fits the chain but in no plan, because of its boundaries,
-    is in `rejected` with the first mismatch found.
+    and `plan_mismatch` checks it once the kernels are chosen. A segment that fits the
+    chain but in no plan, because of its boundaries, is in `rejected` with the first
+    mismatch found. Raises if a usable segment's `produces` is not `Buf.concrete`.
     """
     ops = chain(problem)
     rejected = {}
@@ -79,6 +80,9 @@ def feasible_plans(problem, segments):
             rejected[segment.name] = reason
     reads = {s.name: s.reads(problem) for s in usable}
     produced = {s.name: s.produces(problem, Params()) for s in usable}
+    for name, out in produced.items():
+        if not out.concrete:
+            raise ValueError(f"{name} produces {out}: one value per field")
     mismatches = {}
     placed = set()
 

@@ -640,7 +640,7 @@ class SortAux(Sort):
     name = "sort.aux"
 
     def produces(self, p, params):
-        return Buf("sorted", None, "aux_sorted", block_m=params.get("block_m"))
+        return Buf("sorted", None, rows="aux_sorted", block_m=params.get("block_m"))
 
     def run(
         self,
@@ -685,7 +685,7 @@ class SortFlat(Sort):
     flat = True
 
     def produces(self, p, params):
-        return Buf("sorted", None, "unsorted", block_m=params.get("block_m"))
+        return Buf("sorted", None, rows="flat", block_m=params.get("block_m"))
 
     def run(
         self,

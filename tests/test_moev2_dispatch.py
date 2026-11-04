@@ -215,6 +215,60 @@ def test_op_chain_and_buffers():
         buf.Buf("bogus", ScaleSpec(dtypes.fp8))
 
 
+def test_buf_fields_come_from_declared_sets():
+    import numpy as np
+
+    Buf, CALL_INPUT = buf.Buf, buf.CALL_INPUT
+    assert Buf("sorted", None).rows == "expert_sorted"
+    assert Buf("inter", None).rows == "token_major"
+    for bad in (
+        {"rows": "v2_sorted"},
+        {"rows": "flat"},  # a sort's row order, not an intermediate's
+        {"rows": frozenset({"token_major", "typo"})},
+        {"rows": frozenset()},
+        {"rows": ["token_major"]},
+        {"scales": "shuffled"},
+        {"pad": -1},
+        {"pad": True},
+    ):
+        with pytest.raises(ValueError):
+            Buf("inter", None, **bad)
+    v2 = Buf("inter", None, rows="expert_sorted", scales="v2")
+    mxmoe = dataclasses.replace(v2, scales="mxmoe")
+    assert v2.concrete and not Buf("sorted", None, rows=None).concrete
+    assert str(v2) == "inter:expert_sorted:scales=v2"
+    assert v2.mismatch(mxmoe) == (
+        "reads inter:expert_sorted:scales=v2, gets inter:expert_sorted:scales=mxmoe"
+    )
+    assert Buf("inter", None, rows="expert_sorted", scales=None).mismatch(mxmoe) is None
+    assert Buf("inter", None).mismatch(v2) is not None
+    assert (
+        Buf("inter", None, pad=None).mismatch(dataclasses.replace(v2, pad=64))
+        is not None
+    )
+    assert Buf("inter", None, pad=None).mismatch(Buf("inter", None, pad=64)) is None
+    assert Buf("inter", None).mismatch(Buf("inter", None, pad=64)) is not None
+    assert Buf("inter", None, pad=np.int64(8)).pad == 8
+    either = Buf("inter", None, rows="expert_sorted", scales=frozenset({"v2", "mxmoe"}))
+    assert either.mismatch(mxmoe) is None and either.mismatch(v2) is None
+    # A dispatch's received tokens are not the caller's.
+    assert CALL_INPUT.mismatch(Buf("tokens", None, rows="received")) is not None
+    with pytest.raises(ValueError, match="open field"):
+        plan.MoePlan((), "default", boundaries=(Buf("sorted", None, rows=None),))
+
+    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.segments.sort import Sort
+
+    class AnyRowsSort(Sort):
+        name = "sort.any"
+
+        def produces(self, p, params):
+            return Buf("sorted", None, rows=None)
+
+    with pytest.raises(ValueError, match="sort.any produces sorted:any rows"):
+        resolver.feasible_plans(_problem(), a8w8_pt.SEGMENTS + (AnyRowsSort(),))
+
+
 def test_params_and_frozen_map():
     p = Params(kernel="k", ksplit=0)
     assert p.kernel == "k" and p.replace(ksplit=2).ksplit == 2 and p.ksplit == 0
@@ -282,7 +336,7 @@ def test_a_segment_reads_the_last_buffer_of_each_kind_before_it():
     from aiter.moev2.segments.ck import CkGemm1, CkGemm2
     from aiter.moev2.segments.sort import Sort
 
-    aux = Buf("sorted", None, layout="aux_sorted")
+    aux = Buf("sorted", None, rows="aux_sorted")
 
     class AuxSort(Sort):
         name = "sort.aux"

@@ -42,6 +42,8 @@ class MoePlan:
         for b in self.boundaries:
             if not isinstance(b, Buf):
                 raise TypeError(f"boundary {b!r} is not a Buf")
+            if not b.concrete:
+                raise ValueError(f"boundary {b} has an open field")
 
     def structure(self) -> StructureKey:
         return (

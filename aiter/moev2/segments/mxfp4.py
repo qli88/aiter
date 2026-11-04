@@ -3,7 +3,7 @@
 """Segments of the MXFP4 (`per_1x32` fp4) FlyDSL kernels: FlyDSL 2-stage and MXMOE.
 
 Which buffers a stage writes depends on its kernel name (a fused fp4 output, the v2
-sorted layout of a layout GEMM2, the MXMOE layout), so each kind is its own segment and
+scales of a layout GEMM2, the MXMOE scales), so each kind is its own segment and
 the boundary check keeps the legacy pairings: a FlyDSL stage 1 is followed by
 `quant.inter` (`flydsl.gemm1`) or writes the fp4 intermediate itself
 (`flydsl.gemm1_q`, `flydsl.gemm1_layout`); a layout GEMM2 with the scatter epilog and
@@ -488,12 +488,17 @@ class FlydslGemm1Layout(_FlydslStage1):
 
     def reads(self, p):
         return (
-            Buf("sorted", None, frozenset({"default", "aux_sorted"})),
+            Buf("sorted", None, rows=frozenset({"expert_sorted", "aux_sorted"})),
             Buf("tokens", p.act_in),
         )
 
     def produces(self, p, params):
-        return Buf("inter", layout_gemm2_inter(params.get("kernel2")), "v2_sorted")
+        return Buf(
+            "inter",
+            layout_gemm2_inter(params.get("kernel2")),
+            rows="expert_sorted",
+            scales="v2",
+        )
 
     def build(self, p, params):
         stage1 = super().build(p, params)
@@ -577,7 +582,10 @@ class FlydslLayoutGemm2(Segment):
         return cfg is not None and (cfg["epilog"] == "scatter") == self.scatter
 
     def reads(self, p):
-        return (Buf("sorted", None), Buf("inter", None, "v2_sorted"))
+        return (
+            Buf("sorted", None),
+            Buf("inter", None, rows="expert_sorted", scales="v2"),
+        )
 
     def reads_with(self, p, params):
         return layout_gemm2_reads(self.reads(p), params.get("kernel"))
@@ -630,7 +638,10 @@ class FlydslLayoutGemm2Scatter(FlydslLayoutGemm2):
     scatter = True
 
     def reads(self, p):
-        return (Buf("sorted", None, "aux_sorted"), Buf("inter", None, "v2_sorted"))
+        return (
+            Buf("sorted", None, rows="aux_sorted"),
+            Buf("inter", None, rows="expert_sorted", scales="v2"),
+        )
 
 
 class MxmoeGemm1(Segment):
@@ -653,12 +664,12 @@ class MxmoeGemm1(Segment):
         )
 
     def reads(self, p):
-        return (Buf("sorted", None, "aux_sorted"), Buf("tokens", None))
+        return (Buf("sorted", None, rows="aux_sorted"), Buf("tokens", None))
 
     def produces(self, p, params):
         kernel = params.get("kernel")
         fmt = mx_inter(_parse_mxfp4_g1_kname(kernel)["out_dtype"]) if kernel else None
-        return Buf("inter", fmt, "mxmoe_sorted")
+        return Buf("inter", fmt, rows="expert_sorted", scales="mxmoe")
 
     def check_row(self, p, row, kernel_name1=""):
         return mxfp4_row_rejection(p, row)
@@ -719,7 +730,10 @@ class MxmoeGemm2(Segment):
         )
 
     def reads(self, p):
-        return (Buf("sorted", None, "aux_sorted"), Buf("inter", None, "mxmoe_sorted"))
+        return (
+            Buf("sorted", None, rows="aux_sorted"),
+            Buf("inter", None, rows="expert_sorted", scales="mxmoe"),
+        )
 
     def reads_with(self, p, params):
         return layout_gemm2_reads(self.reads(p), params.get("kernel"))

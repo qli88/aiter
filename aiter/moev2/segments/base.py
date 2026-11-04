@@ -273,8 +273,8 @@ class Segment:
 
     def reads(self, p: MoeProblem) -> tuple:
         """The boundary `Buf`s this segment reads, each from the last segment before it
-        that produced that kind. `fmt=None` reads any format, `block_m=None` any
-        block_m."""
+        that produced that kind. None in a field but `kind` reads any value; a frozenset
+        of `rows` or `scales`, any of those."""
         raise NotImplementedError(self.name)
 
     def reads_with(self, p: MoeProblem, params: Params) -> tuple:
@@ -283,8 +283,9 @@ class Segment:
         return self.reads(p)
 
     def produces(self, p: MoeProblem, params: Params):
-        """The `Buf` this segment hands to the next one (`params` empty before the
-        kernels are chosen: a format the kernel fixes is then None, any)."""
+        """The `Buf` this segment hands to the next one, with one `rows`, `scales` and
+        `pad` value (`params` empty before the kernels are chosen: a format the kernel
+        fixes is then None, any)."""
         raise NotImplementedError(self.name)
 
     def check_row(self, p: MoeProblem, row, kernel_name1="") -> RowRejection | None:

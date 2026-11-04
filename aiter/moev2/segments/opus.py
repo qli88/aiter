@@ -95,12 +95,17 @@ class OpusGemm1Layout(_OpusStage1):
 
     def reads(self, p):
         return (
-            Buf("sorted", None, frozenset({"default", "aux_sorted"})),
+            Buf("sorted", None, rows=frozenset({"expert_sorted", "aux_sorted"})),
             Buf("tokens", p.act_in),
         )
 
     def produces(self, p, params):
-        return Buf("inter", layout_gemm2_inter(params.get("kernel2")), "v2_sorted")
+        return Buf(
+            "inter",
+            layout_gemm2_inter(params.get("kernel2")),
+            rows="expert_sorted",
+            scales="v2",
+        )
 
     def build(self, p, params):
         stage1 = super().build(p, params)

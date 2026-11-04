@@ -29,9 +29,9 @@ COMBINE_FORMATS = {
     "mxfp8": mxfp8(),
     "mxfp4": mxfp4(),
 }
-# The layouts of the dispatched tokens it reads: one row per received token, or the
-# rows grouped per expert by the compact plan (`stage1_fused`).
-TOKEN_LAYOUTS = frozenset({"token_major", "compact_plan"})
+# The rows of the dispatched tokens it reads: one per received token, or grouped per
+# expert by the compact plan (`stage1_fused`).
+TOKEN_ROWS = frozenset({"received", "compact_plan"})
 
 ACTIVATIONS = (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
 # The weight dtypes it reads as MXFP4: ATOM's loader keeps the packed bytes as uint8.
@@ -129,7 +129,7 @@ class GroupedGfx1250(Segment):
 
     def reads(self, p):
         if self.p2p:
-            return (Buf("tokens", None, layout=TOKEN_LAYOUTS),)
+            return (Buf("tokens", None, rows=TOKEN_ROWS),)
         return (CALL_INPUT,)
 
     def produces(self, p, params):
