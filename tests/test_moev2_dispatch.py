@@ -2445,6 +2445,96 @@ def test_opus_param_space_follows_the_legacy_filters():
     assert gemm2.param_space(_a8w4(out=dtypes.fp16))
 
 
+def _fmoe_problem(
+    activation=ActivationType.Silu,
+    q=None,
+    quant=QuantType.per_Token,
+    doweight=False,
+    arch="gfx950",
+    out=dtypes.bf16,
+    g1u1=True,
+):
+    q = dtypes.fp8 if q is None else q
+    args = (64, 7168, 256, 256, 8, out, q, q, quant, g1u1, activation, doweight, 0, 0)
+    cu_num = 256 if arch == "gfx950" else 304
+    return MoeProblem.from_legacy_key(*args, arch=arch, cu_num=cu_num)
+
+
+def test_asm_1stage_param_space_reads_the_1stage_tables(monkeypatch, tmp_path):
+    import aiter.jit.core
+    from aiter.moev2.segments import asm
+
+    one_stage = asm.AsmFmoe1Stage()
+    space = one_stage.param_space(_fmoe_problem())
+    assert space and {p["block_m"] for p in space} == {32}
+    for p in space:
+        assert (
+            p["kernel"]
+            .split("aiter", 1)[1][2:]
+            .startswith("fmoe_bf16_pertokenFp8_g1u1_")
+        )
+        assert "tkw1" not in p["kernel"] and "multix" not in p["kernel"]
+        assert 256 % int(p["kernel"].rsplit("x", 1)[1][:-1]) == 0
+        assert p["xbf16"] is False and p["flat"] == 0
+    tkw1 = one_stage.param_space(_fmoe_problem(doweight=True))
+    assert tkw1 and all("_tkw1_" in p["kernel"] for p in tkw1)
+    blockscale = one_stage.param_space(_fmoe_problem(quant=QuantType.per_1x128))
+    assert {p["xbf16"] for p in blockscale} == {False, True}
+    for p in blockscale:
+        table = "blockscaleBf16" if p["xbf16"] else "blockscaleFp8"
+        assert f"fmoe_bf16_{table}_g1u1_" in p["kernel"]
+    assert {p["flat"] for p in blockscale} > {0}
+    monkeypatch.setattr(aiter.jit.core, "AITER_ASM_DIR", str(tmp_path))
+    assert one_stage.param_space(_fmoe_problem()) == ()
+
+
+def test_asm_1stage_runs_the_formats_only_a_tuned_row_reaches(monkeypatch):
+    from aiter.moev2.dispatch import ranking
+    from aiter.moev2.migration import a8w8_blockscale, a8w8_ptok
+    from aiter.moev2.segments import asm
+
+    one_stage, default_1stage = asm.AsmFmoe1Stage(), ranking.PREDICATES["fmoe_1stage"]
+    for arch, keys in asm.FMOE_1STAGE_TUNED_KEYS.items():
+        for activation, quant, out, q, _q_w, g1u1, doweight in keys:
+            q = dtypes.fp8 if q == "fp8" else q
+            p = _fmoe_problem(activation, q, quant, doweight, arch, out, g1u1)
+            segments = (
+                a8w8_blockscale if quant == QuantType.per_1x128 else a8w8_ptok
+            ).SEGMENTS
+            assert one_stage.accepts(p) and not default_1stage(p), (arch, p)
+            monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+            res = resolver.resolve(p, segments)
+            assert "asm.fmoe_1stage" not in res.plan.structure()[0], (arch, p)
+            params = one_stage.param_space(p)[0]
+            row = {
+                **_ROW_1STAGE,
+                "block_m": params["block_m"],
+                "kernelName1": params["kernel"],
+                "xbf16": int(params.get("xbf16", False)),
+                "flat": float(params.get("flat", 0)),
+            }
+            monkeypatch.setattr(tuned, "lookup", lambda problem, row=row: row)
+            res = resolver.resolve(p, segments)
+            assert res.plan.structure()[0][-1] == "asm.fmoe_1stage", (arch, p)
+            assert res.metadata.stage1.keywords["kernelName"] == params["kernel"]
+    assert default_1stage(_fmoe_problem(doweight=True))
+
+
+def test_asm_1stage_param_space_lists_none_where_no_tuned_row_runs():
+    from aiter.moev2.segments import asm
+
+    one_stage = asm.AsmFmoe1Stage()
+    for p in (
+        _fmoe_problem(q=dtypes.i8, doweight=True),
+        _fmoe_problem(out=dtypes.fp16),
+        _fmoe_problem(g1u1=False),
+        _fmoe_problem(quant=QuantType.per_Tensor),
+        _fmoe_problem(ActivationType.Gelu, quant=QuantType.per_1x128, arch="gfx1201"),
+        _mx_problem(dtypes.fp4x2, dtypes.fp4x2),
+    ):
+        assert one_stage.param_space(p) == ()
+
+
 def test_opus_param_space_lists_a8w4_on_gfx950_only():
     from aiter.moev2.segments import opus
 

@@ -23,7 +23,9 @@ on a gfx950 too. ASM and FlyDSL rows are not copied: their gfx942 configs give g
 gfx950 (legacy and v2 alike). For a8w8_blockscale, whose shipped ASM stage-1 rows are
 gfx942 only, the arch's own CK rows are also added with stage 1 swapped for the arch's
 ASM kernel of the same tile M (when it ships one), so that branch runs too; for a8w8_pt,
-the gfx942 int8 rows whose ASM kernel the arch ships are copied as well.
+the gfx942 int8 rows whose ASM kernel the arch ships are copied as well; for a8w8_ptok,
+1-stage rows are added for the formats only a tuned row runs on the arch
+(`asm.FMOE_1STAGE_TUNED_KEYS`).
 
 A case that does not fit in the free GPU memory is reported as skipped and fails the run
 (it was not compared); one that raises the same error on legacy and v2 passes, with the
@@ -647,6 +649,8 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
         extra = _asm_blockscale_rows(df, gfx, cu_num)
     elif path_name == "a8w8_pt":
         extra = _asm_int8_rows(df, gfx, cu_num)
+    elif path_name == "a8w8_ptok":
+        extra = _asm_1stage_rows(df, gfx, cu_num)
     sample = pd.concat([extra, sample])
     table = pd.concat([extra, own, src]).drop_duplicates(_KEY_COLUMNS)
     cases = []
@@ -721,6 +725,54 @@ def _asm_int8_rows(df, gfx, cu_num):
     ].copy()
     rows["gfx"], rows["cu_num"] = gfx, cu_num
     return rows
+
+
+_1STAGE_SHAPES = ((32, 4096, 512, 64, 8), (256, 7168, 256, 256, 8))
+
+
+def _asm_1stage_rows(df, gfx, cu_num):
+    """Per-token 1-stage rows for the formats only a tuned row runs on the arch
+    (`asm.FMOE_1STAGE_TUNED_KEYS`; no shipped table has them): a persistent kernel of
+    the format's table at each of `_1STAGE_SHAPES`, the smallest `subGU_n` at the first,
+    the largest at the second (the non-persistent 32x128 fp8 kernels give wrong results,
+    todo 5.54)."""
+    import pandas as pd
+    import torch
+
+    from aiter import QuantType
+    from aiter.moev2.segments import asm
+
+    fp8 = "torch.float8_e4m3fn" if gfx == "gfx950" else "torch.float8_e4m3fnuz"
+    rows = []
+    for key in sorted(asm.FMOE_1STAGE_TUNED_KEYS.get(gfx, ()), key=str):
+        act, q_type, _out, q_a, _q_w, _g1u1, doweight = key
+        if q_type != QuantType.per_Token:
+            continue
+        int8 = q_a == torch.int8
+        name = act.name.lower()
+        table = (
+            _REPO / "hsa" / gfx / "fmoe" / name
+            / f"fmoe_bf16_pertoken{'Int8' if int8 else 'Fp8'}_g1u1_{name}"
+            f"{'_tkw1' if doweight else ''}.csv"
+        )  # fmt: skip
+        kernels = pd.read_csv(table)
+        kernels = kernels[(kernels["ps"] == 1) & (kernels["smf"] == 0)]
+        for i, (token, model_dim, inter_dim, expert, topk) in enumerate(_1STAGE_SHAPES):
+            fits = kernels[inter_dim % kernels["subGU_n"] == 0].sort_values("subGU_n")
+            row = dict.fromkeys(df.columns)
+            row.update(
+                gfx=gfx, cu_num=cu_num, token=token, model_dim=model_dim,
+                inter_dim=inter_dim, expert=expert, topk=topk,
+                act_type=f"ActivationType.{act.name}", dtype="torch.bfloat16",
+                q_dtype_a="torch.int8" if int8 else fp8,
+                q_dtype_w="torch.int8" if int8 else fp8,
+                q_type="QuantType.per_Token", use_g1u1=1,
+                doweight_stage1=int(doweight), block_m=32, ksplit=0,
+                kernelName1=fits["knl_name"].iloc[0 if i == 0 else -1], kernelName2="Null",
+                run_1stage=1, xbf16=0, flat=0, nt=0,
+            )  # fmt: skip
+            rows.append({k: v for k, v in row.items() if k in df.columns})
+    return pd.DataFrame(rows, columns=df.columns)
 
 
 def cases(path_name, synth_cases=()):

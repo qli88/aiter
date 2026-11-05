@@ -417,14 +417,47 @@ class AsmStage1Cktile(AsmStage1):
         return ()
 
 
-def fmoe_1stage_caps():
-    """One `Cap` per key of the legacy `fused_moe_1stage_dict`: the formats 1-stage
-    `fmoe` runs, on the arch that lists them."""
-    from ..dispatch.ranking import fmoe_1stage_keys
+# fmt: off
+# The formats a tuned 1-stage row runs beyond the keys of the legacy
+# `fused_moe_1stage_dict` (`ranking.FMOE_1STAGE_KEYS`), which only gate legacy's untuned
+# default: legacy's tuner times these kernel tables and legacy dispatch runs the row
+# without the dict. Same key layout; `_F8` stands for the arch's fp8.
+_S, _G = ActivationType.Silu, ActivationType.Gelu
+_TOK, _1X128 = QuantType.per_Token, QuantType.per_1x128
+_F8 = "fp8"
+_BF, _I8 = dtypes.bf16, dtypes.i8
+FMOE_1STAGE_TUNED_KEYS = {
+    "gfx942": frozenset({
+        (_G, _1X128, _BF, _F8, _F8, True, False),
+        (_S, _TOK,   _BF, _F8, _F8, True, True),
+        (_G, _TOK,   _BF, _F8, _F8, True, True),
+    }),
+    "gfx950": frozenset({
+        (_G, _TOK,   _BF, _F8, _F8, True, True),
+        (_S, _TOK,   _BF, _I8, _I8, True, False),
+        (_G, _TOK,   _BF, _I8, _I8, True, False),
+    }),
+}
+# fmt: on
 
+
+def fmoe_1stage_formats(arch):
+    """The formats 1-stage `fmoe` runs on `arch`: the `fused_moe_1stage_dict` keys and
+    `FMOE_1STAGE_TUNED_KEYS`."""
+    from ..dispatch import ranking
+
+    tuned = (
+        tuple(dtypes.fp8 if el is _F8 else el for el in key)
+        for key in FMOE_1STAGE_TUNED_KEYS.get(arch, ())
+    )
+    return ranking.fmoe_1stage_keys(arch) | frozenset(tuned)
+
+
+def fmoe_1stage_caps():
+    """One `Cap` per format of `fmoe_1stage_formats`, on the arch that lists it."""
     caps = []
     for arch in ("gfx942", "gfx950"):
-        for key in sorted(fmoe_1stage_keys(arch), key=str):
+        for key in sorted(fmoe_1stage_formats(arch), key=str):
             activation, quant_type, out_dtype, q_dtype_a, q_dtype_w, g1u1, doweight = (
                 key
             )
@@ -492,4 +525,65 @@ class AsmFmoe1Stage(Segment):
             quant_type=p.quant_type,
             xbf16=params.get("xbf16", False),
             flat=params.get("flat", 0),
+        )
+
+    def param_space(self, p):
+        """Legacy's `gen_1stage_asm_task`: the kernels of the 1-stage tables (`xbf16`:
+        the gfx950 `blockscaleBf16` table for 1x128 fp8), `block_m` their `subGU_m`,
+        `flat` from the table. A kernel whose `subGU_n` does not divide `inter_dim`, or
+        with `smf`, is left out."""
+        if not (
+            self.accepts(p)
+            and tunable(p)
+            and p.quant_type
+            not in (QuantType.No, QuantType.per_Tensor, QuantType.per_1x32)
+            and p.w1.dtype != torch.int4
+        ):
+            return ()
+        quant = {dtypes.i8: "Int8", dtypes.fp8: "Fp8"}.get(p.act_in.dtype, "")
+        blockscale = p.quant_type == QuantType.per_1x128
+        tables = [(("blockscale" if blockscale else "pertoken") + quant, False)]
+        if blockscale and p.act_in.dtype == dtypes.fp8 and p.arch == "gfx950":
+            tables.append(("blockscaleBf16", True))
+        return tuple(
+            Params(kernel=name, block_m=tile_m, xbf16=xbf16, flat=flat)
+            for quant_name, xbf16 in tables
+            for name, tile_m, tile_n, smf, flat in _fmoe_1stage_kernels(
+                _fmoe_1stage_table(p, quant_name)
+            )
+            if smf == 0 and p.shape.inter_dim % tile_n == 0
+        )
+
+
+def _fmoe_1stage_table(p, quant) -> str:
+    """The path of the 1-stage kernel table with quant part `quant` (`pertokenFp8`, ...)
+    that legacy's `gen_1stage_asm_task` reads for `p`: the bf16-output table, also for
+    fp16 output (todo 5.53)."""
+    from aiter.jit.core import AITER_ASM_DIR
+
+    act = {ActivationType.Silu: "silu", ActivationType.Gelu: "gelu"}.get(
+        p.activation.activation, ""
+    )
+    up = 1 if p.is_g1u1 else 0
+    tkw1 = "_tkw1" if "doweight_stage1" in p.features else ""
+    name = f"fmoe_bf16_{quant}_g1u{up}_{act}{tkw1}.csv"
+    return os.path.join(AITER_ASM_DIR, p.arch, "fmoe", act, name)
+
+
+@functools.cache
+def _fmoe_1stage_kernels(path):
+    """`(knl_name, subGU_m, subGU_n, smf, flat)` rows of a 1-stage kernel table; () when
+    the arch ships none."""
+    if not os.path.exists(path):
+        return ()
+    with open(path, newline="") as f:
+        return tuple(
+            (
+                row["knl_name"],
+                int(row["subGU_m"]),
+                int(row["subGU_n"]),
+                int(row["smf"]),
+                int(float(row.get("flat") or 0)),
+            )
+            for row in csv.DictReader(f)
         )

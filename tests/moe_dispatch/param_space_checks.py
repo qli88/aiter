@@ -20,7 +20,8 @@ goes through legacy dispatch itself (a one-row tuned table swapped into `fused_m
 `block_m` legacy ran (the alias row must run the same); where something else runs, it
 is a known difference v2 declines on purpose. Opus stage 1 candidates are listed once
 per legacy task: token-major output in `opus` (with stage 2), sorted output in
-`opus_sorted`.
+`opus_sorted`. A 1-stage candidate (`asm_1stage`) is `(asm_1stage[_xbf16], kernel,
+block_m, flat)`.
 
     python tests/moe_dispatch/param_space_checks.py --check [--arch gfx950]
 """
@@ -187,6 +188,14 @@ def _legacy_asm(tuner, info, call):
     }
 
 
+def _legacy_asm_1stage(tuner, info, call):
+    """`gen_1stage_asm_task`: `(asm_1stage[_xbf16], kernel, block_m, flat)`."""
+    return {
+        (tag[1], tag[2], tag[3], int(tag[4]))
+        for (tag, *_rest) in tuner.gen_1stage_asm_task(info)
+    }
+
+
 def _legacy_ck(tuner, info, call):
     if _is_a8w4(info):
         return set()  # the CK-Tile generator: family `cktile`
@@ -319,6 +328,7 @@ def _families():
             _legacy_asm,
             (asm.AsmStage1(), asm.AsmStage1Blockscale(), asm.AsmStage1Cktile()),
         ),
+        "asm_1stage": Family(_legacy_asm_1stage, (asm.AsmFmoe1Stage(),)),
         "ck": Family(_legacy_ck, (ck.CkGemm1(), ck.CkGemm2())),
         "cktile": Family(
             _legacy_cktile,
@@ -355,13 +365,23 @@ def _stage(segment):
     return "stage1" if Op.GEMM1 in segment.covers else "stage2"
 
 
+def _candidate(segment, params):
+    """The legacy tuner's tag for a v2 candidate: `(stage, kernel, block_m, nt)`, for a
+    1-stage segment `(asm_1stage[_xbf16], kernel, block_m, flat)`."""
+    from aiter.moev2.dispatch.ops import Op
+
+    kernel, block_m = params["kernel"], params["block_m"]
+    if segment.covers[0] <= Op.GEMM1 and segment.covers[1] >= Op.GEMM2:
+        stage = "asm_1stage_xbf16" if params.get("xbf16") else "asm_1stage"
+        return stage, kernel, block_m, int(params.get("flat", 0))
+    return _stage(segment), kernel, block_m, bool(params.get("nt", False))
+
+
 def v2_candidates(segments, problem):
     """`(candidates, twice)`: what `segments` list for `problem`, and what they list
     more than once."""
     listed = collections.Counter(
-        (_stage(s), params["kernel"], params["block_m"], bool(params.get("nt", False)))
-        for s in segments
-        for params in s.param_space(problem)
+        _candidate(s, params) for s in segments for params in s.param_space(problem)
     )
     return set(listed), {c for c, n in listed.items() if n > 1}
 
@@ -399,6 +419,12 @@ def known_difference(family, info, raised):
             and _ck_activation_unmapped(info)
         ):
             return Known(f"legacy raises: CK maps no {_activation(info)} (todo 5.46)")
+        if (
+            family == "asm_1stage"
+            and isinstance(raised, TypeError)
+            and gfx not in ("gfx942", "gfx950")
+        ):
+            return Known(f"legacy raises: no 1-stage table names on {gfx} (todo 5.52)")
         return None
     if gfx == "gfx1201":
         return Known("gfx1201: no v2 path (todo 1b.2)")
@@ -430,6 +456,11 @@ def known_difference(family, info, raised):
         return Known(
             "Opus stage 2 doweight: `opus.gemm2` leaves it out; its only legacy "
             "partner is FlyDSL stage 1 (todo 1e.7)"
+        )
+    if family == "asm_1stage" and q_w == torch.uint32:
+        return Known(
+            "int4 weights: legacy's 1-stage filter tests torch.int4, not uint32 "
+            "(todo 5.47)"
         )
     if family == "asm":
         if q_type == QuantType.per_1x32 and q_a in fp8 and q_w in fp8:
