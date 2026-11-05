@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from aiter import logger
 
 from ..execute.metadata import MOEMetadata
+from ..problem import GROUP_1X32
 from ..segments.asm import stage2_block_m
 from ..segments.base import NO_OPTIONS, Params
 from ..segments.defaults import (
@@ -27,6 +28,8 @@ from ..segments.defaults import (
     default_ksplit,
     use_nt,
 )
+from ..segments.mxfp4 import mx_token
+from ..segments.sort import AUX_SORT_OPUS
 from ..segments.whole_graph import FusedMoeImplResolutionError, resolve_fused_moe_impl
 from . import kernel_names, overrides, profile, ranking, tuned
 from .buf import CALL_INPUT
@@ -180,6 +183,29 @@ def plan_mismatch(problem, plan) -> str | None:
     return None
 
 
+def boundary_flags(plan) -> dict:
+    """The legacy `MOEMetadata` flags that keep a 2-stage plan's stages consistent,
+    from its boundaries: `output_aux` the sort's auxiliary outputs (rows
+    `aux_sorted`), `fuse_quant` the per-1x32 dtype ("fp4", "fp8") of an intermediate
+    stage 1 writes quantized itself, `skip_inter_quant` GEMM2 reading the v2 layout."""
+    flags = {}
+    for choice, buf in zip(plan.segments, plan.boundaries):
+        if buf.kind == "sorted" and buf.rows == "aux_sorted":
+            flags["output_aux"] = AUX_SORT_OPUS
+        if buf.kind != "inter":
+            continue
+        flags["skip_inter_quant"] = buf.scales == "v2"
+        first, last = choice.segment.covers
+        if (
+            first <= Op.GEMM1
+            and last == Op.QUANT_INTER
+            and buf.fmt is not None
+            and buf.fmt.group == GROUP_1X32
+        ):
+            flags["fuse_quant"] = mx_token(buf.fmt.dtype)
+    return flags
+
+
 def _owned_kernel(raw):
     """The parsed kernel name of a tuned cell, or a decline reason (str)."""
     if not isinstance(raw, str):
@@ -240,11 +266,21 @@ def match_row(plans, row):
     if isinstance(k2, str):
         return k2
     for structure in plans:
-        gemm1 = [s for s in structure if s.covers[0] == Op.GEMM1]
+        gemm1 = [s for s in structure if _covers(s, Op.GEMM1)]
         gemm2 = [s for s in structure if s.covers[0] == Op.GEMM2]
         if gemm1 and gemm2 and gemm1[0].owns(k1) and gemm2[0].owns(k2):
             return structure
     return f"no segments run kernelName1={k1}, kernelName2={k2}"
+
+
+def _covers(segment, op) -> bool:
+    return segment.covers[0] <= op <= segment.covers[1]
+
+
+def _gemm1(structure):
+    """The stage 1 of a 2-stage structure: it may start before GEMM1
+    (`mxmoe.quant_gemm1` quantizes its own input)."""
+    return next(s for s in structure if _covers(s, Op.GEMM1))
 
 
 def _one_stage(structure):
@@ -307,13 +343,13 @@ def _two_stage_plan(
 ):
     """The plan and its metadata, or the reason (str) its chosen kernels disagree
     (`plan_mismatch`). `row`: the tuned row the plan runs, None for a default."""
-    gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
+    gemm1 = _gemm1(structure)
     is_asm = kernel_names.ASM in gemm1.prefixes
     if is_asm:
         block_m = stage2_block_m(block_m)
     choices = []
     for segment in structure:
-        if segment.covers[0] == Op.GEMM1:
+        if segment is gemm1:
             params = Params(
                 options, kernel=kernelName1, kernel2=kernelName2, ksplit=ksplit, nt=nt
             )
@@ -335,7 +371,10 @@ def _two_stage_plan(
     reason = plan_mismatch(problem, plan)
     if reason is not None:
         return reason
-    stage1 = plan.starting(Op.GEMM1)
+    derived = fields.keys() & {"fuse_quant", "skip_inter_quant", "output_aux"}
+    assert not derived, f"metadata_fields sets {sorted(derived)}, which boundaries set"
+    fields.update(boundary_flags(plan))
+    stage1 = plan.covering(Op.GEMM1)
     stage2 = plan.starting(Op.GEMM2)
     metadata = MOEMetadata(
         stage1.segment.build(problem, stage1.params),
@@ -540,7 +579,7 @@ def resolve(problem, segments) -> Resolution:
         plan, metadata = built
         note(f"selected {plan.describe()}")
         return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))
-    gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
+    gemm1 = _gemm1(structure)
     gemm2 = next(s for s in structure if s.covers[0] == Op.GEMM2)
     kernelName2 = gemm2.stage2_kernel(problem, kernelName1, kernelName2)
     tag = f"({kernelName1=}, {kernelName2=})"

@@ -8,7 +8,7 @@ validation, buffers, kernel launches and benchmark hooks.
 """
 
 import functools
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 
@@ -47,7 +47,6 @@ from ..segments.mxmoe import _mxfp4_a4w4_stage1_fw, _mxfp4_a4w4_stage2_fw
 from ..segments.opus import _opus_stage2_fp8_enabled
 from ..segments.quant import quant_a1_mxfp4, quant_inter_mxfp4
 from ..segments.sort import (
-    AUX_SORT_OPUS,
     _fused_decode_sort_quant,
     _is_fused_decode_sort_quant_enabled,
 )
@@ -242,8 +241,9 @@ def run_two_stage(c: Call, metadata, plan, q_dtype_a, after_sort=None):
     if block_size_M is not None:
         block_size_M = int(block_size_M)
     sort = plan.segment("sort").segment
-    quant_a1 = plan.segment("quant.a1").segment
-    gemm1 = plan.starting(Op.GEMM1).segment
+    quant_a1 = plan.starting(Op.QUANT_A1).segment
+    gemm1 = plan.covering(Op.GEMM1).segment
+    assert quant_a1 is not gemm1, f"{gemm1.name} quantizes A1 outside run_mxfp4"
     # A stage 1 that also quantizes its output writes into its own buffer layout.
     fused_inter_quant = gemm1.covers[1] == Op.QUANT_INTER
     quant_inter = None if fused_inter_quant else plan.segment("quant.inter").segment
@@ -280,12 +280,7 @@ def run_two_stage(c: Call, metadata, plan, q_dtype_a, after_sort=None):
             else torch.empty((token_num, c.model_dim), dtype=dtype, device=device)
         )
     a1, a1_scale = quant_a1.run(
-        c.quant_type,
-        hidden_states,
-        c["a1_scale"],
-        q_dtype_a,
-        num_local_tokens,
-        transpose_scale=getattr(gemm1, "transpose_a1_scale", False),
+        c.quant_type, hidden_states, c["a1_scale"], q_dtype_a, num_local_tokens
     )
     if fused_inter_quant:
         a2 = gemm1.out_buffer(a1, a1_scale, token_num, topk, inter_dim, q_dtype_a)
@@ -393,6 +388,12 @@ def a16w4_unsupported(c: Call, q_dtype_a) -> str | None:
         if bad:
             return why
     return None
+
+
+def prequant(plan) -> bool:
+    """Whether A1 is quantized before stage 1 (legacy `prequant` after its MXMOE
+    override): False when the stage 1 segment covers `QUANT_A1` itself."""
+    return plan.covering(Op.GEMM1).segment.covers[0] == Op.GEMM1
 
 
 def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
@@ -568,13 +569,6 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
     config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
         _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)
     )
-    if (
-        stage1_func is _mxfp4_a4w4_stage1_fw
-        and metadata.output_aux == AUX_SORT_OPUS
-        # block_m 16 is the only inline-quant a4w4 GEMM1: it reads raw bf16.
-        and int(metadata.block_m) != 16
-    ):
-        metadata = replace(metadata, prequant=True)
     if prequantized_a1 is not None:
         a1, a1_scale = prequantized_a1, prequantized_a1_scale
     else:
@@ -596,6 +590,7 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
             num_local_tokens,
             sorted_weights,
             c.global_E,
+            prequant=prequant(plan),
         )
     # The a16w4 FlyDSL stage 1 allocates its own sorted intermediate.
     is_a16w4_port = (
@@ -609,7 +604,7 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
         if is_a16w4_port
         else torch.empty((token_num, topk, inter_dim), dtype=dtype, device=device)
     )
-    extra_stage1_args = plan.starting(Op.GEMM1).segment.call_args(c)
+    extra_stage1_args = plan.covering(Op.GEMM1).segment.call_args(c)
     extra_stage2_args = plan.starting(Op.GEMM2).segment.call_args(c)
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:

@@ -153,8 +153,9 @@ class Segment:
     - `covers`: `(first, last)` ops of the chain (`dispatch.ops.Op`) it implements; the
       next segment of a plan starts at the op after `last`. A stage 1 covers
       `(GEMM1, ACT)`, or `(GEMM1, QUANT_INTER)` when it writes GEMM2's input format
-      itself; a stage 2 `(GEMM2, REDUCE)`; the 1-stage ASM kernels `(QUANT_A1, REDUCE)`;
-      a whole-graph implementation `(SORT, REDUCE)`.
+      itself (`(QUANT_A1, QUANT_INTER)` when it also quantizes its own input); a stage 2
+      `(GEMM2, REDUCE)`; the 1-stage ASM kernels `(QUANT_A1, REDUCE)`; a whole-graph
+      implementation `(SORT, REDUCE)`.
     - `capabilities`: the `Cap`s it supports. A problem no `Cap` covers rejects the
       segment (`reject_reason`); no `Cap` at all accepts nothing.
     - `reach` (`REACHES`, checked by `coverage.segment_errors`): how dispatch gets to the
@@ -221,7 +222,9 @@ class Segment:
       kernel: `launch(ordinary_stage2=, stage2_args=, stage2_kwargs=)` returning the
       output (`comm_fused.stage2_rs`, whose runner reads the per-call `c["comm_fused"]`).
     - Launch: `build(p, params)` binds the kernel wrapper, `metadata_fields` the
-      `MOEMetadata` fields it sets, `call_args(c)` the arguments taken from the call.
+      `MOEMetadata` fields it sets (not `fuse_quant`, `skip_inter_quant` or
+      `output_aux`, which the resolver reads off the boundaries), `call_args(c)` the
+      arguments taken from the call.
     - Lifecycle, for stateful segments (`MoeEngine` calls them on the segments a plan
       lists in `BucketPlan.stateful`, each instance once): `workspace_bytes()` is the
       `MemoryNeed` that `prepare` will allocate, known before it does (the engine sums

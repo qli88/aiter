@@ -22,9 +22,11 @@ ROWS = {
     "p2p_scatter": ("token_major",),
     "out": ("token_major",),
 }
-# "v2": the FlyDSL v2 layout GEMM2's arrangement; "mxmoe": MXMOE stage 1's (its native
-# BM16 chunks or v2's, by tile), read by the MXMOE stage 2.
-SCALES = ("plain", "v2", "mxmoe")
+# "v2": the arrangement the layout GEMM2s (`flydsl_moe2_layout_*`,
+# `opus_moe2_layout_*`) read; "mxmoe": MXMOE stage 1's (its native
+# BM16 chunks or v2's, by tile), read by the MXMOE stage 2; "transposed": the 1x128 A1
+# scales of `quant.a1_transposed`, read by `asm.stage1_1x128`.
+SCALES = ("plain", "v2", "mxmoe", "transposed")
 
 _KIND_DEFAULT = object()
 

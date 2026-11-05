@@ -7,7 +7,8 @@ scales of a layout GEMM2, the MXMOE scales), so each kind is its own segment and
 the boundary check keeps the legacy pairings: a FlyDSL stage 1 is followed by
 `quant.inter` (`flydsl.gemm1`) or writes the fp4 intermediate itself
 (`flydsl.gemm1_q`, `flydsl.gemm1_layout`); a layout GEMM2 with the scatter epilog and
-MXMOE read the auxiliary sort (`sort.aux`).
+MXMOE read the auxiliary sort (`sort.aux`); MXMOE stage 1 reads the activations
+`quant.a1` quantized (`mxmoe.gemm1`) or quantizes them itself (`mxmoe.quant_gemm1`).
 """
 
 import dataclasses
@@ -23,7 +24,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
 )
 
 from ..dispatch import kernel_names, overrides
-from ..dispatch.buf import Buf
+from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec, scale_spec
 from .base import Cap, DefaultKernels, RowRejection, Segment
@@ -40,7 +41,6 @@ from .mxmoe import (
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
 )
-from .sort import AUX_SORT_OPUS
 
 
 def mxfp4():
@@ -410,7 +410,7 @@ class FlydslGemm1(_FlydslStage1):
 
 class FlydslGemm1Quant(_FlydslStage1):
     """A FlyDSL stage 1 that quantizes its output to MXFP4 or mxfp8 (`_fp4` or `_fp8`
-    in its options)."""
+    in its options), in the v2 layout for an Opus layout GEMM2."""
 
     name = "flydsl.gemm1_q"
     reach = "tuned"
@@ -432,23 +432,43 @@ class FlydslGemm1Quant(_FlydslStage1):
         return None
 
     def produces(self, p, params):
-        return Buf("inter", p.act_in)
-
-    def metadata_fields(self, p, params):
-        return {
-            **super().metadata_fields(p, params),
-            "fuse_quant": _stage1_fused_quant(params.kernel),
-        }
+        kernel = params.get("kernel")
+        fmt = p.act_in if kernel is None else mx_inter(_stage1_fused_quant(kernel))
+        return fused_inter(fmt, params.get("kernel2"))
 
 
-_MX_INTER = {"fp4": dtypes.fp4x2, "fp8": dtypes.fp8}
+def fused_inter(fmt, kernel2) -> Buf:
+    """The intermediate a FlyDSL or Opus stage 1 quantizing it to `fmt` writes for
+    GEMM2 `kernel2` (None before it is chosen): for a layout name (`_moe2_layout_`,
+    legacy `skip_inter_quant`) the executor has it write the v2 layout, else
+    token-major."""
+    if kernel2 and "_moe2_layout_" in kernel2:
+        return Buf("inter", fmt, rows="expert_sorted", scales="v2")
+    return Buf("inter", fmt)
+
+
+def _mx_dtypes() -> dict:
+    # dtypes.fp8 depends on the arch, so it is read per call.
+    return {"fp4": dtypes.fp4x2, "fp8": dtypes.fp8}
 
 
 def mx_inter(a_dtype) -> ScaleSpec | None:
     """The per-1x32 intermediate a FlyDSL name's dtype token ("fp4", "fp8") stands
     for; None (any) for no token or another one."""
-    dtype = _MX_INTER.get(a_dtype)
+    dtype = _mx_dtypes().get(a_dtype)
     return None if dtype is None else scale_spec(QuantType.per_1x32, dtype)
+
+
+def mx_token(dtype) -> str:
+    """The FlyDSL name token ("fp4", "fp8") of a per-1x32 dtype; "" for another."""
+    return next((t for t, d in _mx_dtypes().items() if d == dtype), "")
+
+
+def _reads_mx_inter(cfg) -> bool:
+    """A parsed layout GEMM2 name reads an fp4 or fp8 intermediate; legacy would hand
+    stage 1 another token as `fuse_quant`, which no boundary describes, so such a name
+    is not owned and legacy runs the call."""
+    return cfg is not None and mx_inter(cfg["a_dtype"]) is not None
 
 
 def layout_gemm2_inter(kernel2) -> ScaleSpec | None:
@@ -504,12 +524,6 @@ class FlydslGemm1Layout(_FlydslStage1):
         stage1 = super().build(p, params)
         stage1.keywords["out_dtype"] = self._a_dtype(params)
         return stage1
-
-    def metadata_fields(self, p, params):
-        return {
-            **super().metadata_fields(p, params),
-            "fuse_quant": self._a_dtype(params),
-        }
 
     @staticmethod
     def _a_dtype(params):
@@ -579,7 +593,7 @@ class FlydslLayoutGemm2(Segment):
         if kernel is None or kernel.family != kernel_names.FLYDSL_LAYOUT:
             return False
         cfg = parse_flydsl_v2_gemm2_kernel(kernel.format())
-        return cfg is not None and (cfg["epilog"] == "scatter") == self.scatter
+        return _reads_mx_inter(cfg) and (cfg["epilog"] == "scatter") == self.scatter
 
     def reads(self, p):
         return (
@@ -624,11 +638,7 @@ class FlydslLayoutGemm2(Segment):
         )
 
     def metadata_fields(self, p, params):
-        return {
-            "skip_inter_quant": True,
-            "output_aux": AUX_SORT_OPUS if self.scatter else False,
-            "stage2_has_bias": swiglu_bias(p),
-        }
+        return {"stage2_has_bias": swiglu_bias(p)}
 
 
 class FlydslLayoutGemm2Scatter(FlydslLayoutGemm2):
@@ -644,9 +654,16 @@ class FlydslLayoutGemm2Scatter(FlydslLayoutGemm2):
         )
 
 
+def _mxmoe_quantizes_a1(kernel_name) -> bool:
+    """Whether MXMOE stage 1 `kernel_name` is handed the caller's activations: legacy
+    `prequant` is False and its override (any block_m but 16) does not apply."""
+    p1 = _parse_mxfp4_g1_kname(kernel_name)
+    return p1["BM"] == 16 and not (p1["a_dtype"] == "fp8" and not p1["inline_quant"])
+
+
 class MxmoeGemm1(Segment):
-    """MXMOE stage 1 (`flydsl_mxmoe_g1_*`): quantizes its input unless handed fp4,
-    and writes its own sorted, quantized intermediate."""
+    """MXMOE stage 1 (`flydsl_mxmoe_g1_*`) on the prequantized activations (`quant.a1`):
+    it writes its own sorted, quantized intermediate."""
 
     name = "mxmoe.gemm1"
     prefixes = (kernel_names.MXMOE,)
@@ -661,10 +678,11 @@ class MxmoeGemm1(Segment):
             kernel is not None
             and kernel.family == kernel_names.MXMOE
             and kernel.stage == 1
+            and _mxmoe_quantizes_a1(kernel.format()) == (self.covers[0] == Op.QUANT_A1)
         )
 
     def reads(self, p):
-        return (Buf("sorted", None, rows="aux_sorted"), Buf("tokens", None))
+        return (Buf("sorted", None, rows="aux_sorted"), Buf("tokens", p.act_in))
 
     def produces(self, p, params):
         kernel = params.get("kernel")
@@ -701,11 +719,22 @@ class MxmoeGemm1(Segment):
         p1 = _parse_mxfp4_g1_kname(params.kernel)
         return {
             "block_m": p1["BM"],
-            "fuse_quant": p1["out_dtype"],
-            "output_aux": AUX_SORT_OPUS,
+            # Legacy's value before its run-time override; the run follows the plan.
             "prequant": p1["a_dtype"] == "fp8" and not p1["inline_quant"],
             "has_bias": "bias1" in p.features and p1.get("enable_bias", False),
         }
+
+
+class MxmoeQuantGemm1(MxmoeGemm1):
+    """MXMOE stage 1 handed the caller's activations, which it quantizes itself
+    (block_m 16, legacy `prequant` False)."""
+
+    name = "mxmoe.quant_gemm1"
+    reach = "tuned"
+    covers = (Op.QUANT_A1, Op.QUANT_INTER)
+
+    def reads(self, p):
+        return (Buf("sorted", None, rows="aux_sorted"), CALL_INPUT)
 
 
 class MxmoeGemm2(Segment):
@@ -724,9 +753,8 @@ class MxmoeGemm2(Segment):
             return False
         if kernel.family == kernel_names.MXMOE:
             return True
-        return (
-            kernel.family == kernel_names.FLYDSL_LAYOUT
-            and parse_flydsl_v2_gemm2_kernel(kernel.format()) is not None
+        return kernel.family == kernel_names.FLYDSL_LAYOUT and _reads_mx_inter(
+            parse_flydsl_v2_gemm2_kernel(kernel.format())
         )
 
     def reads(self, p):

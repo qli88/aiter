@@ -300,19 +300,21 @@ class AsmStage1(Segment):
 class AsmStage1Blockscale(AsmStage1):
     """ASM stage 1 for 1x128 fp8: it writes the intermediate already quantized.
 
-    The a1 quantization writes its scale transposed for this kernel, which writes fp8
-    rows followed by their fp32 scales into one buffer (`out_buffer`); `split_out` cuts
-    that into the GEMM2 inputs.
+    It reads the A1 scales transposed (`quant.a1_transposed`) and writes fp8 rows
+    followed by their fp32 scales into one buffer (`out_buffer`); `split_out` cuts that
+    into the GEMM2 inputs.
     """
 
     name = "asm.stage1_1x128"
     reach = "tuned"
     covers = (Op.GEMM1, Op.QUANT_INTER)
-    transpose_a1_scale = True
 
     @property
     def capabilities(self):
         return a8w8_blockscale_caps()
+
+    def reads(self, p):
+        return (Buf("sorted", None), Buf("tokens", p.act_in, scales="transposed"))
 
     def produces(self, p, params):
         return Buf("inter", p.act_in)

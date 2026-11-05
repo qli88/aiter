@@ -1131,8 +1131,9 @@ def test_a_tuned_asm_blockscale_row_runs_the_packed_stage1(monkeypatch):
         _problem(quant=QuantType.per_1x128), a8w8_blockscale.SEGMENTS
     )
     assert res.plan.structure()[0] == (
-        "sort", "quant.a1", "asm.stage1_1x128", "ck.gemm2"
+        "sort", "quant.a1_transposed", "asm.stage1_1x128", "ck.gemm2"
     )  # fmt: skip
+    assert res.plan.boundaries[1].scales == "transposed"
     assert res.metadata.stage1.func.__name__ == "asm_stage1"
 
 
@@ -1548,6 +1549,74 @@ def test_a8w4_defaults_and_tuned_rows(monkeypatch):
     )
 
 
+def test_consistency_flags_come_from_the_boundaries(monkeypatch):
+    """`fuse_quant`, `skip_inter_quant` and `output_aux` are read off the plan's
+    boundaries (`resolver.boundary_flags`): an Opus layout GEMM2 reads the v2 layout,
+    which only a stage 1 quantizing the intermediate itself writes."""
+    from aiter.moev2.migration import a8w4
+
+    def resolve(problem, row):
+        monkeypatch.setattr(tuned, "lookup", lambda p: row)
+        return resolver.resolve(problem, a8w4.SEGMENTS)
+
+    opus = {
+        "kernelName1": "opus_moe1_afp8_wfp4_bf16_t64x384_gs_qgb3_aff32_p2_fp8",
+        "kernelName2": "opus_moe2_layout_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584",
+        "block_m": 64,
+        "ksplit": 0,
+    }
+    flydsl = {
+        **opus,
+        "kernelName1": "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w2_gui_fp8",
+    }
+    for row, gemm1 in ((opus, "opus.gemm1"), (flydsl, "flydsl.gemm1_q")):
+        res = resolve(_a8w4_problem(), row)
+        assert res.plan.structure()[0][2:] == (gemm1, "opus.gemm2")
+        inter = res.plan.boundaries[2]
+        assert (inter.rows, inter.scales) == ("expert_sorted", "v2")
+        m = res.metadata
+        assert m.skip_inter_quant and m.fuse_quant == "fp8" and m.output_aux is False
+        not_layout = {**row, "kernelName2": opus["kernelName2"].replace("_layout", "")}
+        m = resolve(_a8w4_problem(), not_layout).metadata
+        assert not m.skip_inter_quant and m.fuse_quant == "fp8"
+    plain = {**flydsl, "kernelName1": "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w2_gui"}
+    assert "the chosen kernels disagree" in resolve(_a8w4_problem(), plain).declined
+    # The scatter epilog reads the auxiliary sort.
+    scatter = {
+        "kernelName1": "flydsl_moe1_afp8_wfp4_bf16_t128x256x256_bnt0_gui_fp8",
+        "kernelName2": "flydsl_moe2_layout_afp8_wfp4_bf16_t128x256x256_scatter_sbm128",
+        "block_m": 128,
+        "ksplit": 0,
+    }
+    res = resolve(_a8w4_problem(), scatter)
+    assert res.plan.structure()[0][-1] == "flydsl_layout.gemm2_scatter"
+    m = res.metadata
+    assert m.output_aux == "opus" and m.skip_inter_quant and m.fuse_quant == "fp8"
+    # A layout input dtype no boundary describes: legacy runs it.
+    other = {**scatter, "kernelName2": scatter["kernelName2"].replace("afp8", "abf16")}
+    assert "no segments run" in resolve(_a8w4_problem(), other).declined
+
+
+def test_quant_a1_variants_write_their_scales(monkeypatch):
+    from aiter.moev2.segments import quant
+
+    seen = []
+
+    def get_quant(quant_type):
+        def run(x, scale=None, quant_dtype=None, num_rows=None, transpose_scale=False):
+            seen.append(transpose_scale)
+            return x, scale
+
+        return run
+
+    monkeypatch.setattr(quant, "get_quant", get_quant)
+    x = torch.zeros(2, 128, dtype=torch.bfloat16)
+    for segment in (quant.QuantA1(), quant.QuantA1Transposed()):
+        segment.run(QuantType.per_1x128, x, None, dtypes.fp8, None)
+        segment.run(QuantType.per_1x128, x.to(dtypes.fp8), x[:, :1], dtypes.fp8, None)
+    assert seen == [False, True]
+
+
 def test_mxfp8_defaults_and_tuned_rows(monkeypatch):
     from aiter.moev2.migration import mxfp8
     from aiter.ops.flydsl.moe_common import GateMode
@@ -1628,7 +1697,7 @@ def test_mxmoe_bias_flags_follow_the_kernel_names(monkeypatch):
         token=8, shape=_MXMOE_SHAPE, is_shuffled=True, has_stage2_bias=True
     )
     res = _a4w4_resolve(monkeypatch, p, _MXMOE_ROW)
-    assert res.plan.structure()[0][2] == "mxmoe.gemm1"
+    assert res.plan.structure()[0][1] == "mxmoe.quant_gemm1"
     assert res.metadata.stage2_has_bias and not res.metadata.has_bias
 
 
@@ -1785,10 +1854,17 @@ def test_a8w4_leaves_legacy_grouped_gfx1250_calls_to_legacy(monkeypatch):
 
 
 def test_a4w4_tuned_rows_pick_the_mxmoe_and_layout_v2_segments(monkeypatch):
+    from aiter.moev2.execute import executor
+
+    def legacy_prequant(m):
+        # fused_moe_2stages: MXMOE stage 1 with the Opus aux sort, block_m not 16.
+        return m.prequant or (m.output_aux == "opus" and m.block_m != 16)
+
     p = _a4w4_problem(token=8, shape=_MXMOE_SHAPE, is_shuffled=True)
     res = _a4w4_resolve(monkeypatch, p, _MXMOE_ROW)
+    # block_m 16: the caller's activations go to the kernel (legacy prequant False).
     assert res.plan.structure()[0] == (
-        "sort.aux", "quant.a1", "mxmoe.gemm1", "mxmoe.gemm2"
+        "sort.aux", "mxmoe.quant_gemm1", "mxmoe.gemm2"
     )  # fmt: skip
     m = res.metadata
     assert (m.block_m, m.output_aux, m.fuse_quant, m.prequant) == (
@@ -1797,6 +1873,26 @@ def test_a4w4_tuned_rows_pick_the_mxmoe_and_layout_v2_segments(monkeypatch):
         "fp4",
         False,
     )
+    assert executor.prequant(res.plan) is legacy_prequant(m) is False
+    # Another block_m: quant.a1 runs, as legacy's override of the recorded False.
+    row = dict(
+        _MXMOE_ROW,
+        block_m=128,
+        kernelName1="flydsl_mxmoe_g1_a4w4_128x256x256_xcd4",
+        kernelName2="flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_reduce_sbm128",
+    )
+    res = _a4w4_resolve(monkeypatch, p, row)
+    assert res.plan.structure()[0] == (
+        "sort.aux", "quant.a1", "mxmoe.gemm1", "mxmoe.gemm2"
+    )  # fmt: skip
+    m = res.metadata
+    assert (m.block_m, m.output_aux, m.fuse_quant, m.prequant) == (
+        128,
+        "opus",
+        "fp4",
+        False,
+    )
+    assert executor.prequant(res.plan) is legacy_prequant(m) is True
     row = {
         "block_m": 32,
         "ksplit": 0,

@@ -6,10 +6,11 @@
 back.
 
 Segments, for tuned rows only (legacy has no Opus default): `opus.gemm1` writes the
-mxfp8 intermediate itself, for a stage 2 that reads it (Opus, FlyDSL, CK-Tile);
-`opus.gemm1_layout` writes the sorted input of a FlyDSL layout GEMM2; `opus.gemm2` runs
-an Opus stage 2 (`opus_moe2_*`, `opus_moe2_layout_*`) after any stage 1. The kernels take
-the row's `block_m` (stage 1) and sort `block_m` (stage 2).
+mxfp8 intermediate itself, for a stage 2 that reads it (Opus, FlyDSL, CK-Tile; the v2
+layout for `opus_moe2_layout_*`); `opus.gemm1_layout` writes the sorted input of a
+FlyDSL layout GEMM2; `opus.gemm2` runs an Opus stage 2 (`opus_moe2_*`,
+`opus_moe2_layout_*`; a layout name after a FlyDSL stage 1 needs one quantizing its
+output). The kernels take the row's `block_m` (stage 1) and sort `block_m` (stage 2).
 """
 
 import functools
@@ -27,7 +28,13 @@ from ..dispatch.ops import Op
 from ..problem import ScaleSpec
 from .base import RowRejection, Segment
 from .defaults import BLOCK_SIZE_M, default_block_m
-from .mxfp4 import a8w4_caps, layout_gemm2_inter, mxfp4_row_rejection, swiglu_bias
+from .mxfp4 import (
+    a8w4_caps,
+    fused_inter,
+    layout_gemm2_inter,
+    mxfp4_row_rejection,
+    swiglu_bias,
+)
 
 
 def _opus_stage2_fp8_enabled():
@@ -72,18 +79,19 @@ class _OpusStage1(Segment):
         )
 
     def metadata_fields(self, p, params):
-        return {"has_bias": swiglu_bias(p), "fuse_quant": "fp8"}
+        return {"has_bias": swiglu_bias(p)}
 
 
 class OpusGemm1(_OpusStage1):
-    """An Opus stage 1 writing the mxfp8 intermediate."""
+    """An Opus stage 1 writing the mxfp8 intermediate (in the v2 layout for an Opus
+    layout GEMM2)."""
 
     name = "opus.gemm1"
     reach = "tuned"
     covers = (Op.GEMM1, Op.QUANT_INTER)
 
     def produces(self, p, params):
-        return Buf("inter", p.act_in)
+        return fused_inter(p.act_in, params.get("kernel2"))
 
 
 class OpusGemm1Layout(_OpusStage1):
@@ -112,19 +120,14 @@ class OpusGemm1Layout(_OpusStage1):
         stage1.keywords["out_dtype"] = self._a_dtype(params)
         return stage1
 
-    def metadata_fields(self, p, params):
-        return {
-            **super().metadata_fields(p, params),
-            "fuse_quant": self._a_dtype(params),
-        }
-
     @staticmethod
     def _a_dtype(params):
         return parse_flydsl_v2_gemm2_kernel(params.kernel2)["a_dtype"]
 
 
 class OpusGemm2(Segment):
-    """An Opus stage 2, after a FlyDSL, Opus, CK or CK-Tile stage 1."""
+    """An Opus stage 2, after a FlyDSL, Opus, CK or CK-Tile stage 1 (a layout name
+    after a FlyDSL one: `flydsl.gemm1_q`)."""
 
     name = "opus.gemm2"
     reach = "tuned"
@@ -145,6 +148,15 @@ class OpusGemm2(Segment):
 
     def reads(self, p):
         return (Buf("sorted", None), Buf("inter", p.act_in))
+
+    def reads_with(self, p, params):
+        """A layout name after a FlyDSL or Opus stage 1 reads the v2 layout (legacy
+        `skip_inter_quant`); after another stage 1 legacy quantizes the intermediate
+        as for any other name."""
+        sort, inter = self.reads(p)
+        if params.get("kernel1", "").startswith(("flydsl_", "opus_moe1_")):
+            return (sort, fused_inter(inter.fmt, params.get("kernel")))
+        return (sort, inter)
 
     def produces(self, p, params):
         return Buf("out", ScaleSpec(p.out_dtype))
@@ -201,8 +213,4 @@ class OpusGemm2(Segment):
         )
 
     def metadata_fields(self, p, params):
-        fields = dict(params.route)
-        if params.kernel1.startswith(("flydsl_", "opus_moe1_")):
-            # The tuned FlyDSL/Opus branch.
-            fields["skip_inter_quant"] = "_moe2_layout_" in params.kernel
-        return fields
+        return dict(params.route)

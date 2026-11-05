@@ -30,6 +30,7 @@ from ..segments.mxfp4 import (
     FlydslLayoutGemm2Scatter,
     MxmoeGemm1,
     MxmoeGemm2,
+    MxmoeQuantGemm1,
     mxfp4,
 )
 from ..segments.quant import QuantA1, QuantInter
@@ -49,6 +50,7 @@ SEGMENTS = (
     FlydslGemm1Quant(),
     FlydslGemm1Layout(),
     MxmoeGemm1(),
+    MxmoeQuantGemm1(),
     QuantInter(),
     CkGemm2(),
     CktileGemm2(),

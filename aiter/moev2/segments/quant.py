@@ -27,6 +27,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
 from .base import Cap, Segment
+from .ck import blockscale_fp8
 
 _FEATURES = frozenset(
     {"ep_mask", "num_local_tokens", "doweight_stage1", "act_scales", "bias1", "bias2"}
@@ -40,26 +41,20 @@ class QuantA1(Segment):
     name = "quant.a1"
     covers = (Op.QUANT_A1, Op.QUANT_A1)
     capabilities = (Cap(features=_FEATURES, pads=True, extras=_EXTRAS, shared=True),)
+    scales = "plain"
 
     def reads(self, p):
         return (CALL_INPUT,)
 
     def produces(self, p, params):
-        return Buf("tokens", p.act_in)
+        return Buf("tokens", p.act_in, scales=self.scales)
 
-    def run(
-        self,
-        quant_type,
-        hidden_states,
-        a1_scale,
-        q_dtype_a,
-        num_local_tokens,
-        transpose_scale=False,
-    ):
-        """`(a1, a1_scale)`: quantize unless the activations already are `q_dtype_a`."""
+    def run(self, quant_type, hidden_states, a1_scale, q_dtype_a, num_local_tokens):
+        """`(a1, a1_scale)`: quantize unless the activations already are `q_dtype_a`
+        (then they and their scales pass unchanged, whatever `scales` says)."""
         if hidden_states.dtype != q_dtype_a:
             quant_func = get_quant(quant_type)
-            if transpose_scale:
+            if self.scales == "transposed":
                 quant_func = functools.partial(quant_func, transpose_scale=True)
             return quant_func(
                 hidden_states,
@@ -71,6 +66,26 @@ class QuantA1(Segment):
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         return hidden_states, a1_scale
+
+
+class QuantA1Transposed(QuantA1):
+    """`quant.a1` writing the 1x128 scales transposed, for `asm.stage1_1x128`."""
+
+    name = "quant.a1_transposed"
+    reach = "tuned"
+    scales = "transposed"
+
+    @property
+    def capabilities(self):
+        return (
+            Cap(
+                act_in=frozenset({blockscale_fp8()}),
+                features=_FEATURES,
+                pads=True,
+                extras=_EXTRAS,
+                shared=True,
+            ),
+        )
 
 
 def _keeps_bf16(dtype, w1_dtype, q_dtype_a, activation, ksplit, is_shuffled):
@@ -107,11 +122,15 @@ def quant_a1_mxfp4(
     num_local_tokens,
     sorted_weights,
     routing_num_experts,
+    *,
+    prequant,
 ):
     """`(a1, a1_scale)` for `per_1x32`: the legacy `fused_moe_2stages` branches, which
-    quantize into (or sort the scales of) the sorted layout of the stage 1 kernel."""
+    quantize into (or sort the scales of) the sorted layout of the stage 1 kernel.
+    `prequant` False: the stage 1 quantizes the activations itself (legacy
+    `metadata.prequant` after its MXMOE override), so they pass unchanged."""
     token_num = hidden_states.shape[0]
-    if not metadata.prequant:
+    if not prequant:
         return hidden_states, None
     if (
         dtype in [dtypes.bf16, dtypes.fp16]

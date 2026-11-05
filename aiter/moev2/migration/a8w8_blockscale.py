@@ -16,7 +16,7 @@ from aiter import QuantType, dtypes
 from .. import paths
 from ..segments.asm import AsmFmoe1Stage, AsmStage1Blockscale
 from ..segments.ck import CkGemm1, CkGemm2, blockscale_fp8
-from ..segments.quant import QuantA1, QuantInter
+from ..segments.quant import QuantA1, QuantA1Transposed, QuantInter
 from ..segments.sort import Sort, SortFlat
 from . import local
 
@@ -26,6 +26,7 @@ SEGMENTS = (
     Sort(),
     SortFlat(),
     QuantA1(),
+    QuantA1Transposed(),
     CkGemm1(),
     AsmStage1Blockscale(),
     QuantInter(),

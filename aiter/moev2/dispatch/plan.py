@@ -65,6 +65,13 @@ class MoePlan:
                 return choice
         return None
 
+    def covering(self, op) -> SegmentChoice | None:
+        """The segment whose span includes `op`."""
+        for choice in self.segments:
+            if choice.segment.covers[0] <= op <= choice.segment.covers[1]:
+                return choice
+        return None
+
     def describe(self) -> str:
         chain = " | ".join(str(c) for c in self.segments)
         params = ", ".join(f"{k}={v}" for k, v in self.params.items())
