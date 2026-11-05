@@ -6,10 +6,12 @@ For every tuner key the snapshot's `get_2stage_cfgs` keys give, on every simulat
 arch, and per kernel family, the set of `(stage, kernel, block_m, nt)` the legacy
 `FmoeTuner` generator lists equals the set v2's segments list, except for the known
 differences below, each with its reason; a known difference holds only where v2 lists
-nothing and, unless legacy raises (where v2's guard is the fix, todo 5.46), no segment
-of the family accepts the problem. A tuner key is the 14 fields the legacy
-tuner tunes on, after its own filters (`tune()`): per-1x32 only on gfx950,
-per-128x128 tuned as per-1x128; it tunes no g1u0 key, so v2 must list nothing there.
+nothing and no segment of the family accepts the problem, unless legacy raises (where
+v2's guard is the fix, todo 5.46) or the reason says v2 declines on purpose. No
+candidate may be listed twice. A tuner key is the 14 fields the legacy tuner tunes
+on, per-128x128 tuned as per-1x128; legacy `tune()` skips g1u0 keys, and per-1x32 keys
+off gfx950, so v2 must list nothing there. On gfx950 a few synthetic keys add what the
+snapshot lacks.
 
     python tests/moe_dispatch/param_space_checks.py --check [--arch gfx950]
 """
@@ -91,14 +93,45 @@ def tuner_keys(gfx, cu_num):
             key.args[:10]
         )
         activation, doweight = key.args[10], key.args[11]
-        if q_type == QuantType.per_1x32 and gfx != "gfx950":
-            continue
         if q_type == QuantType.per_128x128:
             q_type = QuantType.per_1x128
         info = (gfx, cu_num, token, model_dim, inter_dim, expert, topk, activation)
         info += (dtype, q_a, q_w, q_type, g1u1, doweight)
         out.setdefault(info, None)
+    for info in synthetic_keys(gfx, cu_num):
+        out.setdefault(info, None)
     return list(out)
+
+
+def synthetic_keys(gfx, cu_num):
+    """gfx950 per-1x32 keys the snapshot lacks: fp16 output, a4w4 Gelu, the gpt-oss
+    model_dim 2880."""
+    if gfx != "gfx950":
+        return []
+    from aiter import ActivationType, QuantType, dtypes
+
+    fp4, fp8 = dtypes.fp4x2, dtypes.fp8
+    shapes = (
+        (dtypes.fp16, fp4, ActivationType.Silu, 7168, 256),
+        (dtypes.fp16, fp8, ActivationType.Swiglu, 7168, 256),
+        (dtypes.bf16, fp4, ActivationType.Gelu, 7168, 256),
+        (dtypes.bf16, fp8, ActivationType.Swiglu, 2880, 2880),
+        (dtypes.bf16, dtypes.bf16, ActivationType.Situv2, 2880, 384),
+    )
+    return [
+        (gfx, cu_num, token, model_dim, inter_dim, 128, 4, activation)
+        + (dtype, q_a, fp4, QuantType.per_1x32, True, doweight)
+        for token in (16, 512)
+        for dtype, q_a, activation, model_dim, inter_dim in shapes
+        for doweight in (False, True)
+    ]
+
+
+def legacy_tunes(info):
+    """Whether legacy `tune()` tunes `info`: g1u1, per-1x32 only on gfx950."""
+    from aiter import QuantType
+
+    return bool(info[12]) and (info[11] != QuantType.per_1x32 or info[0] == "gfx950")
 
 
 def _is_a8w4(info):
@@ -130,15 +163,47 @@ def _legacy_ck(tuner, info):
     }
 
 
-def _families():
-    from aiter.moev2.segments import asm, ck
+def _tags(tasks):
+    return {(tag[1], tag[2], tag[3], False) for (tag, *_rest) in tasks}
 
+
+def _legacy_flydsl(tuner, info):
+    return _tags(tuner.gen_flydsl_2stages_task(info, _BLOCK_MS)) | _tags(
+        tuner.gen_flydsl_i4_2stages_task(info, _BLOCK_MS)
+    )
+
+
+def _legacy_flydsl_layout(tuner, info):
+    return _tags(tuner.gen_flydsl_v2_2stages_task(info, _BLOCK_MS))
+
+
+def _families():
+    from aiter.moev2.segments import asm, ck, flydsl_fhmoe, mxfp4
+
+    fhmoe = (
+        flydsl_fhmoe.FlydslFhmoeGemm1(),
+        flydsl_fhmoe.FlydslFhmoeGemm1Quant(),
+        flydsl_fhmoe.FlydslFhmoeGemm2(),
+    )
     return {
         "asm": (
             _legacy_asm,
             (asm.AsmStage1(), asm.AsmStage1Blockscale(), asm.AsmStage1Cktile()),
         ),
         "ck": (_legacy_ck, (ck.CkGemm1(), ck.CkGemm2())),
+        "flydsl": (
+            _legacy_flydsl,
+            (mxfp4.FlydslGemm1(), mxfp4.FlydslGemm1Quant(), mxfp4.FlydslGemm2())
+            + fhmoe,
+        ),
+        "flydslv2": (
+            _legacy_flydsl_layout,
+            (
+                mxfp4.FlydslGemm1Layout(),
+                mxfp4.FlydslLayoutGemm2(),
+                mxfp4.FlydslLayoutGemm2Scatter(),
+            ),
+        ),
     }
 
 
@@ -149,11 +214,14 @@ def _stage(segment):
 
 
 def v2_candidates(segments, problem):
-    return {
+    """`(candidates, twice)`: what `segments` list for `problem`, and what they list
+    more than once."""
+    listed = collections.Counter(
         (_stage(s), params["kernel"], params["block_m"], bool(params.get("nt", False)))
         for s in segments
         for params in s.param_space(problem)
-    }
+    )
+    return set(listed), {c for c, n in listed.items() if n > 1}
 
 
 def _activation(info):
@@ -168,9 +236,14 @@ def _ck_activation_unmapped(info):
     return _activation(info) not in ACT_OP_MAP
 
 
+Known = collections.namedtuple("Known", "reason declined", defaults=(False,))
+"""A known difference; `declined`: v2's segments accept the problem and list nothing
+on purpose."""
+
+
 def known_difference(family, info, raised):
-    """The reason legacy's candidates for `info` are not v2's (v2 lists none), or
-    None."""
+    """The `Known` reason legacy's candidates for `info` are not v2's (v2 lists none),
+    or None."""
     import torch
 
     from aiter import QuantType
@@ -183,20 +256,35 @@ def known_difference(family, info, raised):
             and isinstance(raised, KeyError)
             and _ck_activation_unmapped(info)
         ):
-            return f"legacy raises: CK maps no {_activation(info)} (todo 5.46)"
+            return Known(f"legacy raises: CK maps no {_activation(info)} (todo 5.46)")
         return None
     if gfx == "gfx1201":
-        return "gfx1201: no v2 path (todo 1b.2)"
+        return Known("gfx1201: no v2 path (todo 1b.2)")
     if q_type != QuantType.per_1x32 and _activation(info) not in ("silu", "gelu"):
-        return "Swiglu/GeluTanh outside per-1x32: v2 claims Silu and Gelu (todo 1c.4)"
+        return Known(
+            "Swiglu/GeluTanh outside per-1x32: v2 claims Silu and Gelu (todo 1c.4)"
+        )
+    if family.startswith("flydsl") and _activation(info) not in (
+        "silu",
+        "swiglu",
+        "situv2",
+    ):
+        return Known(
+            f"FlyDSL {_activation(info)}: dispatch discards the tuned row (todo 5.48)",
+            declined=True,
+        )
+    if family == "flydsl" and q_type == QuantType.per_1x32 and info[13]:
+        return Known(
+            "per-1x32 doweight: the FlyDSL capabilities leave it out (todo 1e.7)"
+        )
     if family == "asm":
         if q_type == QuantType.per_1x32 and q_a in fp8 and q_w in fp8:
-            return (
+            return Known(
                 "mxfp8: legacy lists the per-token fp8 ASM kernels, which take no "
                 "1x32 scales"
             )
         if q_w == torch.uint32:
-            return (
+            return Known(
                 "int4 weights: legacy's ASM filter tests torch.int4, not uint32 "
                 "(todo 5.47)"
             )
@@ -243,31 +331,36 @@ def check_arch(arch, tuner):
                 try:
                     # The legacy generators print when a kernel table is missing.
                     with contextlib.redirect_stdout(io.StringIO()):
-                        legacy = legacy_fn(tuner, info) if info[12] else set()
+                        tuned = legacy_tunes(info)
+                        legacy = legacy_fn(tuner, info) if tuned else set()
                 except Exception as exc:  # noqa: BLE001
                     raised, legacy = exc, set()
-                v2 = v2_candidates(segments, problem)
+                v2, twice = v2_candidates(segments, problem)
                 counts[f"{family} legacy"] += len(legacy)
                 counts[f"{family} v2"] += len(v2)
+                if twice:
+                    problem_at(family, info, "listed twice", sorted(twice)[:2])
                 if v2 - legacy:
                     problem_at(family, info, "v2-only", sorted(v2 - legacy)[:2])
                 if not (legacy - v2 or raised is not None):
                     continue
-                reason = known_difference(family, info, raised)
-                if reason is None and raised is not None:
+                k = known_difference(family, info, raised)
+                if k is None and raised is not None:
                     problem_at(family, info, "legacy raises", repr(raised))
-                elif reason is None:
+                elif k is None:
                     problem_at(family, info, "legacy-only", sorted(legacy - v2)[:2])
                 elif v2:
-                    problem_at(family, info, f"partly known ({reason})", "")
-                elif raised is None and (
-                    accepting := [s.name for s in segments if s.accepts(problem)]
+                    problem_at(family, info, f"partly known ({k.reason})", "")
+                elif (
+                    raised is None
+                    and not k.declined
+                    and (accepting := [s.name for s in segments if s.accepts(problem)])
                 ):
                     problem_at(
-                        family, info, f"known ({reason}) but accepted", accepting
+                        family, info, f"known ({k.reason}) but accepted", accepting
                     )
                 else:
-                    known[reason] += 1
+                    known[k.reason] += 1
     return counts, known, problems
 
 

@@ -26,7 +26,7 @@ from .ck import (
     int8_per_tensor_caps,
     int8_per_token_caps,
 )
-from .defaults import TUNE_BLOCK_MS
+from .defaults import TUNE_BLOCK_MS, tunable
 
 
 def asm_stage1(
@@ -324,8 +324,7 @@ class AsmStage1(Segment):
         )
 
     def param_space(self, p):
-        # The legacy tuner tunes no g1u0 key; the 1x128 capabilities admit g1u0.
-        if not self.accepts(p) or not p.is_g1u1:
+        if not (self.accepts(p) and tunable(p)):
             return ()
         return tuple(
             Params(kernel=name, block_m=tile_m)

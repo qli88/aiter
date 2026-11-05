@@ -15,7 +15,7 @@ from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec, scale_spec
 from .base import Cap, Params, Segment
-from .defaults import TUNE_BLOCK_MS
+from .defaults import TUNE_BLOCK_MS, tunable
 
 
 def ck_moe_stage1(
@@ -236,15 +236,13 @@ def _ck_dtype(dtype):
 
 
 def _ck_tunable(p) -> bool:
-    """The problems the legacy tuner lists CK instances for without raising: g1u1 (it
-    tunes no g1u0 key), per-1x32 only as fp4 x fp4 without Swiglu (fp8 x fp4 goes to
-    CK-Tile), and the activations the codegen maps (`ACT_OP_MAP`)."""
+    """The problems the legacy CK generator lists instances for without raising:
+    per-1x32 only as fp4 x fp4 without Swiglu (fp8 x fp4 goes to CK-Tile), and the
+    activations the codegen maps (`ACT_OP_MAP`)."""
     from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_ck2stages_common import (
         ACT_OP_MAP,
     )
 
-    if not p.is_g1u1:
-        return False
     if p.quant_type == QuantType.per_1x32 and not (
         p.act_in.dtype == p.w1.dtype == dtypes.fp4x2 and p.activation.kind != "swiglu"
     ):
@@ -273,7 +271,7 @@ def _ck_instances(stage, arch, a, b, c, quant, act, doweight):
 
 def ck_param_space(segment, p, stage):
     names = tuple(_ck_dtype(d) for d in (p.act_in.dtype, p.w1.dtype, p.out_dtype))
-    if not segment.accepts(p) or not _ck_tunable(p) or None in names:
+    if not (segment.accepts(p) and tunable(p) and _ck_tunable(p)) or None in names:
         return ()
     instances = _ck_instances(
         stage,

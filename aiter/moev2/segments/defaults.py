@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Default kernel parameters used when no tuned row applies."""
+"""Default kernel parameters used when no tuned row applies, and the problems and
+block_m values the tuner tries."""
 
 import functools
 import os
@@ -11,6 +12,12 @@ from aiter.jit.utils.chip_info import get_cu_num
 BLOCK_SIZE_M = 32
 # The block_m values the tuner tries.
 TUNE_BLOCK_MS = (16, 32, 64, 128)
+
+
+def tunable(p) -> bool:
+    """The problems the tuner lists candidates for, as the legacy tuner: g1u1 only,
+    per-1x32 only on gfx950."""
+    return p.is_g1u1 and (p.quant_type != QuantType.per_1x32 or p.arch == "gfx950")
 
 
 @functools.lru_cache(maxsize=2048)

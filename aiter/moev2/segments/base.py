@@ -221,7 +221,9 @@ class Segment:
       each: `kernel` and the structure values (`block_m`, `nt`) that the other
       segments of the plan must share. It reads the family's own instance list,
       filtered by the problem as the legacy tuner's `gen_*_task` for the family
-      filters it; () for a problem the segment does not accept.
+      filters it; () for a problem the segment does not accept, one the legacy
+      `tune()` skips (`defaults.tunable`), or one where dispatch would discard the
+      tuned row.
     - Stage 2 only: `stage2_kernel` (a rename of the tuned name, e.g. fp4 to fp8);
       `stage2_launch(c)`, None, or what the executor calls instead of the plan's stage 2
       kernel: `launch(ordinary_stage2=, stage2_args=, stage2_kwargs=)` returning the

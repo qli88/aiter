@@ -27,8 +27,8 @@ from ..dispatch import kernel_names, overrides
 from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec, scale_spec
-from .base import Cap, DefaultKernels, RowRejection, Segment
-from .defaults import BLOCK_SIZE_M
+from .base import Cap, DefaultKernels, Params, RowRejection, Segment
+from .defaults import BLOCK_SIZE_M, TUNE_BLOCK_MS, tunable
 from .flydsl import (
     _flydsl_stage1_wrapper,
     _flydsl_stage2_wrapper,
@@ -184,6 +184,13 @@ def _row_names(row):
     )
 
 
+TUNED_ROW_ACTIVATIONS = (
+    ActivationType.Silu,
+    ActivationType.Swiglu,
+    ActivationType.Situv2,
+)
+
+
 def mxfp4_row_rejection(p, row) -> RowRejection | None:
     """The legacy `get_2stage_cfgs` checks, in its order, that discard a tuned row with
     an Opus, FlyDSL or MXMOE kernel. (Its stage 2 checks are with `cktile.gemm2` and
@@ -197,20 +204,14 @@ def mxfp4_row_rejection(p, row) -> RowRejection | None:
             "both w1 and w2 must be marked is_shuffled=True; using default "
             "heuristics"
         )
-    if kn1.startswith("opus_") and activation not in (
-        ActivationType.Silu,
-        ActivationType.Swiglu,
-        ActivationType.Situv2,
-    ):
+    if kn1.startswith("opus_") and activation not in TUNED_ROW_ACTIVATIONS:
         return RowRejection(
             f"[fused_moe] discarding Opus tuned config for unsupported "
             f"activation {activation}; using default heuristics"
         )
-    if (kn1.startswith("flydsl_") or kn2.startswith("flydsl_")) and activation not in (
-        ActivationType.Silu,
-        ActivationType.Swiglu,
-        ActivationType.Situv2,
-    ):
+    if (
+        kn1.startswith("flydsl_") or kn2.startswith("flydsl_")
+    ) and activation not in TUNED_ROW_ACTIVATIONS:
         return RowRejection(
             f"[fused_moe] discarding FlyDSL tuned config for unsupported "
             f"activation {activation}; using default heuristics"
@@ -348,6 +349,148 @@ def _stage1_fused_quant(kernel_name) -> str:
     return "fp8" if "_fp8" in options else ("fp4" if "_fp4" in options else "")
 
 
+@functools.cache
+def _flydsl_kernels(lister, *args) -> dict:
+    """A FlyDSL kernel registry (`aiter.ops.flydsl.moe_kernels.<lister>`); read only."""
+    from aiter.ops.flydsl import moe_kernels
+
+    return getattr(moe_kernels, lister)(*args)
+
+
+def _split_k_fits(k, model_dim) -> bool:
+    kb, kw, tk = k.get("k_batch", 1), k.get("k_wave", 1), k["tile_k"]
+    if model_dim % kb or (model_dim // kb) % tk:
+        return False
+    k_per_batch = model_dim // kb
+    return kw <= 1 or not (k_per_batch % kw or (k_per_batch // kw) % tk)
+
+
+def _out_token(p) -> str:
+    return "bf16" if p.out_dtype == dtypes.bf16 else "f16"
+
+
+@functools.cache
+def _flydsl_candidates(a, b, out, model_dim, inter_dim) -> tuple:
+    """`(stage, kernel, block_m)` of the legacy tuner's `gen_flydsl_2stages_task`."""
+    s1 = _flydsl_kernels("get_flydsl_stage1_kernels", a, b, out)
+    s2 = _flydsl_kernels("get_flydsl_stage2_kernels", a, b, out)
+    fused = {"fp8": "_fp8", "fp4": "_fp4"}.get(a)
+    out_list = []
+    for block_m in TUNE_BLOCK_MS:
+        for name, k in s1.items():
+            if k["tile_m"] != block_m or not _split_k_fits(k, model_dim):
+                continue
+            # a16w4: each of the 4 // k_wave N-waves needs whole 16-wide MFMA tiles.
+            if a == "bf16" and k["tile_n"] % (16 * max(1, 4 // k.get("k_wave", 1))):
+                continue
+            if fused is None:
+                names = (name,)
+            elif k.get("k_batch", 1) > 1:
+                names = (name + fused,)
+            else:
+                names = (name, name + fused)
+            out_list += [(1, n, block_m) for n in names]
+        for name, k in s2.items():
+            tile_m = k["tile_m"]
+            if block_m % tile_m or tile_m not in (block_m, block_m // 2):
+                continue
+            lds = tile_m * (k["tile_k"] * 2 + k["tile_n"] * 4)
+            if a == "bf16" and (
+                tile_m != block_m or lds > 160 * 1024 or inter_dim % k["tile_k"]
+            ):
+                continue
+            sbm = "" if tile_m == block_m else f"_sbm{block_m}"
+            out_list.append((2, name + sbm, block_m))
+    return tuple(out_list)
+
+
+@functools.cache
+def _flydsl_int4_candidates(out, model_dim) -> tuple:
+    """`(stage, kernel, block_m)` of the legacy tuner's `gen_flydsl_i4_2stages_task`."""
+    s1 = _flydsl_kernels("get_flydsl_stage1_kernels_int4_bf16", out)
+    s2 = _flydsl_kernels("get_flydsl_stage2_kernels_int4_bf16", out)
+    out_list = []
+    for block_m in TUNE_BLOCK_MS:
+        for name, k in s1.items():
+            kb, tk = k.get("k_batch", 1), k["tile_k"]
+            k_tiles = (model_dim // kb) // tk
+            if k["tile_m"] != block_m or (
+                kb > 1
+                and (
+                    model_dim % kb
+                    or (model_dim // kb) % tk
+                    or k_tiles < 4
+                    or k_tiles % 2
+                )
+            ):
+                continue
+            out_list.append((1, name, block_m))
+        out_list += [
+            (2, name, block_m)
+            for name, k in s2.items()
+            if k["tile_m"] == block_m
+            and k.get("mode", "atomic") == "atomic"
+            and k.get("persist") is None
+        ]
+    return tuple(out_list)
+
+
+@functools.cache
+def _flydsl_layout_candidates(a, b, model_dim, inter_dim) -> tuple:
+    """`(stage, kernel, block_m)` of the legacy tuner's `gen_flydsl_v2_2stages_task`:
+    the fused stage 1 without split-K, and the layout GEMM2s."""
+    s1 = _flydsl_kernels("get_flydsl_stage1_kernels", a, b, "bf16")
+    out_list = []
+    for block_m in (32, 64, 128):
+        out_list += [
+            (1, f"{name}_{a}", block_m)
+            for name, k in s1.items()
+            if k.get("tile_m") == block_m and k.get("k_batch", 1) == 1
+        ]
+        s2 = _flydsl_kernels(
+            "get_flydsl_stage2_v2_kernels", a, b, "bf16", block_m, model_dim, inter_dim
+        )
+        out_list += [(2, name, block_m) for name in s2]
+    return tuple(out_list)
+
+
+def flydsl_candidates(p, layout) -> tuple:
+    """The legacy tuner's FlyDSL candidates for `p`: the layout ones (`layout`), else
+    the token-major and int4 ones."""
+    if p.quant_type != QuantType.per_1x32:
+        return ()
+    s = p.shape
+    a, b = mx_token(p.act_in.dtype), mx_token(p.w1.dtype)
+    if layout:
+        if p.out_dtype != dtypes.bf16 or "doweight_stage1" in p.features:
+            return ()
+        if (a, b) not in (("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")):
+            return ()
+        return _flydsl_layout_candidates(a, b, s.model_dim, s.inter_dim)
+    if p.w1.dtype == dtypes.i4x2:
+        return _flydsl_int4_candidates(_out_token(p), s.model_dim)
+    if not b:
+        return ()
+    a = {dtypes.bf16: "bf16", dtypes.fp16: "fp16"}.get(p.act_in.dtype, a or "fp8")
+    return _flydsl_candidates(a, b, _out_token(p), s.model_dim, s.inter_dim)
+
+
+def flydsl_param_space(segment, p, layout) -> tuple:
+    """The FlyDSL candidates `segment` runs: its stage, and the kernels it owns. None
+    for an activation whose FlyDSL tuned rows dispatch discards (the legacy tuner lists
+    them)."""
+    if not (segment.accepts(p) and tunable(p)):
+        return ()
+    if p.activation.activation not in TUNED_ROW_ACTIVATIONS:
+        return ()
+    stage = 1 if Op.GEMM1 in segment.covers else 2
+    return tuple(
+        Params(kernel=name, block_m=block_m)
+        for st, name, block_m in flydsl_candidates(p, layout)
+        if st == stage and segment.owns(kernel_names.parse(name))
+    )
+
+
 class _FlydslStage1(Segment):
     prefixes = (kernel_names.FLYDSL,)
 
@@ -375,6 +518,9 @@ class _FlydslStage1(Segment):
 
     def metadata_fields(self, p, params):
         return {"has_bias": swiglu_bias(p, tuned=params.get("tuned", False))}
+
+    def param_space(self, p):
+        return flydsl_param_space(self, p, layout=False)
 
 
 class FlydslGemm1(_FlydslStage1):
@@ -529,6 +675,9 @@ class FlydslGemm1Layout(_FlydslStage1):
     def _a_dtype(params):
         return parse_flydsl_v2_gemm2_kernel(params.kernel2)["a_dtype"]
 
+    def param_space(self, p):
+        return flydsl_param_space(self, p, layout=True)
+
 
 class FlydslGemm2(Segment):
     name = "flydsl.gemm2"
@@ -574,6 +723,9 @@ class FlydslGemm2(Segment):
 
     def metadata_fields(self, p, params):
         return {"stage2_has_bias": swiglu_bias(p, tuned=params.get("tuned", False))}
+
+    def param_space(self, p):
+        return flydsl_param_space(self, p, layout=False)
 
 
 class FlydslLayoutGemm2(Segment):
@@ -639,6 +791,9 @@ class FlydslLayoutGemm2(Segment):
 
     def metadata_fields(self, p, params):
         return {"stage2_has_bias": swiglu_bias(p)}
+
+    def param_space(self, p):
+        return flydsl_param_space(self, p, layout=True)
 
 
 class FlydslLayoutGemm2Scatter(FlydslLayoutGemm2):

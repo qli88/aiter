@@ -546,7 +546,8 @@ def fhmoe_caps():
 
 
 class _FhmoeStage1:
-    """The FHMoE stage 1 over a plain FlyDSL stage 1 (first base after this one)."""
+    """The FHMoE stage 1 over a plain FlyDSL stage 1 (first base after this one). The
+    legacy tuner tunes no FHMoE call, so it lists no candidates."""
 
     @property
     def capabilities(self):
@@ -557,6 +558,9 @@ class _FhmoeStage1:
         return functools.partial(
             _flydsl_fhmoe_stage1_wrapper, *stage1.args, **stage1.keywords
         )
+
+    def param_space(self, p):
+        return ()
 
     def call_args(self, c):
         return {
@@ -581,9 +585,12 @@ class FlydslFhmoeGemm1Quant(_FhmoeStage1, FlydslGemm1Quant):
 
 
 class FlydslFhmoeGemm2(FlydslGemm2):
-    """`flydsl.gemm2` with the shared expert."""
+    """`flydsl.gemm2` with the shared expert; no candidates, as `_FhmoeStage1`."""
 
     name = "flydsl_fhmoe.gemm2"
+
+    def param_space(self, p):
+        return ()
 
     @property
     def capabilities(self):

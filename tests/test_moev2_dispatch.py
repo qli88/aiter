@@ -2263,3 +2263,84 @@ def test_tuning_candidates_skip_problems_legacy_does_not_tune():
     a4w4_swiglu = MoeProblem.from_legacy_key(*args, arch="gfx950", cu_num=256)
     assert ck.CkGemm1().accepts(a4w4_swiglu)
     assert ck.CkGemm1().param_space(a4w4_swiglu) == ()
+
+
+def _mx_problem(q_a, q_w, activation=ActivationType.Silu, arch="gfx950", out=None):
+    out = out or dtypes.bf16
+    args = (64, 7168, 256, 256, 8, out, q_a, q_w, QuantType.per_1x32, True)
+    args += (activation, False, 0, 0)
+    return MoeProblem.from_legacy_key(*args, arch=arch, cu_num=256)
+
+
+def test_flydsl_param_space_splits_the_legacy_candidates_by_segment():
+    from aiter.moev2.segments import flydsl_fhmoe, mxfp4
+
+    a4w4 = _mx_problem(dtypes.fp4x2, dtypes.fp4x2)
+    gemm1 = mxfp4.FlydslGemm1().param_space(a4w4)
+    fused = mxfp4.FlydslGemm1Quant().param_space(a4w4)
+    layout1 = mxfp4.FlydslGemm1Layout().param_space(a4w4)
+    assert gemm1 and fused and layout1
+    assert not any(p["kernel"].endswith("_fp4") for p in gemm1)
+    assert all(p["kernel"].endswith("_fp4") for p in fused + layout1)
+    assert {p["block_m"] for p in layout1} == {32, 64, 128}
+    gemm2 = mxfp4.FlydslGemm2().param_space(a4w4)
+    assert gemm2 and all(p["kernel"].startswith("flydsl_moe2_a") for p in gemm2)
+    layout2 = mxfp4.FlydslLayoutGemm2().param_space(a4w4)
+    scatter = mxfp4.FlydslLayoutGemm2Scatter().param_space(a4w4)
+    assert layout2 and scatter
+    assert all("_scatter" in p["kernel"] for p in scatter)
+    assert not any("_scatter" in p["kernel"] for p in layout2)
+    for fhmoe in (
+        flydsl_fhmoe.FlydslFhmoeGemm1(),
+        flydsl_fhmoe.FlydslFhmoeGemm1Quant(),
+        flydsl_fhmoe.FlydslFhmoeGemm2(),
+    ):
+        assert fhmoe.param_space(a4w4) == ()
+
+    a16wi4 = _mx_problem(dtypes.bf16, dtypes.i4x2)
+    gemm2 = mxfp4.FlydslGemm2().param_space(a16wi4)
+    assert gemm2 and all("_atomic" in p["kernel"] for p in gemm2)
+    assert mxfp4.FlydslGemm1Layout().param_space(a16wi4) == ()
+
+
+def test_flydsl_param_space_follows_the_legacy_name_rules():
+    from aiter.moev2.segments import mxfp4
+    from aiter.ops.flydsl import moe_kernels
+
+    a4w4 = _mx_problem(dtypes.fp4x2, dtypes.fp4x2)
+    s1 = moe_kernels.get_flydsl_stage1_kernels("fp4", "fp4", "bf16")
+    unfused = mxfp4.FlydslGemm1().param_space(a4w4)
+    fused = {p["kernel"] for p in mxfp4.FlydslGemm1Quant().param_space(a4w4)}
+    assert unfused and all(s1[p["kernel"]].get("k_batch", 1) == 1 for p in unfused)
+    split_k = {n + "_fp4" for n, k in s1.items() if k.get("k_batch", 1) > 1}
+    assert split_k & fused
+
+    s2 = moe_kernels.get_flydsl_stage2_kernels("fp4", "fp4", "bf16")
+    sbm = [p for p in mxfp4.FlydslGemm2().param_space(a4w4) if "_sbm" in p["kernel"]]
+    assert sbm
+    for p in sbm:
+        name, block_m = p["kernel"].rsplit("_sbm", 1)
+        assert int(block_m) == p["block_m"] == 2 * s2[name]["tile_m"]
+
+    f16 = _mx_problem(dtypes.fp4x2, dtypes.fp4x2, out=dtypes.fp16)
+    names = [p["kernel"] for p in mxfp4.FlydslGemm2().param_space(f16)]
+    assert names and all("_wfp4_f16_" in n for n in names)
+
+
+def test_flydsl_param_space_lists_none_where_dispatch_discards_the_row():
+    from aiter.moev2.segments import mxfp4
+
+    gelu = _mx_problem(dtypes.fp4x2, dtypes.fp4x2, ActivationType.Gelu)
+    segments = (mxfp4.FlydslGemm1(), mxfp4.FlydslGemm2(), mxfp4.FlydslGemm1Layout())
+    for segment in segments:
+        assert segment.accepts(gelu)
+        assert segment.param_space(gelu) == ()
+
+
+def test_flydsl_param_space_lists_per_1x32_on_gfx950_only():
+    from aiter.moev2.segments import mxfp4
+
+    for arch, listed in (("gfx942", False), ("gfx950", True)):
+        a16w4 = _mx_problem(dtypes.bf16, dtypes.fp4x2, ActivationType.Situv2, arch)
+        assert mxfp4.FlydslGemm1().accepts(a16w4)
+        assert bool(mxfp4.FlydslGemm1().param_space(a16w4)) is listed
