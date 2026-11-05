@@ -28,7 +28,7 @@ from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec, scale_spec
 from .base import Cap, DefaultKernels, Params, RowRejection, Segment
-from .defaults import BLOCK_SIZE_M, TUNE_BLOCK_MS, tunable
+from .defaults import BLOCK_SIZE_M, TUNE_BLOCK_MS, default_nt, tunable
 from .flydsl import (
     _flydsl_stage1_wrapper,
     _flydsl_stage2_wrapper,
@@ -343,6 +343,32 @@ def _a16wi4_default_kernels(p) -> DefaultKernels:
     return DefaultKernels(kn1, kn2, tile_m, 0, warning)
 
 
+def mxmoe_default_kernels(p) -> DefaultKernels:
+    """The legacy heuristic MXMOE fallback (SiTUv2 without a tuned row)."""
+    s = p.shape
+    token, topk, expert = s.m, s.topk, s.experts
+    bm = 64 if token < 512 else 128
+    rows_per_expert = -(-token * topk // expert)
+    g1_swz = min(6, max(1, -(-rows_per_expert // bm)))
+    g1_sfx = f"_xcd{g1_swz}" if g1_swz > 1 else ""
+    kn1 = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256_situv2{g1_sfx}"
+    kn2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{bm}x256x128_reduce_sbm{bm}"
+    warning = (
+        f"[fused_moe] no tuned FlyDSL config for {p.log_keys()}, "
+        f"using heuristic MXMOE fallback (kn1={kn1!r}, kn2={kn2!r})"
+    )
+    return DefaultKernels(kn1, kn2, bm, 0, warning)
+
+
+def _stage1_default_params(p, branch: DefaultKernels):
+    return Params(
+        kernel=branch.kernel1,
+        block_m=branch.block_m,
+        ksplit=branch.ksplit,
+        nt=default_nt(p),
+    )
+
+
 def _stage1_fused_quant(kernel_name) -> str:
     """What a FlyDSL stage 1 quantizes its output to, from its name ("" for none)."""
     options = kernel_name.split("_t")[-1]
@@ -550,8 +576,11 @@ class FlydslGemm1(_FlydslStage1):
     def produces(self, p, params):
         return Buf("inter", ScaleSpec(p.out_dtype))
 
-    def default_kernels(self, p):
-        return flydsl_default_kernels(p)
+    def default_params(self, p):
+        return _stage1_default_params(p, flydsl_default_kernels(p))
+
+    def default_warning(self, p):
+        return flydsl_default_kernels(p).warning
 
 
 class FlydslGemm1Quant(_FlydslStage1):
@@ -710,6 +739,9 @@ class FlydslGemm2(Segment):
     def check_row(self, p, row, kernel_name1=""):
         return mxfp4_row_rejection(p, row)
 
+    def default_params(self, p):
+        return Params(kernel=flydsl_default_kernels(p).kernel2)
+
     def build(self, p, params):
         return functools.partial(
             _flydsl_stage2_wrapper,
@@ -854,21 +886,13 @@ class MxmoeGemm1(Segment):
             interleave=(p.gate_mode == GateMode.INTERLEAVE),
         )
 
-    def default_kernels(self, p):
-        """The legacy heuristic MXMOE fallback (SiTUv2 without a tuned row)."""
-        s = p.shape
-        token, topk, expert = s.m, s.topk, s.experts
-        bm = 64 if token < 512 else 128
-        rows_per_expert = -(-token * topk // expert)
-        g1_swz = min(6, max(1, -(-rows_per_expert // bm)))
-        g1_sfx = f"_xcd{g1_swz}" if g1_swz > 1 else ""
-        kn1 = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256_situv2{g1_sfx}"
-        kn2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{bm}x256x128_reduce_sbm{bm}"
-        warning = (
-            f"[fused_moe] no tuned FlyDSL config for {p.log_keys()}, "
-            f"using heuristic MXMOE fallback (kn1={kn1!r}, kn2={kn2!r})"
-        )
-        return DefaultKernels(kn1, kn2, bm, 0, warning)
+    def default_params(self, p):
+        if self.reach != "ranked":
+            return None
+        return _stage1_default_params(p, mxmoe_default_kernels(p))
+
+    def default_warning(self, p):
+        return mxmoe_default_kernels(p).warning
 
     def metadata_fields(self, p, params):
         p1 = _parse_mxfp4_g1_kname(params.kernel)
@@ -926,6 +950,9 @@ class MxmoeGemm2(Segment):
 
     def check_row(self, p, row, kernel_name1=""):
         return mxfp4_row_rejection(p, row)
+
+    def default_params(self, p):
+        return Params(kernel=mxmoe_default_kernels(p).kernel2)
 
     def build(self, p, params):
         return functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=params.kernel)

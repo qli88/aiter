@@ -35,7 +35,7 @@ from ..dispatch.ops import Op
 from ..problem import FrozenMap, ScaleSpec
 from ..shapes import get_inter_dim
 from .base import Cap, DefaultKernels, Params, RowRejection, Segment
-from .defaults import default_ksplit, tunable
+from .defaults import default_ksplit, default_nt, tunable
 from .flydsl import (
     _can_reroute_mxfp4_to_flydsl,
     _flydsl_mxfp4_layout_is_compatible,
@@ -562,10 +562,12 @@ class CktileGemm1(Segment):
         return None
 
     @staticmethod
-    def _branch(p, params):
+    def _options(p, params):
+        """The stage 1 options: in `params` at `default_params`, else the CK-Tile branch
+        legacy takes for the tuned row."""
         if not params.kernel:
-            return cktile_default_kernels(p)
-        return cktile_branch(p, int(params.ksplit), tuned_row=True)
+            return params
+        return cktile_branch(p, int(params.ksplit), tuned_row=True).options
 
     def reads(self, p):
         return (Buf("sorted", None), Buf("tokens", p.act_in))
@@ -573,12 +575,27 @@ class CktileGemm1(Segment):
     def produces(self, p, params):
         return Buf("inter", ScaleSpec(p.out_dtype))
 
-    def default_kernels(self, p):
-        return cktile_default_kernels(p)
+    def default_params(self, p):
+        """Legacy's CK-Tile default branch for `p` (None outside them): `block_m`, the
+        metadata split-K and the stage 1 options, by the branch."""
+        branch = cktile_default_kernels(p)
+        if branch is None:
+            return None
+        return Params(
+            branch.options,
+            kernel=branch.kernel1,
+            block_m=branch.block_m,
+            ksplit=branch.ksplit,
+            nt=default_nt(p),
+        )
+
+    def default_warning(self, p):
+        branch = cktile_default_kernels(p)
+        return None if branch is None else branch.warning
 
     def build(self, p, params):
         layout = p.layout
-        options = self._branch(p, params).options
+        options = self._options(p, params)
         kwargs = {}
         if "post_activation_layout" in options:
             kwargs["post_activation_layout"] = options["post_activation_layout"]
@@ -595,7 +612,7 @@ class CktileGemm1(Segment):
     def metadata_fields(self, p, params):
         fields = {"has_bias": "bias1" in p.features}
         if params.kernel:
-            branch = self._branch(p, params)
+            branch = cktile_branch(p, int(params.ksplit), tuned_row=True)
             fields.update(block_m=branch.block_m, ksplit=branch.ksplit)
         return fields
 
@@ -656,6 +673,9 @@ class CktileGemm2(Segment):
 
     def produces(self, p, params):
         return Buf("out", ScaleSpec(p.out_dtype))
+
+    def default_params(self, p):
+        return Params(kernel="")
 
     def check_row(self, p, row, kernel_name1=""):
         kn2 = str(row.get("kernelName2", "") or "").strip()

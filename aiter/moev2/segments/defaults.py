@@ -9,6 +9,8 @@ import os
 from aiter import QuantType
 from aiter.jit.utils.chip_info import get_cu_num
 
+from .base import Params
+
 BLOCK_SIZE_M = 32
 # The block_m values the tuner tries.
 TUNE_BLOCK_MS = (16, 32, 64, 128)
@@ -58,6 +60,24 @@ def default_ksplit(quant_type, token, topk, expert, inter_dim, model_dim):
     if quant_type in (QuantType.per_1x128, QuantType.per_1x32):
         return get_ksplit(token, topk, expert, inter_dim, model_dim)
     return 0
+
+
+def default_nt(p) -> bool:
+    s = p.shape
+    return use_nt(s.m, s.topk, s.experts)
+
+
+def default_stage1_params(p):
+    """The legacy default 2-stage branch (CK, ASM stage 1): the launcher's heuristic
+    kernel (an empty name), `default_block_m`, `default_ksplit` and `use_nt`."""
+    s = p.shape
+    dims = (p.quant_type, s.m, s.topk, s.experts, s.inter_dim, s.model_dim)
+    return Params(
+        kernel="",
+        block_m=default_block_m(*dims),
+        ksplit=default_ksplit(*dims),
+        nt=default_nt(p),
+    )
 
 
 @functools.lru_cache(maxsize=2048)

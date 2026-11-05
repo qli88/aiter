@@ -110,8 +110,8 @@ NO_OPTIONS = FrozenMap()
 
 @dataclass(frozen=True)
 class DefaultKernels:
-    """The kernels a segment picks when no tuned row applies, and the warning logged
-    (None: none). `options`: extra stage 1 parameters (`Params`) of the choice."""
+    """A legacy default branch's choice: both stages' kernels, `block_m`, split-K and
+    the warning logged (None: none). `options`: extra stage 1 parameters."""
 
     kernel1: str
     kernel2: str
@@ -215,8 +215,10 @@ class Segment:
       discards it, with an optional warning), `declines_row` (migration only: the row
       goes back to the legacy code), `row_params` (what the row sets besides the kernel
       names).
-    - Without a tuned row: `default_kernels` (a stage 1 naming both stages' kernels),
-      `default_params`.
+    - Without a tuned row: `default_params(p)`, the `Params` it runs at, None where
+      legacy runs it only from tuned rows (any `reach` but "ranked"). A stage 1's params
+      also hold the plan's `block_m`, `ksplit` and `nt`, as legacy's default branches pick
+      them; `default_warning(p)` is the line legacy logs when it runs them.
     - Tuning: `param_space(p)`, the candidates the tuner may try for `p`, one `Params`
       each: `kernel` and the structure values (`block_m`, `nt`) that the other
       segments of the plan must share. It reads the family's own instance list,
@@ -274,8 +276,13 @@ class Segment:
     def accepts(self, p: MoeProblem) -> bool:
         return self.reject_reason(p) is None
 
-    def default_params(self, p: MoeProblem) -> Params:
-        return Params()
+    def default_params(self, p: MoeProblem) -> Params | None:
+        """The params it runs at without a tuned row, or None (see the class)."""
+        return None
+
+    def default_warning(self, p: MoeProblem) -> str | None:
+        """For a stage 1: the warning logged when it runs at `default_params`."""
+        return None
 
     def param_space(self, p: MoeProblem) -> tuple:
         return ()
@@ -307,11 +314,6 @@ class Segment:
 
     def declines_row(self, p: MoeProblem, row) -> str | None:
         """Why tuned `row` goes back to the legacy code for `p`, though owned, or None."""
-        return None
-
-    def default_kernels(self, p: MoeProblem) -> DefaultKernels | None:
-        """For a stage 1 without a tuned row: the kernels it names for both stages (with
-        block_m, ksplit and the warning logged), or None to keep the defaults."""
         return None
 
     def stage2_kernel(self, p: MoeProblem, kernel_name1, kernel_name2) -> str:

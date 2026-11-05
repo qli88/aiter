@@ -1006,6 +1006,68 @@ def test_blockscale_defaults_take_the_legacy_block_m_and_ksplit(monkeypatch):
     assert (res.metadata.block_m, res.metadata.ksplit) == (64, 0)
 
 
+def test_only_ranked_segments_have_default_params():
+    from aiter.moev2.migration import fhmoe
+    from aiter.moev2.segments import ck_tile
+
+    problems = (
+        _problem(),
+        _problem(quant=QuantType.per_1x128),
+        _problem(fp8=dtypes.i8),
+        _a4w4_problem(is_shuffled=True),
+        _a4w4_problem(activation=ActivationType.Situv2, is_shuffled=True),
+        _mx_problem(dtypes.fp8, dtypes.fp4x2, ActivationType.Swiglu),
+        api.fhmoe_problem(_mxfp8_problem()),
+    )
+    modules = _local_path_modules() + [fhmoe]
+    segments = {s.name: s for m in modules for s in m.SEGMENTS}
+    tried = collections.Counter()
+    for segment in segments.values():
+        for p in problems:
+            if not segment.accepts(p):
+                continue
+            params = segment.default_params(p)
+            tried[segment.reach, params is None] += 1
+            if segment.reach != "ranked":
+                assert params is None, (segment.name, p)
+            elif segment.name == "cktile.gemm1":
+                branch = ck_tile.cktile_default_kernels(p)
+                assert (params is None) == (branch is None), p
+            else:
+                assert params is not None, (segment.name, p)
+    assert {"flydsl_fhmoe.gemm1", "flydsl_fhmoe.gemm2", "cktile.gemm1"} <= set(segments)
+    assert tried["ranked", False] and tried["tuned", True]
+
+
+def test_a_default_plan_runs_its_stages_default_params(monkeypatch):
+    p = _a4w4_problem(is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, p)
+    stage1 = res.plan.covering(ops.Op.GEMM1)
+    stage2 = res.plan.starting(ops.Op.GEMM2)
+    first = stage1.segment.default_params(p)
+    assert first == Params(
+        kernel="flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2",
+        block_m=32,
+        ksplit=-1,
+        nt=True,
+    )
+    assert stage1.params.kernel == first.kernel
+    assert stage2.segment.default_params(p).kernel == stage2.params.kernel
+    assert stage2.params.kernel.startswith("flydsl_moe2_afp4_wfp4_bf16_t32x")
+    assert (res.plan.params.block_m, res.plan.params.ksplit) == (32, -1)
+    assert stage1.params.nt is stage2.params.nt is True
+    assert res.logs[-1] == (logging.WARNING, stage1.segment.default_warning(p))
+    assert "using heuristic FlyDSL fallback" in res.logs[-1][1]
+
+
+def test_a_ranked_structure_without_default_params_raises(monkeypatch):
+    from aiter.moev2.segments import ck
+
+    monkeypatch.setattr(ck.CkGemm2, "default_params", lambda self, p: None)
+    with pytest.raises(ValueError, match="ck.gemm2: no default params"):
+        _default_resolve(monkeypatch, 64, QuantType.per_Tensor)
+
+
 _ROW_1STAGE = {
     "block_m": 64,
     "ksplit": 0,

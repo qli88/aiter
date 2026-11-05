@@ -26,7 +26,7 @@ from .ck import (
     int8_per_tensor_caps,
     int8_per_token_caps,
 )
-from .defaults import TUNE_BLOCK_MS, tunable
+from .defaults import BLOCK_SIZE_M, TUNE_BLOCK_MS, default_stage1_params, tunable
 
 
 def asm_stage1(
@@ -315,6 +315,9 @@ class AsmStage1(Segment):
     def produces(self, p, params):
         return Buf("inter", ScaleSpec(dtypes.bf16))
 
+    def default_params(self, p):
+        return default_stage1_params(p) if self.reach == "ranked" else None
+
     def build(self, p, params):
         return functools.partial(
             asm_stage1,
@@ -506,16 +509,17 @@ class AsmFmoe1Stage(Segment):
     def produces(self, p, params):
         return Buf("out", ScaleSpec(p.out_dtype))
 
-    @staticmethod
-    def default_xbf16(p) -> bool:
-        """Legacy's default `xbf16`: the gfx950 1x128 kernels under AITER_XBFLOAT16=1."""
+    def default_params(self, p):
+        """Legacy's default 1-stage call: the launcher's heuristic kernel, `xbf16` for
+        the gfx950 1x128 kernels under AITER_XBFLOAT16=1."""
         from ..dispatch import overrides
 
-        return (
+        xbf16 = (
             p.quant_type == QuantType.per_1x128
             and p.arch == "gfx950"
             and overrides.xbf16()
         )
+        return Params(kernel="", block_m=BLOCK_SIZE_M, ksplit=0, xbf16=xbf16, flat=0)
 
     def build(self, p, params):
         return functools.partial(

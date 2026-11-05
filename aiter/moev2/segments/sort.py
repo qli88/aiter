@@ -26,7 +26,7 @@ from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 from .. import hooks
 from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
-from .base import Cap, Segment
+from .base import Cap, Params, Segment
 from .flydsl import _empty_bf16
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
@@ -601,6 +601,10 @@ class Sort(Segment):
 
     def produces(self, p, params):
         return Buf("sorted", None, block_m=params.get("block_m"))
+
+    def default_params(self, p):
+        """No params of its own: it sorts at the plan's `block_m`, which the stage 1 sets."""
+        return Params() if self.reach == "ranked" else None
 
     def run(
         self,

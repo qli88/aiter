@@ -387,6 +387,20 @@ def _two_stage_plan(
     return plan, metadata
 
 
+# The keys of a stage 1's default params the resolver places itself; the rest are the
+# stage 1's options.
+_PLAN_DEFAULTS = frozenset({"kernel", "block_m", "ksplit", "nt"})
+
+
+def _default_params(problem, structure) -> dict:
+    """`{segment: default_params}` of a ranked structure; raises where one has none."""
+    defaults = {segment: segment.default_params(problem) for segment in structure}
+    missing = [segment.name for segment, params in defaults.items() if params is None]
+    if missing:
+        raise ValueError(f"{', '.join(missing)}: no default params for {problem}")
+    return defaults
+
+
 def resolve(problem, segments) -> Resolution:
     explain = [] if overrides.explain() else None
 
@@ -503,15 +517,21 @@ def resolve(problem, segments) -> Resolution:
             return declined(f"ranking {region}: {legacy} is not ported")
         if structure is None:
             return declined(f"ranking {region}: no listed structure is feasible")
-        kernelName1 = ""
+        defaults = _default_params(problem, structure)
         kernelName2 = ""
         one_stage = _one_stage(structure)
         run_1stage = one_stage is not None
-        run_1stage_xbf16 = run_1stage and one_stage.default_xbf16(problem)
-        flat = 0
-        dims = (q_type, s.m, s.topk, s.experts, s.inter_dim, s.model_dim)
-        block_m = BLOCK_SIZE_M if run_1stage else default_block_m(*dims)
-        ksplit = 0 if run_1stage else default_ksplit(*dims)
+        if run_1stage:
+            first = defaults[one_stage]
+            kernelName1, block_m, ksplit = first.kernel, first.block_m, first.ksplit
+            run_1stage_xbf16, flat = first.xbf16, first.flat
+        else:
+            # Legacy logs its generic 2-stage heuristic whatever branch runs; the
+            # stages' `default_params` replace it below.
+            kernelName1 = ""
+            run_1stage_xbf16, flat = False, 0
+            dims = (q_type, s.m, s.topk, s.experts, s.inter_dim, s.model_dim)
+            block_m, ksplit = default_block_m(*dims), default_ksplit(*dims)
         use_non_temporal_load = use_nt(s.m, s.topk, s.experts)
         logs.append(
             (
@@ -589,14 +609,15 @@ def resolve(problem, segments) -> Resolution:
             f"[fused_moe] using 2stage {'default' if cfg is None else tag} for {keys} ",
         )
     )
-    default = gemm1.default_kernels(problem) if source != "tuned" else None
     options = NO_OPTIONS
-    if default is not None:
-        kernelName1, kernelName2 = default.kernel1, default.kernel2
-        block_m, ksplit = default.block_m, default.ksplit
-        options = default.options
-        if default.warning is not None:
-            logs.append((WARNING, default.warning))
+    if source != "tuned":
+        first, second = defaults[gemm1], defaults[gemm2]
+        kernelName1, kernelName2 = first.kernel, second.kernel
+        block_m, ksplit, use_non_temporal_load = first.block_m, first.ksplit, first.nt
+        options = Params({k: v for k, v in first.items() if k not in _PLAN_DEFAULTS})
+        warning = gemm1.default_warning(problem)
+        if warning is not None:
+            logs.append((WARNING, warning))
     built = _two_stage_plan(
         problem,
         structure,

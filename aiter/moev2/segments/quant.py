@@ -26,7 +26,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
-from .base import Cap, Segment
+from .base import Cap, Params, Segment
 from .ck import blockscale_fp8
 
 _FEATURES = frozenset(
@@ -48,6 +48,9 @@ class QuantA1(Segment):
 
     def produces(self, p, params):
         return Buf("tokens", p.act_in, scales=self.scales)
+
+    def default_params(self, p):
+        return Params() if self.reach == "ranked" else None
 
     def run(self, quant_type, hidden_states, a1_scale, q_dtype_a, num_local_tokens):
         """`(a1, a1_scale)`: quantize unless the activations already are `q_dtype_a`
@@ -283,6 +286,9 @@ class QuantInter(Segment):
 
     def produces(self, p, params):
         return Buf("inter", p.act_in)
+
+    def default_params(self, p):
+        return Params()
 
     def run(
         self,

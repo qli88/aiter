@@ -15,7 +15,7 @@ from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec, scale_spec
 from .base import Cap, Params, Segment
-from .defaults import TUNE_BLOCK_MS, tunable
+from .defaults import TUNE_BLOCK_MS, default_stage1_params, tunable
 
 
 def ck_moe_stage1(
@@ -324,6 +324,9 @@ class CkGemm1(Segment):
     def produces(self, p, params):
         return Buf("inter", ScaleSpec(p.out_dtype))
 
+    def default_params(self, p):
+        return default_stage1_params(p)
+
     def build(self, p, params):
         return functools.partial(
             ck_moe_stage1,
@@ -358,6 +361,9 @@ class CkGemm2(Segment):
 
     def produces(self, p, params):
         return Buf("out", ScaleSpec(p.out_dtype))
+
+    def default_params(self, p):
+        return Params(kernel="")
 
     def build(self, p, params):
         return functools.partial(
