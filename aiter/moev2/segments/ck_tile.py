@@ -10,8 +10,15 @@ Relu2, split-K, Swiglu without a kernelName1), which differ in the stage 1 split
 activation layout and the `block_m`/`ksplit` of the metadata (`cktile_branch`): as a
 default, or for a tuned row named `swiglu_mxfp4_bf16_cktile`, which legacy treats as a
 tuned row without kernels (the branches with its split-K). A tuned `cktile_*`
-kernelName1 goes to legacy's ASM stage 1 and stays unowned. `cktile.gemm2` also runs the
-`cktile_*` stage 2 of tuned rows.
+kernelName1 that neither those branches nor FlyDSL's default take goes to legacy's ASM
+stage 1 and stays unowned. `cktile.gemm2` also runs the `cktile_*` stage 2 of tuned
+rows.
+
+Tuner candidates (a8w4): for the legacy tuner's `cktile_a8w4_bm*` stage 1 names,
+`cktile.gemm1` lists what the CK-Tile branch that takes them runs (the interleaved Swiglu
+branch, `CKTILE_A8W4_STAGE1`; the split-K branch, `cktile_a8w4_split_k_stage1`), and
+`cktile.gemm2` lists the legacy tuner's stage 2 names; `aiter/moev2/kernel_name_map.csv`
+shows the mapping.
 """
 
 import functools
@@ -27,8 +34,8 @@ from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..problem import FrozenMap, ScaleSpec
 from ..shapes import get_inter_dim
-from .base import Cap, DefaultKernels, RowRejection, Segment
-from .defaults import default_ksplit
+from .base import Cap, DefaultKernels, Params, RowRejection, Segment
+from .defaults import default_ksplit, tunable
 from .flydsl import (
     _can_reroute_mxfp4_to_flydsl,
     _flydsl_mxfp4_layout_is_compatible,
@@ -404,13 +411,22 @@ def cktile_default_kernels(p) -> DefaultKernels:
     return cktile_branch(p, ksplit, tuned_row=False)
 
 
+# Legacy `get_block_m()` by token count: `block_m` below each bound, else the last.
+CKTILE_TIER_BLOCK_MS = ((2048, 16), (16384, 32), (None, 64))
+
+
+def cktile_tier_block_m(token) -> int:
+    return next(
+        b for bound, b in CKTILE_TIER_BLOCK_MS if bound is None or token < bound
+    )
+
+
 def cktile_branch(p, ksplit, tuned_row) -> DefaultKernels | None:
     """The CK-Tile branch legacy takes for `p` with the split-K `ksplit` (the default,
     or a tuned row's), in its order: `block_m`, the metadata split-K, the stage 1
     options and the warning; None when legacy takes none of them. `tuned_row`: a
     non-empty kernelName1 rules out the last branch (Swiglu without one)."""
-    token = p.shape.m
-    tier_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
+    tier_block_m = cktile_tier_block_m(p.shape.m)
     if cktile_interleaved_swiglu(p):
         # `get_block_m()`; the metadata keeps the default split-K, stage 1 does not split.
         block_m = 32 if p.act_in.dtype == dtypes.fp8 else tier_block_m
@@ -481,6 +497,32 @@ def cktile_caps():
             pads=True,
             extras=frozenset({"disable_inline_sort"}),
         ),
+    )
+
+
+# The block_m values the legacy tuner tries for CK-Tile (`cktile_a8w4_bm<block_m>`).
+CKTILE_A8W4_BLOCK_MS = (32, 64)
+
+# What legacy's interleaved Swiglu branch runs for those stage 1 names: `get_block_m()`
+# (32 for fp8 activations), the row's split-K (the tuner writes 0), stage 1 unsplit.
+CKTILE_A8W4_STAGE1 = Params(kernel=kernel_names.CKTILE_ALIAS, block_m=32, ksplit=0)
+
+
+def cktile_a8w4_split_k_stage1(token) -> Params:
+    """What legacy's split-K branch runs for those stage 1 names (gate and up not
+    interleaved in the weights): the token tier's `block_m`, the row's split-K 0
+    (stage 1 splits in 2)."""
+    return Params(
+        kernel=kernel_names.CKTILE_ALIAS, block_m=cktile_tier_block_m(token), ksplit=0
+    )
+
+
+def _tuned_a8w4(p) -> bool:
+    """The keys the legacy tuner lists CK-Tile candidates for: fp8 x MXFP4, per-1x32."""
+    return (
+        p.quant_type == QuantType.per_1x32
+        and p.act_in.dtype == dtypes.fp8
+        and p.w1.dtype == dtypes.fp4x2
     )
 
 
@@ -557,6 +599,33 @@ class CktileGemm1(Segment):
             fields.update(block_m=branch.block_m, ksplit=branch.ksplit)
         return fields
 
+    def param_space(self, p):
+        """The CK-Tile stage 1 legacy runs for the legacy tuner's `cktile_a8w4_bm*`
+        candidates (no branch reads them by name): `CKTILE_A8W4_STAGE1` where the
+        interleaved Swiglu branch takes that row, `cktile_a8w4_split_k_stage1` where
+        the split-K branch does (`gate_up_interleave` False, where FlyDSL's default
+        does not take it); none where FlyDSL's default or ASM stage 1 (todo 5.17)
+        runs it, or dispatch discards the row."""
+        if not (self.accepts(p) and tunable(p) and _tuned_a8w4(p)):
+            return ()
+        if cktile_interleaved_swiglu(p):
+            params = CKTILE_A8W4_STAGE1
+        elif cktile_split_k(p, 0):
+            params = cktile_a8w4_split_k_stage1(p.shape.m)
+        else:
+            return ()
+        row = {
+            "kernelName1": params.kernel,
+            "kernelName2": params.kernel,
+            "ksplit": params.ksplit,
+        }
+        if (
+            self.declines_row(p, row) is not None
+            or CktileGemm2().check_row(p, row) is not None
+        ):
+            return ()
+        return (params,)
+
 
 class CktileGemm2(Segment):
     """CK-Tile stage 2, after a CK-Tile stage 1 or as a tuned row's `cktile_*` stage 2."""
@@ -596,6 +665,22 @@ class CktileGemm2(Segment):
                 f"for inter_dim={p.shape.inter_dim}; using default heuristics"
             )
         return None
+
+    def param_space(self, p):
+        """The legacy tuner's `cktile_a8w4_bm<block_m>` stage 2, except where dispatch
+        discards it. Legacy runs it at the row's `block_m` after a FlyDSL, Opus or ASM
+        stage 1, and at its CK-Tile branch's `block_m` after that branch's stage 1;
+        which stage 1 it follows is the structure's (5.2)."""
+        if not (self.accepts(p) and tunable(p) and _tuned_a8w4(p)):
+            return ()
+        names = (
+            (f"cktile_a8w4_bm{block_m}", block_m) for block_m in CKTILE_A8W4_BLOCK_MS
+        )
+        return tuple(
+            Params(kernel=name, block_m=block_m)
+            for name, block_m in names
+            if self.check_row(p, {"kernelName2": name}) is None
+        )
 
     def build(self, p, params):
         layout = p.layout

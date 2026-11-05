@@ -2265,11 +2265,20 @@ def test_tuning_candidates_skip_problems_legacy_does_not_tune():
     assert ck.CkGemm1().param_space(a4w4_swiglu) == ()
 
 
-def _mx_problem(q_a, q_w, activation=ActivationType.Silu, arch="gfx950", out=None):
+def _mx_problem(
+    q_a,
+    q_w,
+    activation=ActivationType.Silu,
+    arch="gfx950",
+    out=None,
+    inter_dim=256,
+    doweight=False,
+    **kwargs,
+):
     out = out or dtypes.bf16
-    args = (64, 7168, 256, 256, 8, out, q_a, q_w, QuantType.per_1x32, True)
-    args += (activation, False, 0, 0)
-    return MoeProblem.from_legacy_key(*args, arch=arch, cu_num=256)
+    args = (64, 7168, inter_dim, 256, 8, out, q_a, q_w, QuantType.per_1x32, True)
+    args += (activation, doweight, 0, 0)
+    return MoeProblem.from_legacy_key(*args, **kwargs, arch=arch, cu_num=256)
 
 
 def test_flydsl_param_space_splits_the_legacy_candidates_by_segment():
@@ -2344,3 +2353,101 @@ def test_flydsl_param_space_lists_per_1x32_on_gfx950_only():
         a16w4 = _mx_problem(dtypes.bf16, dtypes.fp4x2, ActivationType.Situv2, arch)
         assert mxfp4.FlydslGemm1().accepts(a16w4)
         assert bool(mxfp4.FlydslGemm1().param_space(a16w4)) is listed
+
+
+def _a8w4(activation=ActivationType.Swiglu, **kwargs):
+    return _mx_problem(dtypes.fp8, dtypes.fp4x2, activation, **kwargs)
+
+
+def _interleaved():
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    return {"gate_mode": GateMode.INTERLEAVE.value, "gate_up_interleave": True}
+
+
+def test_cktile_param_space_lists_what_legacy_runs():
+    from aiter.moev2.segments import ck_tile
+
+    gemm1, gemm2 = ck_tile.CktileGemm1(), ck_tile.CktileGemm2()
+    stage2 = {("cktile_a8w4_bm32", 32), ("cktile_a8w4_bm64", 64)}
+    interleaved = _a8w4(**_interleaved())
+    params = ck_tile.CKTILE_A8W4_STAGE1
+    assert gemm1.param_space(interleaved) == (params,)
+    assert gemm1.owns(kernel_names.parse(params["kernel"]))
+    branch = ck_tile.cktile_branch(interleaved, params["ksplit"], tuned_row=True)
+    assert (branch.block_m, branch.ksplit) == (params["block_m"], params["ksplit"])
+    assert branch.options["split_k"] == 1
+    assert {(p["kernel"], p["block_m"]) for p in gemm2.param_space(interleaved)} == (
+        stage2
+    )
+    for p in (_a8w4(), _a8w4(ActivationType.Silu, **_interleaved())):
+        assert gemm1.param_space(p) == ()
+        assert {(q["kernel"], q["block_m"]) for q in gemm2.param_space(p)} == stage2
+
+
+def test_cktile_param_space_lists_the_split_k_branch_without_gate_up_interleave():
+    from moe_dispatch.keys import _variant_kwargs
+
+    from aiter.moev2.segments import ck_tile
+
+    gemm1 = ck_tile.CktileGemm1()
+    standard = _variant_kwargs("standard", ActivationType.Swiglu)
+    assert gemm1.param_space(_a8w4(**standard)) == ()  # FlyDSL's default takes it
+    interleave_gate = {**_interleaved(), "gate_up_interleave": False}
+    tiers = ((64, 16), (2047, 16), (2048, 32), (16383, 32), (16384, 64), (20000, 64))
+    for token, block_m in tiers:
+        for p in (_a8w4(doweight=True, **standard), _a8w4(**interleave_gate)):
+            p = dataclasses.replace(p, shape=dataclasses.replace(p.shape, m=token))
+            (params,) = gemm1.param_space(p)
+            assert params == ck_tile.cktile_a8w4_split_k_stage1(token)
+            assert params["kernel"] == kernel_names.CKTILE_ALIAS
+            assert params["block_m"] == block_m
+            branch = ck_tile.cktile_branch(p, params["ksplit"], tuned_row=True)
+            assert branch.block_m == block_m and branch.options["split_k"] == 2
+
+
+def test_cktile_param_space_lists_none_where_dispatch_discards_the_row():
+    from aiter.moev2.segments import ck_tile
+
+    unsafe = _a8w4(inter_dim=384, **_interleaved())
+    for segment in (ck_tile.CktileGemm1(), ck_tile.CktileGemm2()):
+        assert segment.accepts(unsafe)
+        assert segment.param_space(unsafe) == ()
+
+
+def test_cktile_param_space_lists_a8w4_only():
+    from aiter.moev2.segments import ck_tile
+
+    a16w4 = _mx_problem(
+        dtypes.bf16, dtypes.fp4x2, ActivationType.Swiglu, **_interleaved()
+    )
+    for segment in (ck_tile.CktileGemm1(), ck_tile.CktileGemm2()):
+        assert segment.accepts(a16w4)
+        assert segment.param_space(a16w4) == ()
+
+
+def test_opus_param_space_follows_the_legacy_filters():
+    from aiter.moev2.segments import opus
+
+    gemm1, layout1, gemm2 = opus.OpusGemm1(), opus.OpusGemm1Layout(), opus.OpusGemm2()
+    p = _a8w4()
+    stage1 = gemm1.param_space(p)
+    assert stage1 and layout1.param_space(p) == stage1
+    assert all(q["block_m"] in (16, 32, 64, 128) for q in stage1)
+    names = {q["kernel"] for q in gemm2.param_space(p)}
+    plain = {n for n in names if not n.startswith("opus_moe2_layout_")}
+    assert plain and names == plain | {
+        n.replace("opus_moe2_", "opus_moe2_layout_", 1) for n in plain
+    }
+    for no_stage1 in (_a8w4(out=dtypes.fp16), _a8w4(doweight=True)):
+        assert gemm1.param_space(no_stage1) == ()
+        assert layout1.param_space(no_stage1) == ()
+    assert gemm2.param_space(_a8w4(out=dtypes.fp16))
+
+
+def test_opus_param_space_lists_a8w4_on_gfx950_only():
+    from aiter.moev2.segments import opus
+
+    segments = (opus.OpusGemm1(), opus.OpusGemm1Layout(), opus.OpusGemm2())
+    for p in (_a8w4(arch="gfx942"), _mx_problem(dtypes.fp4x2, dtypes.fp4x2)):
+        assert all(s.param_space(p) == () for s in segments)

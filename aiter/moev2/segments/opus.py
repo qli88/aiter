@@ -16,6 +16,7 @@ output). The kernels take the row's `block_m` (stage 1) and sort `block_m` (stag
 import functools
 import os
 
+from aiter import ActivationType, dtypes
 from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
@@ -26,8 +27,8 @@ from ..dispatch import kernel_names, overrides
 from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec
-from .base import RowRejection, Segment
-from .defaults import BLOCK_SIZE_M, default_block_m
+from .base import Params, RowRejection, Segment
+from .defaults import BLOCK_SIZE_M, TUNE_BLOCK_MS, default_block_m, tunable
 from .mxfp4 import (
     a8w4_caps,
     fused_inter,
@@ -43,6 +44,67 @@ def _opus_stage2_fp8_enabled():
 
 def _row_block_m(row):
     return int(row.get("block_m", BLOCK_SIZE_M))
+
+
+@functools.lru_cache(maxsize=2048)
+def _opus_candidates(model_dim, inter_dim, token, stage1) -> tuple:
+    """`(stage, kernel, block_m)` of the legacy tuner's `gen_opus_2stages_task` for a
+    tuned a8w4 key (`stage1`: its stage 1 filters pass); each stage 1 entry stands for
+    both of legacy's tasks (token-major and sorted output)."""
+    from csrc.opus_moe.opus_moe_common import (
+        OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT as contract,
+    )
+    from csrc.opus_moe.opus_moe_common import (
+        get_opus_a8w4_stage2_kernels,
+        opus_a8w4_stage1_instances_for_shape,
+    )
+
+    if inter_dim % (contract.bk_logical // contract.fp4_values_per_byte):
+        return ()
+    insts = opus_a8w4_stage1_instances_for_shape(
+        model_dim=model_dim, logical_inter_dim=inter_dim, inter_dim_pad=0
+    )
+    stage2 = get_opus_a8w4_stage2_kernels(token=token)
+    out = []
+    for block_m in TUNE_BLOCK_MS:
+        if stage1:
+            out += [
+                (1, inst.profile_name, block_m)
+                for inst in insts
+                if int(inst.block_m) == block_m
+            ]
+        for name, k in stage2.items():
+            block_n = int(k.get("kernel_block_n"))
+            if k["sort_block_m"] != block_m or block_n <= 0 or model_dim % block_n:
+                continue
+            layout = name.replace("opus_moe2_", "opus_moe2_layout_", 1)
+            out += [(2, name, block_m), (2, layout, block_m)]
+    return tuple(out)
+
+
+def opus_param_space(segment, p) -> tuple:
+    """The Opus candidates `segment` runs: its stage. Legacy's stage 1 filters: bf16
+    output, Silu/Swiglu/SiTUv2, no `doweight_stage1`."""
+    if not (
+        segment.accepts(p)
+        and tunable(p)
+        and p.act_in.dtype == dtypes.fp8
+        and p.w1.dtype == dtypes.fp4x2
+    ):
+        return ()
+    stage = 1 if Op.GEMM1 in segment.covers else 2
+    stage1 = (
+        p.out_dtype == dtypes.bf16
+        and p.activation.activation
+        in (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
+        and "doweight_stage1" not in p.features
+    )
+    s = p.shape
+    return tuple(
+        Params(kernel=name, block_m=block_m)
+        for st, name, block_m in _opus_candidates(s.model_dim, s.inter_dim, s.m, stage1)
+        if st == stage and segment.owns(kernel_names.parse(name))
+    )
 
 
 class _OpusStage1(Segment):
@@ -80,6 +142,9 @@ class _OpusStage1(Segment):
 
     def metadata_fields(self, p, params):
         return {"has_bias": swiglu_bias(p)}
+
+    def param_space(self, p):
+        return opus_param_space(self, p)
 
 
 class OpusGemm1(_OpusStage1):
@@ -214,3 +279,6 @@ class OpusGemm2(Segment):
 
     def metadata_fields(self, p, params):
         return dict(params.route)
+
+    def param_space(self, p):
+        return opus_param_space(self, p)
