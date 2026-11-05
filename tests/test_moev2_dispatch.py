@@ -2603,3 +2603,86 @@ def test_opus_param_space_lists_a8w4_on_gfx950_only():
     segments = (opus.OpusGemm1(), opus.OpusGemm1Layout(), opus.OpusGemm2())
     for p in (_a8w4(arch="gfx942"), _mx_problem(dtypes.fp4x2, dtypes.fp4x2)):
         assert all(s.param_space(p) == () for s in segments)
+
+
+class _Listed(Segment):
+    name = "test.listed"
+    prefixes = (kernel_names.CK2STAGES,)
+
+    def param_space(self, p):
+        return (
+            Params(kernel="a", block_m=32, nt=False),
+            Params(kernel="a", block_m=64, nt=True),
+            Params(kernel="b", block_m=32, nt=False),
+        )
+
+
+def test_params_reason_compares_the_candidate_fields():
+    p = _tuning_problem()
+    assert Segment().params_reason(p, Params(kernel="a")) == "no candidates"
+    s = _Listed()
+    for params, reason in (
+        (Params(kernel="a", block_m=64, nt=True), None),
+        (Params(kernel="b", block_m=32, nt=False, ksplit=0, kernel2="x"), None),
+        (Params(kernel="c", block_m=32, nt=False), "not a candidate"),
+        (Params(kernel="a", block_m=16, nt=True), "differs: block_m"),
+        (Params(kernel="a", block_m=32, nt=True), "differs: block_m"),
+        (Params(kernel="b", block_m=64, nt=True), "differs: block_m, nt"),
+        (Params(kernel="b", block_m=32), "differs: nt"),
+    ):
+        assert s.params_reason(p, params) == reason, params
+        assert s.params_valid(p, params) is (reason is None)
+
+
+def test_param_reasons_reads_each_kernel_choice_over_the_plan_params():
+    from aiter.moev2.dispatch import coverage
+
+    class Unnamed(Segment):
+        name = "test.unnamed"
+
+    listed = _Listed()
+    tuned_plan = plan.MoePlan(
+        (
+            plan.SegmentChoice(Unnamed(), Params(kernel="a")),
+            plan.SegmentChoice(listed, Params(kernel="a", nt=False)),
+            plan.SegmentChoice(listed, Params(kernel="b", block_m=64, nt=False)),
+            plan.SegmentChoice(listed, Params()),
+        ),
+        "tuned",
+        params=Params(block_m=32, ksplit=2),
+    )
+    assert coverage.param_reasons(_tuning_problem(), tuned_plan) == [
+        (listed, None),
+        (listed, "differs: block_m"),
+    ]
+
+
+def test_params_reason_compares_the_flydsl_layout_stage1_as_it_runs():
+    from aiter.moev2.segments import mxfp4
+
+    a4w4 = _mx_problem(dtypes.fp4x2, dtypes.fp4x2)
+    layout1 = mxfp4.FlydslGemm1Layout()
+    candidate = layout1.param_space(a4w4)[0]
+    kernel2 = next(
+        c["kernel"]
+        for c in mxfp4.FlydslLayoutGemm2().param_space(a4w4)
+        if c["block_m"] == candidate["block_m"]
+    )
+    plain = candidate.replace(kernel=candidate["kernel"].removesuffix("_fp4"))
+    assert plain["kernel"] != candidate["kernel"]
+    assert layout1.params_valid(a4w4, plain.replace(kernel2=kernel2))
+    assert layout1.params_reason(a4w4, plain) == "not a candidate"
+    other_m = 64 if candidate["block_m"] != 64 else 32
+    wrong_m = plain.replace(kernel2=kernel2, block_m=other_m)
+    assert layout1.params_reason(a4w4, wrong_m) == "differs: block_m"
+    fp8_kernel2 = kernel2.replace("_afp4_", "_afp8_")
+    assert fp8_kernel2 != kernel2
+    assert layout1.params_reason(a4w4, candidate.replace(kernel2=fp8_kernel2)) == (
+        "not a candidate"
+    )
+    unknown = candidate.replace(kernel="flydsl_moe1_unknown", kernel2=kernel2)
+    assert layout1.params_reason(a4w4, unknown) == "not a candidate"
+
+
+def test_shipped_tuned_rows_match_the_recorded_tuner_coverage():
+    _subprocess_check("row_params_checks.py")

@@ -704,6 +704,21 @@ class FlydslGemm1Layout(_FlydslStage1):
     def _a_dtype(params):
         return parse_flydsl_v2_gemm2_kernel(params.kernel2)["a_dtype"]
 
+    def effective_kernel(self, p, params):
+        """The kernel's registry params with the `out_dtype` `build` gives it: a plain
+        stage 1 name under a layout GEMM2 runs as its `_fp4` / `_fp8` candidate. The
+        name itself if the registry does not parse it."""
+        from .flydsl import _get_flydsl_moe_kernels
+
+        kernel = params.get("kernel", "")
+        parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel)
+        if parsed is None:
+            return kernel
+        kernel2 = parse_flydsl_v2_gemm2_kernel(params.get("kernel2") or "")
+        if kernel2 is not None:
+            parsed = {**parsed, "out_dtype": kernel2["a_dtype"]}
+        return Params(parsed)
+
     def param_space(self, p):
         return flydsl_param_space(self, p, layout=True)
 

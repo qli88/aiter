@@ -546,8 +546,9 @@ def fhmoe_caps():
 
 
 class _FhmoeStage1:
-    """The FHMoE stage 1 over a plain FlyDSL stage 1 (first base after this one). The
-    legacy tuner tunes no FHMoE call, so it lists no candidates."""
+    """The FHMoE stage 1 over a plain FlyDSL stage 1 (first base after this one). It
+    lists no candidates: legacy tunes FHMoE calls in `op_tests/tuners/tune_fhmoe.py`,
+    which `param_space` does not mirror yet."""
 
     @property
     def capabilities(self):

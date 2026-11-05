@@ -1,0 +1,33 @@
+{
+ "gfx1201": {},
+ "gfx942": {
+  "a16w4 | flydsl.gemm1 | no candidates": 32,
+  "a16w4 | flydsl.gemm2 | no candidates": 32,
+  "a16wi4 | flydsl.gemm1 | no candidates": 48,
+  "a16wi4 | flydsl.gemm2 | no candidates": 48,
+  "a8w8_blockscale | asm.fmoe_1stage | differs: xbf16": 5,
+  "a8w8_blockscale | asm.fmoe_1stage | not a candidate": 4
+ },
+ "gfx942_cu80": {
+  "a16w16 | impl.whole_graph | no candidates": 27,
+  "a16w4 | flydsl.gemm1 | no candidates": 32,
+  "a16w4 | flydsl.gemm2 | no candidates": 32,
+  "a8w8_blockscale | asm.fmoe_1stage | differs: xbf16": 4,
+  "a8w8_pt | impl.whole_graph | no candidates": 17,
+  "a8w8_ptok | impl.whole_graph | no candidates": 66
+ },
+ "gfx950": {
+  "a16w4 | asm.fmoe_1stage | no candidates": 6,
+  "a16w4 | cktile.gemm1 | no candidates": 24,
+  "a16w4 | cktile.gemm2 | no candidates": 24,
+  "a4w4 | asm.fmoe_1stage | no candidates": 17,
+  "a4w4 | mxmoe.gemm1 | no candidates": 85,
+  "a4w4 | mxmoe.gemm2 | no candidates": 210,
+  "a4w4 | mxmoe.quant_gemm1 | no candidates": 125,
+  "a8w4 | asm.stage1_cktile | no candidates": 5,
+  "a8w8_blockscale | ck.gemm1 | not a candidate": 7,
+  "fhmoe | flydsl_fhmoe.gemm1 | no candidates": 4,
+  "fhmoe | flydsl_fhmoe.gemm1_q | no candidates": 24,
+  "fhmoe | flydsl_fhmoe.gemm2 | no candidates": 28
+ }
+}

@@ -225,7 +225,9 @@ class Segment:
       filtered by the problem as the legacy tuner's `gen_*_task` for the family
       filters it; () for a problem the segment does not accept, one the legacy
       `tune()` skips (`defaults.tunable`), or one where dispatch would discard the
-      tuned row.
+      tuned row. `params_reason(p, params)` / `params_valid`: whether a tuned row's
+      choice is one of them, by `effective_kernel` (what runs under a name) and the
+      candidate's other fields; only a report reads it, not dispatch.
     - Stage 2 only: `stage2_kernel` (a rename of the tuned name, e.g. fp4 to fp8);
       `stage2_launch(c)`, None, or what the executor calls instead of the plan's stage 2
       kernel: `launch(ordinary_stage2=, stage2_args=, stage2_kwargs=)` returning the
@@ -286,6 +288,39 @@ class Segment:
 
     def param_space(self, p: MoeProblem) -> tuple:
         return ()
+
+    def effective_kernel(self, p: MoeProblem, params: Params):
+        """What runs under `params`' kernel, to compare a choice with `param_space`:
+        the name, unless this segment runs one name as another."""
+        return params.get("kernel", "")
+
+    def params_reason(self, p: MoeProblem, params: Params) -> str | None:
+        """None if `params` (a choice's, over the plan's) is a candidate of
+        `param_space(p)`: the same `effective_kernel` and the candidate's other fields.
+        Else "no candidates", "not a candidate" (no candidate has its effective kernel)
+        or "differs: <fields>", the fields of the closest such candidate."""
+        space = self.param_space(p)
+        if not space:
+            return "no candidates"
+        kernel = self.effective_kernel(p, params)
+        differs = []
+        for candidate in space:
+            if self.effective_kernel(p, candidate) != kernel:
+                continue
+            fields = [
+                f
+                for f, v in sorted(candidate.items())
+                if f != "kernel" and params.get(f) != v
+            ]
+            if not fields:
+                return None
+            differs.append(fields)
+        if not differs:
+            return "not a candidate"
+        return "differs: " + ", ".join(min(differs, key=lambda f: (len(f), f)))
+
+    def params_valid(self, p: MoeProblem, params: Params) -> bool:
+        return self.params_reason(p, params) is None
 
     def owns(self, kernel) -> bool:
         """Whether this segment runs the parsed tuned kernel name `kernel`."""

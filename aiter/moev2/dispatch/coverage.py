@@ -10,12 +10,15 @@ tests/moe_dispatch/coverage_checks.py):
   or a decline caused by its tuned row.
 - `row_status`: what the resolver does with the problem's exact tuned row: used, or
   why not (legacy's discard warning, or the decline).
+- `param_reasons`: for a plan a tuned row gives, whether each kernel segment's params
+  are a tuner candidate (`Segment.params_reason`; in CI over the shipped rows:
+  tests/moe_dispatch/row_params_checks.py).
 - `segment_errors`: segments whose `reach` does not hold: "ranked" in no ranking entry,
   "tuned" or "hibernating" in one, "tuned" run by no shipped tuned row, "hibernating"
   run by one or without a GPU test.
 """
 
-from ..segments.base import REACHES
+from ..segments.base import REACHES, Params
 from . import tuned
 from .ranking import _default_table, best
 from .resolver import WARNING, resolve
@@ -71,6 +74,16 @@ def row_status(problem, resolution) -> str | None:
         return "bypassed (AITER_BYPASS_TUNE_CONFIG)"
     warning = next((m for level, m in resolution.logs if level == WARNING), None)
     return f"discarded: {warning}" if warning else "discarded"
+
+
+def param_reasons(problem, plan) -> list:
+    """`(segment, reason)` for each segment of `plan` that runs a named kernel: its
+    `params_reason` for its params over the plan's (None: a tuner candidate)."""
+    return [
+        (c.segment, c.segment.params_reason(problem, Params(plan.params, **c.params)))
+        for c in plan.segments
+        if c.segment.prefixes and "kernel" in c.params
+    ]
 
 
 def segment_errors(paths, table=None, used=None, tested=frozenset()) -> list:
