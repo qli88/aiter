@@ -6,6 +6,7 @@ Per-key equality with the legacy code over the whole snapshot runs in a subproce
 (tests/moe_dispatch/key_checks.py, differential.py); the rest are unit tests.
 """
 
+import collections
 import dataclasses
 import functools
 import inspect
@@ -2186,3 +2187,79 @@ def test_shape_is_frozen():
         s.m = 3
     assert ActSpec("silu").activation == ActivationType.Silu
     assert WeightLayout("16x16", "separated").g1u1
+
+
+# 5.1 tuning candidates
+
+
+def test_param_space_matches_the_legacy_tuner_for_every_key():
+    _subprocess_check("param_space_checks.py")
+
+
+def _tuning_problem(
+    activation=ActivationType.Silu, quant=QuantType.per_Token, g1u1=True, **kw
+):
+    fp8 = dtypes.fp8
+    args = (64, 7168, 256, 256, 8, dtypes.bf16, fp8, fp8, quant, g1u1, activation)
+    args += (kw.pop("doweight", False), 0, 0)
+    return MoeProblem.from_legacy_key(*args, **kw, arch="gfx950", cu_num=256)
+
+
+def test_segments_list_no_candidates_by_default():
+    assert Segment().param_space(_tuning_problem()) == ()
+
+
+def test_ck_param_space_lists_the_codegen_instances():
+    from aiter.moev2.segments import ck
+    from aiter.moev2.segments.defaults import TUNE_BLOCK_MS
+
+    for segment, stage in ((ck.CkGemm1(), 1), (ck.CkGemm2(), 2)):
+        space = segment.param_space(_tuning_problem())
+        assert space
+        for params in space:
+            assert params["kernel"].startswith(f"moe_ck2stages_gemm{stage}_")
+            assert params["block_m"] in TUNE_BLOCK_MS and params["nt"] is False
+        blockscale = segment.param_space(_tuning_problem(quant=QuantType.per_1x128))
+        kernels = collections.Counter(p["kernel"] for p in blockscale)
+        assert kernels and set(kernels.values()) == {2}
+        assert {p["nt"] for p in blockscale} == {False, True}
+
+
+def test_ck_param_space_is_empty_where_legacy_raises_or_v2_declines():
+    from aiter.moev2.segments import ck
+
+    for activation in (ActivationType.Swiglu, ActivationType.Situv2):
+        assert ck.CkGemm1().param_space(_tuning_problem(activation)) == ()
+
+
+def test_asm_stage1_param_space_reads_the_arch_kernel_table(monkeypatch, tmp_path):
+    import aiter.jit.core
+    from aiter.moev2.segments import asm
+
+    space = asm.AsmStage1().param_space(_tuning_problem())
+    assert space and all("pertokenFp8_g1u1" in p["kernel"] for p in space)
+    doweight = asm.AsmStage1().param_space(_tuning_problem(doweight=True))
+    assert doweight and all("_doweight_" in p["kernel"] for p in doweight)
+    blockscale = asm.AsmStage1Blockscale().param_space(
+        _tuning_problem(quant=QuantType.per_1x128)
+    )
+    assert blockscale and all("_blockscale_" in p["kernel"] for p in blockscale)
+    assert asm.AsmStage1().param_space(_tuning_problem(quant=QuantType.per_1x128)) == ()
+    assert asm.AsmStage1Cktile().param_space(_tuning_problem()) == ()
+    monkeypatch.setattr(aiter.jit.core, "AITER_ASM_DIR", str(tmp_path))
+    assert asm.AsmStage1().param_space(_tuning_problem()) == ()
+
+
+def test_tuning_candidates_skip_problems_legacy_does_not_tune():
+    from aiter.moev2.segments import asm, ck
+
+    g1u0 = _tuning_problem(quant=QuantType.per_1x128, g1u1=False)
+    assert asm.AsmStage1Blockscale().accepts(g1u0) and ck.CkGemm2().accepts(g1u0)
+    assert asm.AsmStage1Blockscale().param_space(g1u0) == ()
+    assert ck.CkGemm2().param_space(g1u0) == ()
+    fp4 = dtypes.fp4x2
+    args = (64, 7168, 256, 256, 8, dtypes.bf16, fp4, fp4, QuantType.per_1x32, True)
+    args += (ActivationType.Swiglu, False, 0, 0)
+    a4w4_swiglu = MoeProblem.from_legacy_key(*args, arch="gfx950", cu_num=256)
+    assert ck.CkGemm1().accepts(a4w4_swiglu)
+    assert ck.CkGemm1().param_space(a4w4_swiglu) == ()

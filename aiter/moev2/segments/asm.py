@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """ASM kernels: stage 1 (`_ZN5aiter...fmoe_stage1...E`) and the 1-stage `fmoe` family."""
 
+import csv
 import functools
+import os
 from dataclasses import replace
 
 import torch
@@ -16,7 +18,7 @@ from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec, scale_spec
 from ..shapes import get_inter_dim
-from .base import Cap, Segment
+from .base import Cap, Params, Segment
 from .ck import (
     a8w8_blockscale_caps,
     a8w8_per_tensor_caps,
@@ -24,6 +26,7 @@ from .ck import (
     int8_per_tensor_caps,
     int8_per_token_caps,
 )
+from .defaults import TUNE_BLOCK_MS
 
 
 def asm_stage1(
@@ -266,6 +269,30 @@ def stage2_block_m(block_m):
     return block_m
 
 
+def _stage1_kernel_table(p) -> str:
+    """The ASM stage 1 kernel table legacy's `gen_2stages_asm1_task` reads for `p`."""
+    from aiter.jit.core import AITER_ASM_DIR
+
+    quant = "Int8" if p.act_in.dtype == dtypes.i8 else "Fp8"
+    blockscale = "_blockscale" if p.quant_type == QuantType.per_1x128 else ""
+    doweight = "_doweight" if "doweight_stage1" in p.features else ""
+    return os.path.join(
+        AITER_ASM_DIR,
+        p.arch,
+        "fmoe_2stages",
+        f"fmoe_stage1_bf16_pertoken{quant}{blockscale}{doweight}_g1u1.csv",
+    )
+
+
+@functools.cache
+def _stage1_kernels(path):
+    """`(knl_name, tile_m)` rows of a kernel table; () when the arch ships none."""
+    if not os.path.exists(path):
+        return ()
+    with open(path, newline="") as f:
+        return tuple((row["knl_name"], int(row["tile_m"])) for row in csv.DictReader(f))
+
+
 class AsmStage1(Segment):
     name = "asm.stage1"
     prefixes = (kernel_names.ASM,)
@@ -294,6 +321,16 @@ class AsmStage1(Segment):
             kernelName=params.kernel,
             activation=p.activation.activation,
             quant_type=p.quant_type,
+        )
+
+    def param_space(self, p):
+        # The legacy tuner tunes no g1u0 key; the 1x128 capabilities admit g1u0.
+        if not self.accepts(p) or not p.is_g1u1:
+            return ()
+        return tuple(
+            Params(kernel=name, block_m=tile_m)
+            for name, tile_m in _stage1_kernels(_stage1_kernel_table(p))
+            if tile_m in TUNE_BLOCK_MS
         )
 
 
@@ -376,6 +413,9 @@ class AsmStage1Cktile(AsmStage1):
         if flydsl_mxfp4(p) or cktile_branch(p, ksplit, tuned_row=True) is not None:
             return "a default MXFP4 branch takes the cktile_* row"
         return None
+
+    def param_space(self, p):
+        return ()
 
 
 def fmoe_1stage_caps():

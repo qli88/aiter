@@ -217,6 +217,11 @@ class Segment:
       names).
     - Without a tuned row: `default_kernels` (a stage 1 naming both stages' kernels),
       `default_params`.
+    - Tuning: `param_space(p)`, the candidates the tuner may try for `p`, one `Params`
+      each: `kernel` and the structure values (`block_m`, `nt`) that the other
+      segments of the plan must share. It reads the family's own instance list,
+      filtered by the problem as the legacy tuner's `gen_*_task` for the family
+      filters it; () for a problem the segment does not accept.
     - Stage 2 only: `stage2_kernel` (a rename of the tuned name, e.g. fp4 to fp8);
       `stage2_launch(c)`, None, or what the executor calls instead of the plan's stage 2
       kernel: `launch(ordinary_stage2=, stage2_args=, stage2_kwargs=)` returning the
@@ -269,6 +274,9 @@ class Segment:
 
     def default_params(self, p: MoeProblem) -> Params:
         return Params()
+
+    def param_space(self, p: MoeProblem) -> tuple:
+        return ()
 
     def owns(self, kernel) -> bool:
         """Whether this segment runs the parsed tuned kernel name `kernel`."""

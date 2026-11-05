@@ -14,7 +14,8 @@ from ..dispatch import kernel_names
 from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec, scale_spec
-from .base import Cap, Segment
+from .base import Cap, Params, Segment
+from .defaults import TUNE_BLOCK_MS
 
 
 def ck_moe_stage1(
@@ -219,6 +220,79 @@ def ck_stage1_caps():
     return tuple(replace(cap, g1u1=frozenset({True})) for cap in ck_2stage_caps())
 
 
+def _ck_dtype(dtype):
+    """The codegen name of a dtype (legacy `dtype2str_dict`), for either fp8; None for
+    a dtype the codegen has no name for."""
+    if dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return "f8"
+    return {
+        dtypes.fp16: "f16",
+        dtypes.bf16: "b16",
+        dtypes.i8: "i8",
+        dtypes.fp4x2: "fp4x2",
+        torch.uint32: "i4",
+        torch.int4: "i4",
+    }.get(dtype)
+
+
+def _ck_tunable(p) -> bool:
+    """The problems the legacy tuner lists CK instances for without raising: g1u1 (it
+    tunes no g1u0 key), per-1x32 only as fp4 x fp4 without Swiglu (fp8 x fp4 goes to
+    CK-Tile), and the activations the codegen maps (`ACT_OP_MAP`)."""
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_ck2stages_common import (
+        ACT_OP_MAP,
+    )
+
+    if not p.is_g1u1:
+        return False
+    if p.quant_type == QuantType.per_1x32 and not (
+        p.act_in.dtype == p.w1.dtype == dtypes.fp4x2 and p.activation.kind != "swiglu"
+    ):
+        return False
+    return p.activation.kind in ACT_OP_MAP
+
+
+@functools.cache
+def _ck_instances(stage, arch, a, b, c, quant, act, doweight):
+    """`(name, MPerBlock)` of the CK instances the codegen builds for one call."""
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_ck2stages_common import (
+        get_gemm1_kernels_list,
+        get_gemm2_kernels_list,
+    )
+
+    if stage == 1:
+        _, kernels = get_gemm1_kernels_list(
+            a, b, c, False, quant, act, doweight, True, arch=arch
+        )
+    else:
+        _, kernels = get_gemm2_kernels_list(
+            a, b, c, False, quant, not doweight, True, arch=arch
+        )
+    return tuple((k.name, k.MPerBlock) for k in kernels.values())
+
+
+def ck_param_space(segment, p, stage):
+    names = tuple(_ck_dtype(d) for d in (p.act_in.dtype, p.w1.dtype, p.out_dtype))
+    if not segment.accepts(p) or not _ck_tunable(p) or None in names:
+        return ()
+    instances = _ck_instances(
+        stage,
+        p.arch,
+        *names,
+        int(p.quant_type),
+        p.activation.kind,
+        "doweight_stage1" in p.features,
+    )
+    nts = (False, True) if p.quant_type == QuantType.per_1x128 else (False,)
+    return tuple(
+        Params(kernel=name, block_m=block_m, nt=nt)
+        for block_m in TUNE_BLOCK_MS
+        for name, m_per_block in instances
+        if m_per_block == block_m
+        for nt in nts
+    )
+
+
 class CkGemm1(Segment):
     name = "ck.gemm1"
     prefixes = (kernel_names.CK2STAGES,)
@@ -263,6 +337,9 @@ class CkGemm1(Segment):
             use_non_temporal_load=params.nt,
         )
 
+    def param_space(self, p):
+        return ck_param_space(self, p, 1)
+
 
 class CkGemm2(Segment):
     name = "ck.gemm2"
@@ -292,3 +369,6 @@ class CkGemm2(Segment):
             quant_type=p.quant_type,
             use_non_temporal_load=params.nt,
         )
+
+    def param_space(self, p):
+        return ck_param_space(self, p, 2)

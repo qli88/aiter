@@ -9,6 +9,8 @@ from aiter import QuantType
 from aiter.jit.utils.chip_info import get_cu_num
 
 BLOCK_SIZE_M = 32
+# The block_m values the tuner tries.
+TUNE_BLOCK_MS = (16, 32, 64, 128)
 
 
 @functools.lru_cache(maxsize=2048)
