@@ -213,12 +213,63 @@ def _legacy_asm(tuner, info, call):
     }
 
 
+_ASM_1STAGE_ADDED = (
+    "1-stage ASM: the tables legacy's tuner does not read, per-1x32 and the gfx942 "
+    "`blockscaleBf16` (5.1k1)"
+)
+
+
+def _asm_1stage_added(info):
+    """The 1-stage candidates added in 5.1k1, read from the kernel tables: on gfx950 the
+    per-1x32 keys of legacy's `fused_moe_1stage_dict` with `model_dim` a multiple of
+    512 (the launcher's MXFP4 check) from the `pertokenMXfp4` table (a FLAT kernel
+    with `xbf16`, a non-flat one without it for fp4 X), on gfx942 1x128 fp8 the
+    `blockscaleBf16` table (`xbf16`); `block_m` the `subGU_m`, `flat` from the table,
+    without `smf` or a `subGU_n` that does not divide `inter_dim`."""
+    import pandas as pd
+    import torch
+
+    import aiter.fused_moe as fm
+    from aiter import QuantType, dtypes
+
+    fp8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    gfx, inter_dim, act, q_type = info[0], info[4], info[7], info[11]
+    name = str(act).split(".")[-1].lower()
+    if q_type == QuantType.per_1x32 and gfx == "gfx950":
+        key = (act, q_type, info[8], info[9], info[10], info[12], info[13])
+        if key not in fm.fused_moe_1stage_dict[gfx] or info[3] % 512 or info[3] < 512:
+            return set()
+        quant, fp4_x = "pertokenMXfp4", info[9] == dtypes.fp4x2
+    elif q_type == QuantType.per_1x128 and gfx == "gfx942" and info[9] in fp8:
+        quant, fp4_x = "blockscaleBf16", None
+    else:
+        return set()
+    tkw1 = "_tkw1" if info[13] else ""
+    table = _REPO / "hsa" / gfx / "fmoe" / name
+    table /= f"fmoe_bf16_{quant}_g1u{int(info[12])}_{name}{tkw1}.csv"
+    if not table.exists():
+        return set()
+    df = pd.read_csv(table)
+    df = df[(df["smf"] == 0) & (inter_dim % df["subGU_n"] == 0)]
+    flats = df["flat"].fillna(0).astype(int) if "flat" in df else [0] * len(df)
+    out = set()
+    for kernel, tile_m, flat in zip(df["knl_name"], df["subGU_m"], flats):
+        if fp4_x is None or flat:
+            out.add(("asm_1stage_xbf16", kernel, int(tile_m), int(flat)))
+        elif fp4_x:
+            out.add(("asm_1stage", kernel, int(tile_m), int(flat)))
+    return out
+
+
 def _legacy_asm_1stage(tuner, info, call):
-    """`gen_1stage_asm_task`: `(asm_1stage[_xbf16], kernel, block_m, flat)`."""
-    return {
+    """`gen_1stage_asm_task`: `(asm_1stage[_xbf16], kernel, block_m, flat)`, with the
+    5.1k1 additions (`_asm_1stage_added`) as a known reason where they add any."""
+    legacy = {
         (tag[1], tag[2], tag[3], int(tag[4]))
         for (tag, *_rest) in tuner.gen_1stage_asm_task(info)
     }
+    added = _asm_1stage_added(info)
+    return legacy | added, {_ASM_1STAGE_ADDED} if added - legacy else set()
 
 
 def _legacy_ck(tuner, info, call):

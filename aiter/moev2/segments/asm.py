@@ -198,10 +198,11 @@ def fused_moe_1stage(
         token_num = hidden_states.shape[0]
         E, model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
-            # FLAT per_1x32 kernels are always xbf16: X stays bf16 and is
-            # dynamic-quantized to MXFP4 inside the kernel, so there is no host
-            # activation e8m0 scale to pack. Only the (not-yet-enabled) non-flat
-            # pre-quantized fp4 path carries a host scale that needs sorting.
+            # FLAT per_1x32 kernels work only with xbf16 on, non-flat ones only
+            # with xbf16 off. FLAT: X stays bf16 and is dynamic-quantized to MXFP4
+            # inside the kernel, so there is no host activation e8m0 scale to pack.
+            # Non-flat: the kernel reads fp4 X, with a host scale that needs
+            # sorting. The other pairing faults or gives NaN (todo 5.65).
             if not xbf16:
                 a1_scale = mxfp4_moe_sort_fwd(
                     a1_scale,
@@ -538,41 +539,71 @@ class AsmFmoe1Stage(Segment):
 
     def param_space(self, p):
         """Legacy's `gen_1stage_asm_task`: the kernels of the 1-stage tables (`xbf16`:
-        the gfx950 `blockscaleBf16` table for 1x128 fp8), `block_m` their `subGU_m`,
-        `flat` from the table. A kernel whose `subGU_n` does not divide `inter_dim`, or
-        with `smf`, is left out."""
+        the `blockscaleBf16` table for 1x128 fp8, which legacy reads on gfx950 only),
+        `block_m` their `subGU_m`, `flat` from the table. Also per-1x32, which legacy's
+        tuner does not time: the `pertokenMXfp4` table, a FLAT kernel with `xbf16`
+        unless the input is fp4 already, a non-flat one without it and for fp4 X only.
+        A kernel whose `subGU_n` does not divide `inter_dim`, or with `smf`, is left
+        out."""
         if not (
             self.accepts(p)
             and tunable(p)
-            and p.quant_type
-            not in (QuantType.No, QuantType.per_Tensor, QuantType.per_1x32)
+            and p.quant_type not in (QuantType.No, QuantType.per_Tensor)
             and p.w1.dtype != torch.int4
         ):
             return ()
+        if p.quant_type == QuantType.per_1x32:
+            # A FLAT kernel works only with `xbf16` on, a non-flat one only with it
+            # off: a FLAT kernel quantizes bf16 X itself, a non-flat one reads fp4 X
+            # and its sorted host scales. The launcher takes either X for any kernel
+            # of the table, and the other pairing faults (non-flat, `xbf16` on) or
+            # gives NaN (FLAT, `xbf16` off) (todo 5.65). It raises unless `model_dim`
+            # is a positive multiple of 512.
+            if p.shape.model_dim < 512 or p.shape.model_dim % 512:
+                return ()
+            fp4_x = p.act_in.dtype == dtypes.fp4x2
+            bf16_x = p.in_dtype != dtypes.fp4x2
+            return tuple(
+                Params(kernel=name, block_m=tile_m, xbf16=bool(flat), flat=flat)
+                for name, tile_m, flat in _fmoe_1stage_fits(p, "pertokenMXfp4")
+                if (bf16_x if flat else fp4_x)
+            )
         quant = {dtypes.i8: "Int8", dtypes.fp8: "Fp8"}.get(p.act_in.dtype, "")
         blockscale = p.quant_type == QuantType.per_1x128
         tables = [(("blockscale" if blockscale else "pertoken") + quant, False)]
-        if blockscale and p.act_in.dtype == dtypes.fp8 and p.arch == "gfx950":
+        if blockscale and p.act_in.dtype == dtypes.fp8:
             tables.append(("blockscaleBf16", True))
         return tuple(
             Params(kernel=name, block_m=tile_m, xbf16=xbf16, flat=flat)
             for quant_name, xbf16 in tables
-            for name, tile_m, tile_n, smf, flat in _fmoe_1stage_kernels(
-                _fmoe_1stage_table(p, quant_name)
-            )
-            if smf == 0 and p.shape.inter_dim % tile_n == 0
+            for name, tile_m, flat in _fmoe_1stage_fits(p, quant_name)
         )
+
+
+def _fmoe_1stage_fits(p, quant):
+    """`(knl_name, subGU_m, flat)` of the table with quant part `quant` whose `subGU_n`
+    divides `inter_dim`, without `smf`."""
+    return tuple(
+        (name, tile_m, flat)
+        for name, tile_m, tile_n, smf, flat in _fmoe_1stage_kernels(
+            _fmoe_1stage_table(p, quant)
+        )
+        if smf == 0 and p.shape.inter_dim % tile_n == 0
+    )
 
 
 def _fmoe_1stage_table(p, quant) -> str:
     """The path of the 1-stage kernel table with quant part `quant` (`pertokenFp8`, ...)
-    that legacy's `gen_1stage_asm_task` reads for `p`: the bf16-output table, also for
-    fp16 output (todo 5.53)."""
+    for `p`, named as legacy's `gen_1stage_asm_task` names it: the bf16-output table,
+    also for fp16 output (todo 5.53). Situv2, which legacy maps to no directory, has
+    its per-1x32 table."""
     from aiter.jit.core import AITER_ASM_DIR
 
-    act = {ActivationType.Silu: "silu", ActivationType.Gelu: "gelu"}.get(
-        p.activation.activation, ""
-    )
+    act = {
+        ActivationType.Silu: "silu",
+        ActivationType.Gelu: "gelu",
+        ActivationType.Situv2: "situv2",
+    }.get(p.activation.activation, "")
     up = 1 if p.is_g1u1 else 0
     tkw1 = "_tkw1" if "doweight_stage1" in p.features else ""
     name = f"fmoe_bf16_{quant}_g1u{up}_{act}{tkw1}.csv"

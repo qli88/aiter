@@ -4,20 +4,15 @@
   "a16w4 | flydsl.gemm1 | no candidates": 32,
   "a16w4 | flydsl.gemm2 | no candidates": 32,
   "a16wi4 | flydsl.gemm1 | no candidates": 48,
-  "a16wi4 | flydsl.gemm2 | no candidates": 48,
-  "a8w8_blockscale | asm.fmoe_1stage | differs: xbf16": 5,
-  "a8w8_blockscale | asm.fmoe_1stage | not a candidate": 4
+  "a16wi4 | flydsl.gemm2 | no candidates": 48
  },
  "gfx942_cu80": {
   "a16w4 | flydsl.gemm1 | no candidates": 32,
-  "a16w4 | flydsl.gemm2 | no candidates": 32,
-  "a8w8_blockscale | asm.fmoe_1stage | differs: xbf16": 4
+  "a16w4 | flydsl.gemm2 | no candidates": 32
  },
  "gfx950": {
-  "a16w4 | asm.fmoe_1stage | no candidates": 6,
   "a16w4 | cktile.gemm1 | no candidates": 24,
   "a16w4 | cktile.gemm2 | no candidates": 24,
-  "a4w4 | asm.fmoe_1stage | no candidates": 17,
   "a4w4 | mxmoe.gemm1 | not a candidate": 3,
   "a4w4 | mxmoe.gemm2 | not a candidate": 9,
   "a8w4 | asm.stage1_cktile | no candidates": 5,

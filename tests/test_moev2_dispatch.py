@@ -3083,9 +3083,86 @@ def test_asm_1stage_param_space_lists_none_where_no_tuned_row_runs():
         _fmoe_problem(g1u1=False),
         _fmoe_problem(quant=QuantType.per_Tensor),
         _fmoe_problem(ActivationType.Gelu, quant=QuantType.per_1x128, arch="gfx1201"),
-        _mx_problem(dtypes.fp4x2, dtypes.fp4x2),
+        _mx_problem(dtypes.fp4x2, dtypes.fp4x2, arch="gfx942"),
+        _mx_problem(dtypes.fp4x2, dtypes.fp4x2, ActivationType.Gelu),
+        _mx_problem(dtypes.fp8, dtypes.fp4x2),
     ):
         assert one_stage.param_space(p) == ()
+
+
+def test_asm_1stage_param_space_lists_the_tables_legacy_does_not_time(monkeypatch):
+    from aiter.moev2.segments import asm
+
+    one_stage = asm.AsmFmoe1Stage()
+    fp4 = one_stage.param_space(_mx_problem(dtypes.fp4x2, dtypes.fp4x2))
+    assert {(p["flat"], p["xbf16"]) for p in fp4} == {(0, False), (1, True)}
+    for p in fp4:
+        assert "_pertokenMXfp4_g1u1_" in p["kernel"] and "_silu_" in p["kernel"]
+        assert p["block_m"] == (16 if p["flat"] else 32)
+        assert 256 % int(p["kernel"].rsplit("x", 1)[1][:-1]) == 0
+    situ = one_stage.param_space(
+        _mx_problem(dtypes.bf16, dtypes.fp4x2, ActivationType.Situv2, inter_dim=384)
+    )
+    assert {p["flat"] for p in situ} == {1, 2}
+    assert all(p["xbf16"] for p in situ)
+    assert all("_situv2_" in p["kernel"] for p in situ)
+    gfx942 = one_stage.param_space(
+        _fmoe_problem(quant=QuantType.per_1x128, arch="gfx942")
+    )
+    a16 = "_ZN5aiter60fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3E"
+    bf16_only = "_ZN5aiter55fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_pf3E"
+    listed = {(p["kernel"], p["block_m"], p["xbf16"], p["flat"]) for p in gfx942}
+    assert {(a16, 1, False, 1), (a16, 1, True, 1), (bf16_only, 16, True, 0)} <= listed
+    assert (bf16_only, 16, False, 0) not in listed
+    fp4_in = _mx_problem(dtypes.fp4x2, dtypes.fp4x2, input_dtype=dtypes.fp4x2)
+    assert {p["flat"] for p in one_stage.param_space(fp4_in)} == {0}
+    for model_dim in (256, 2880):
+        problem = _mx_problem(dtypes.fp4x2, dtypes.fp4x2)
+        problem = dataclasses.replace(
+            problem, shape=dataclasses.replace(problem.shape, model_dim=model_dim)
+        )
+        assert one_stage.param_space(problem) == ()
+    monkeypatch.setattr(
+        asm, "_fmoe_1stage_fits", lambda p, quant: (("a", 32, 0), ("b", 16, 1))
+    )
+    for problem, expected in (
+        (_mx_problem(dtypes.bf16, dtypes.fp4x2, ActivationType.Situv2), {"b"}),
+        (_mx_problem(dtypes.fp4x2, dtypes.fp4x2), {"a", "b"}),
+    ):
+        assert {p["kernel"] for p in one_stage.param_space(problem)} == expected
+
+
+def test_asm_1stage_per_1x32_candidates_run_as_tuned_rows(monkeypatch):
+    from aiter.moev2.migration import a4w4, a16w4
+    from aiter.moev2.segments import asm
+
+    one_stage = asm.AsmFmoe1Stage()
+    problems = (
+        (_mx_problem(dtypes.fp4x2, dtypes.fp4x2), a4w4),
+        (
+            _mx_problem(
+                dtypes.bf16, dtypes.fp4x2, ActivationType.Situv2, inter_dim=384
+            ),
+            a16w4,
+        ),
+    )
+    for p, path in problems:
+        space = one_stage.param_space(p)
+        assert space
+        for params in space:
+            row = {
+                **_ROW_1STAGE,
+                "block_m": params["block_m"],
+                "kernelName1": params["kernel"],
+                "xbf16": int(params["xbf16"]),
+                "flat": float(params["flat"]),
+            }
+            monkeypatch.setattr(tuned, "lookup", lambda problem, row=row: row)
+            res = resolver.resolve(p, path.SEGMENTS)
+            assert res.plan.structure()[0][-1] == "asm.fmoe_1stage", params
+            kw = res.metadata.stage1.keywords
+            assert kw["kernelName"] == params["kernel"], params
+            assert (kw["xbf16"], kw["flat"]) == (params["xbf16"], params["flat"])
 
 
 def test_opus_param_space_lists_a8w4_on_gfx950_only():
