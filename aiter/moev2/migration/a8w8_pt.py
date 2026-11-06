@@ -3,11 +3,11 @@
 """Path `a8w8_pt`: 8-bit activations and weights, per-tensor scales.
 
 Claims `fused_moe_` calls with g1u1 per-tensor fp8 (the arch's fp8) or int8 weights on
-gfx942/gfx950, Silu or Gelu, separated gate/up, no bias, padding, scatter or caller-chosen
-activation dtypes, outside AITER_ONLINE_TUNE. Today fp8 resolves to CK 2-stage (default and
-most tuned rows), ASM stage 1 + CK stage 2, or the FlyDSL gfx942 whole graph; int8 to ASM
-stage 1 + CK stage 2 (default and tuned) or CK 2-stage (tuned). Any other tuned row is
-declined back to the legacy code.
+gfx942/gfx950, Silu, Gelu, Swiglu or GeluTanh, separated gate/up, no bias, padding,
+scatter or caller-chosen activation dtypes, outside AITER_ONLINE_TUNE. Today fp8
+resolves to CK 2-stage (default and most tuned rows), ASM stage 1 + CK stage 2, or the
+FlyDSL gfx942 whole graph; int8 to ASM stage 1 + CK stage 2 (default and tuned) or CK
+2-stage (tuned). Any other tuned row is declined back to the legacy code.
 """
 
 from aiter import QuantType, dtypes
@@ -43,6 +43,7 @@ def takes(problem) -> bool:
         local.key_args_supported(problem, ARCHS)
         and problem.quant_type == QuantType.per_Tensor
         and problem.w1 in (per_tensor_fp8(), per_tensor_int8())
+        and problem.act_in == problem.w1
     )
 
 

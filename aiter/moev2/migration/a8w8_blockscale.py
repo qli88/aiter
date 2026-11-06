@@ -3,12 +3,14 @@
 """Path `a8w8_blockscale`: fp8 activations in 1x128 groups, fp8 weights in 128x128 blocks.
 
 Claims `fused_moe_` calls with `QuantType.per_1x128` or `per_128x128` (which the legacy
-code remaps to `per_1x128`) and g1u1 fp8 weights (the arch's fp8) on gfx942/gfx950, Silu
-or Gelu, separated gate/up, no bias, padding, scatter or caller-chosen activation dtypes,
-outside AITER_ONLINE_TUNE. Today these resolve to 1-stage ASM `fmoe_fp8_blockscale_g1u1`
-(default, in its region), CK 2-stage (default elsewhere, with the 1x128 block_m and
-split-K; most tuned rows), ASM stage 1 + CK stage 2, or a tuned 1-stage row (FLAT too);
-any other tuned row is declined back to the legacy code.
+code remaps to `per_1x128`) and g1u1 fp8 weights (the arch's fp8) on gfx942/gfx950,
+Silu, Gelu, Swiglu or GeluTanh, separated gate/up, no bias, padding, scatter or
+caller-chosen activation dtypes, outside AITER_ONLINE_TUNE. Today these resolve to
+1-stage ASM `fmoe_fp8_blockscale_g1u1` (default, in its region), CK 2-stage (default
+elsewhere, with the 1x128 block_m and split-K; most tuned rows), ASM stage 1 + CK stage
+2, or a tuned 1-stage row (FLAT too); any other tuned row is declined back to the legacy
+code. As in legacy, Swiglu raises (its CK module does not build, todo 5.62), and so
+does GeluTanh under split-K (todo 5.63).
 """
 
 from aiter import QuantType, dtypes
@@ -47,6 +49,7 @@ def takes(problem) -> bool:
         local.key_args_supported(problem, ARCHS)
         and problem.quant_type == QuantType.per_1x128
         and problem.w1 == blockscale_fp8()
+        and problem.act_in == blockscale_fp8()
     )
 
 

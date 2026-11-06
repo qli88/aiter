@@ -23,6 +23,7 @@ from .ck import (
     a8w8_blockscale_caps,
     a8w8_per_tensor_caps,
     a8w8_per_token_caps,
+    ck_module_builds,
     int8_per_tensor_caps,
     int8_per_token_caps,
 )
@@ -351,6 +352,10 @@ class AsmStage1Blockscale(AsmStage1):
     @property
     def capabilities(self):
         return a8w8_blockscale_caps()
+
+    def param_space(self, p):
+        """None where its stage 2, CK, does not build (`ck.ck_module_builds`)."""
+        return super().param_space(p) if ck_module_builds(p) else ()
 
     def reads(self, p):
         return (Buf("sorted", None), Buf("tokens", p.act_in, scales="transposed"))

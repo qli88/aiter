@@ -94,7 +94,7 @@ def _cap(specs, weights=None):
         w1=weights,
         w2=weights,
         out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
-        activation=frozenset({"silu", "gelu"}),
+        activation=frozenset({"silu", "gelu", "swiglu", "gelutanh"}),
         gate_mode=frozenset({"separated"}),
         features=frozenset(
             {"ep_mask", "num_local_tokens", "doweight_stage1", "act_scales"}
@@ -235,10 +235,17 @@ def _ck_dtype(dtype):
     }.get(dtype)
 
 
+def ck_module_builds(p) -> bool:
+    """False where the CK module of the problem fails to build, so every plan with a
+    CK GEMM raises: 1x128 Swiglu (`gridwise_moe_gemm_blockscale` static-asserts on its
+    activation)."""
+    return not (p.quant_type == QuantType.per_1x128 and p.activation.kind == "swiglu")
+
+
 def _ck_tunable(p) -> bool:
     """The problems the legacy CK generator lists instances for without raising:
     per-1x32 only as fp4 x fp4 without Swiglu (fp8 x fp4 goes to CK-Tile), and the
-    activations the codegen maps (`ACT_OP_MAP`)."""
+    activations the codegen maps (`ACT_OP_MAP`) where the module builds."""
     from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_ck2stages_common import (
         ACT_OP_MAP,
     )
@@ -247,7 +254,7 @@ def _ck_tunable(p) -> bool:
         p.act_in.dtype == p.w1.dtype == dtypes.fp4x2 and p.activation.kind != "swiglu"
     ):
         return False
-    return p.activation.kind in ACT_OP_MAP
+    return p.activation.kind in ACT_OP_MAP and ck_module_builds(p)
 
 
 @functools.cache

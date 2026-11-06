@@ -2,12 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Path `a16w16`: bf16/fp16 activations and weights, unquantized (`QuantType.No`).
 
-Claims `fused_moe_` calls with bf16/fp16 weights (g1u1 or g1u0) on gfx942/gfx950, Silu
-or Gelu, separated gate/up, no bias, padding, scatter or caller-chosen activation dtypes,
-outside AITER_ONLINE_TUNE. Today g1u1 resolves to CK 2-stage (default and tuned rows) or
-the FlyDSL gfx942 whole graph (tuned rows), g1u0 to the 1-stage ASM `fmoe` (gfx942, Silu,
-fewer than 256 tokens, or a tuned 1-stage row); other g1u0 calls (legacy's CK 2-stage,
-wrong for g1u0, todo 5.3) and any other tuned row are declined back to the legacy code.
+Claims `fused_moe_` calls with bf16/fp16 weights (g1u1 or g1u0) on gfx942/gfx950, Silu,
+Gelu, Swiglu or GeluTanh, separated gate/up, no bias, padding, scatter or caller-chosen
+activation dtypes, outside AITER_ONLINE_TUNE. Today g1u1 resolves to CK 2-stage (default
+and tuned rows) or the FlyDSL gfx942 whole graph (tuned rows), g1u0 to the 1-stage ASM
+`fmoe` (gfx942, Silu, fewer than 256 tokens, or a tuned 1-stage row); other g1u0 calls
+(legacy's CK 2-stage, wrong for g1u0, todo 5.3) and any other tuned row are declined
+back to the legacy code.
 """
 
 from aiter import QuantType, dtypes
@@ -45,6 +46,7 @@ def takes(problem) -> bool:
         local.key_args_supported(problem, ARCHS, g1u0=True)
         and problem.quant_type == QuantType.No
         and problem.w1.dtype in (dtypes.bf16, dtypes.fp16)
+        and problem.act_in == problem.w1
     )
 
 

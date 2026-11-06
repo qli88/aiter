@@ -576,9 +576,17 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
     monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
     call = _per_tensor_op_call()
     assert a8w8_pt.claims(call)
+    for activation in (
+        ActivationType.Gelu,
+        ActivationType.Swiglu,
+        ActivationType.GeluTanh,
+    ):
+        assert a8w8_pt.claims({**call, "activation": activation.value}), activation
     for change in (
         {"quant_type": QuantType.per_Token.value},
-        {"activation": ActivationType.Swiglu.value},
+        {"activation": ActivationType.Situv2.value},
+        {"activation": ActivationType.Relu2.value},
+        {"swiglu_limit": 7.0},
         {"bias1": torch.empty(1)},
         {"hidden_pad": 64},
         {"quant_dtype_a2": dtypes.fp8},
@@ -617,10 +625,12 @@ def test_claims_only_unquantized_16_bit(monkeypatch):
         assert a16w16.claims(call) and not a8w8_pt.claims(call)
     assert not a16w16.claims(_per_tensor_op_call())
     call = _a16w16_op_call()
+    for activation in (ActivationType.Swiglu, ActivationType.GeluTanh):
+        assert a16w16.claims({**call, "activation": activation.value}), activation
     for change in (
         {"quant_type": QuantType.per_Token.value},
         {"quant_type_a": QuantType.per_Tensor.value},
-        {"activation": ActivationType.Swiglu.value},
+        {"activation": ActivationType.Situv2.value},
         {"bias2": torch.empty(1)},
         {"w2": torch.empty(4, 64, 16, dtype=dtypes.fp8)},
         {"dtype": torch.float32},
@@ -814,10 +824,13 @@ def test_claims_per_token_and_blockscale_fp8(monkeypatch):
     ):
         call = _fp8_op_call(quant)
         assert [m.NAME for m in modules if m.claims(call)] == [owner.NAME], quant
+        for activation in (ActivationType.Swiglu, ActivationType.GeluTanh):
+            changed = {**call, "activation": activation.value}
+            assert [m.NAME for m in modules if m.claims(changed)] == [owner.NAME]
         for change in (
             {"w1": torch.empty(4, 32, 64, dtype=torch.int8)},
             {"w1": torch.empty(4, 16, 64, dtype=dtypes.fp8)},  # g1u0
-            {"activation": ActivationType.Swiglu.value},
+            {"activation": ActivationType.Situv2.value},
             {"quant_type_a": QuantType.per_Tensor.value},
             {"bias1": torch.empty(1)},
         ):
@@ -863,6 +876,8 @@ def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
         {"activation": ActivationType.Situv2.value, "quant_dtype_a": w1.dtype},
         {"activation": ActivationType.Swiglu.value, "quant_dtype_a": dtypes.bf16},
         {"activation": ActivationType.Swiglu.value, "quant_dtype_a": dtypes.fp8},
+        {"activation": ActivationType.GeluTanh.value},
+        {"quant_dtype_a": dtypes.bf16},
         {"activation": ActivationType.Relu2.value},
         {
             "activation": ActivationType.Relu2.value,
@@ -872,8 +887,18 @@ def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
     ):
         changed = {**call, **change}
         problem = api.build_problem(changed, arch="gfx950", cu_num=256)
+        # A `quant_dtype_a` equal to the policy's choice leaves the key as without it;
+        # paths that refuse the argument then decline a key they take.
+        default = {**changed, "quant_dtype_a": None}
+        invisible = changed["quant_dtype_a"] is not None and problem == (
+            api.build_problem(default, arch="gfx950", cu_num=256)
+        )
         for path in _local_path_modules():
-            assert path.claims(changed) == path.takes(problem), (path.NAME, change)
+            if invisible:
+                assert path.claims(default) == path.takes(problem), (path.NAME, change)
+                assert path.takes(problem) or not path.claims(changed), path.NAME
+            else:
+                assert path.claims(changed) == path.takes(problem), (path.NAME, change)
 
 
 def _default_resolve(monkeypatch, token, quant, inter_dim=256, arch="gfx950", **kw):
@@ -905,6 +930,42 @@ def test_int8_defaults_run_asm_stage1_and_int4_runs_ck(monkeypatch):
     res = _default_resolve(monkeypatch, 64, QuantType.per_Token, w=torch.uint32)
     assert res.plan.structure()[0][2] == "ck.gemm1"
     assert res.metadata.stage1.func.__name__ == "ck_moe_stage1"
+
+
+def test_swiglu_and_gelutanh_defaults_run_two_stages_with_the_activation(
+    monkeypatch,
+):
+    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
+
+    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    i8, fp8, bf16 = dtypes.i8, dtypes.fp8, dtypes.bf16
+    # Legacy's heuristic: CK stage 1, ASM for int8 weights; no 1-stage kernel.
+    cases = (
+        (a8w8_pt, QuantType.per_Tensor, fp8, fp8, "ck_moe_stage1"),
+        (a8w8_pt, QuantType.per_Tensor, i8, i8, "asm_stage1"),
+        (a8w8_ptok, QuantType.per_Token, fp8, fp8, "ck_moe_stage1"),
+        (a8w8_ptok, QuantType.per_Token, i8, i8, "asm_stage1"),
+        (a8w8_ptok, QuantType.per_Token, fp8, torch.uint32, "ck_moe_stage1"),
+        (a8w8_blockscale, QuantType.per_1x128, fp8, fp8, "ck_moe_stage1"),
+        (a16w16, QuantType.No, bf16, bf16, "ck_moe_stage1"),
+    )
+    # 1x128 takes legacy's split-K at 1 token (14 at 7168/256, 256 experts, top-8).
+    for activation in (ActivationType.Swiglu, ActivationType.GeluTanh):
+        for path, quant, a, w, stage1 in cases:
+            for token in (1, 16, 512):
+                args = (token, 7168, 256, 256, 8, bf16, a, w, quant, True, activation)
+                args += (False, 0, 0)
+                p = MoeProblem.from_legacy_key(*args, arch="gfx950", cu_num=256)
+                assert path.takes(p), (path.NAME, activation)
+                metadata = resolver.resolve(p, path.SEGMENTS).metadata
+                case = (path.NAME, activation, token)
+                assert not metadata.run_1stage, case
+                assert metadata.stage1.func.__name__ == stage1, case
+                assert metadata.stage2.func.__name__ == "ck_moe_stage2_fwd", case
+                ksplit = 14 if quant == QuantType.per_1x128 and token == 1 else 0
+                assert metadata.ksplit == ksplit, case
+                assert metadata.stage1.keywords["activation"] == activation
+                assert metadata.stage2.keywords["activation"] == activation
 
 
 def test_asm_int8_has_no_doweight_stage1_kernel():
@@ -2287,11 +2348,27 @@ def test_ck_param_space_lists_the_codegen_instances():
         assert {p["nt"] for p in blockscale} == {False, True}
 
 
-def test_ck_param_space_is_empty_where_legacy_raises_or_v2_declines():
+def test_ck_param_space_lists_the_activations_the_codegen_builds():
     from aiter.moev2.segments import ck
 
-    for activation in (ActivationType.Swiglu, ActivationType.Situv2):
-        assert ck.CkGemm1().param_space(_tuning_problem(activation)) == ()
+    for activation in (ActivationType.Swiglu, ActivationType.GeluTanh):
+        space = ck.CkGemm1().param_space(_tuning_problem(activation))
+        assert space, activation
+        assert all(f"_{activation.name.lower()}_" in p["kernel"] for p in space)
+    # Legacy's CK codegen maps no SiTUv2 (`ACT_OP_MAP`): its tuner raises there.
+    assert ck.CkGemm1().param_space(_tuning_problem(ActivationType.Situv2)) == ()
+
+
+def test_param_space_lists_no_1x128_swiglu_ck_module_kernel():
+    from aiter.moev2.segments import asm, ck
+
+    segments = (ck.CkGemm1(), ck.CkGemm2(), asm.AsmStage1Blockscale())
+    blockscale = functools.partial(_tuning_problem, quant=QuantType.per_1x128)
+    for segment in segments:
+        assert segment.param_space(blockscale(ActivationType.GeluTanh)), segment.name
+        assert segment.param_space(blockscale(ActivationType.Swiglu)) == ()
+    # Only 1x128: the per-token Swiglu module builds.
+    assert ck.CkGemm2().param_space(_tuning_problem(ActivationType.Swiglu))
 
 
 def test_asm_stage1_param_space_reads_the_arch_kernel_table(monkeypatch, tmp_path):
@@ -2776,10 +2853,7 @@ def test_whole_graph_param_space_lists_every_shipped_row():
             *args, is_shuffled=True, arch=r["gfx"], cu_num=int(r["cu_num"])
         )
         config = r["kernelName1"].split("__", 2)[2]
-        if p.activation.activation == ActivationType.Swiglu:
-            assert not _whole_graph_configs(p), r  # no v2 path takes it (todo 1c.4)
-        else:
-            assert (config, int(r["block_m"])) in _whole_graph_configs(p), r
+        assert (config, int(r["block_m"])) in _whole_graph_configs(p), r
 
 
 def test_whole_graph_param_space_lists_none_where_no_row_runs():

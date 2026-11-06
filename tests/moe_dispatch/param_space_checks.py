@@ -195,7 +195,18 @@ def _is_a8w4(info):
     )
 
 
+def _ck_module_fails(info):
+    """The CK module of a 1x128 Swiglu key fails to build (`gridwise_moe_gemm_blockscale`
+    static-asserts on the activation), so every CK candidate, and every ASM stage 1
+    with its CK stage 2, fails when the tuner times it."""
+    from aiter import ActivationType, QuantType
+
+    return info[11] == QuantType.per_1x128 and info[7] == ActivationType.Swiglu
+
+
 def _legacy_asm(tuner, info, call):
+    if _ck_module_fails(info):
+        return set()
     return {
         ("stage1", tag[2], tag[3], False)
         for (tag, *_rest) in tuner.gen_2stages_asm1_task(info, _BLOCK_MS)
@@ -211,8 +222,8 @@ def _legacy_asm_1stage(tuner, info, call):
 
 
 def _legacy_ck(tuner, info, call):
-    if _is_a8w4(info):
-        return set()  # the CK-Tile generator: family `cktile`
+    if _is_a8w4(info) or _ck_module_fails(info):
+        return set()  # a8w4: the CK-Tile generator, family `cktile`
     return {
         (tag[1], tag[2], tag[3], bool(tag[6]))
         for (tag, *_rest) in tuner.gen_2stages_task(info, _BLOCK_MS)
@@ -700,10 +711,6 @@ def known_difference(family, info, raised):
         return None
     if gfx == "gfx1201":
         return Known("gfx1201: no v2 path (todo 1b.2)")
-    if q_type != QuantType.per_1x32 and _activation(info) not in ("silu", "gelu"):
-        return Known(
-            "Swiglu/GeluTanh outside per-1x32: v2 claims Silu and Gelu (todo 1c.4)"
-        )
     if family.startswith("flydsl") and _activation(info) not in (
         "silu",
         "swiglu",

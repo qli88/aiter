@@ -61,6 +61,24 @@ EXTRA_COMBOS = (
     ("Silu", "bfloat16", "fp8", "fp8", "per_Tensor", True, False),
     ("Gelu", "bfloat16", "fp8", "fp8", "per_Token", True, False),
     ("Silu", "bfloat16", "fp8", "uint32", "per_Token", True, False),
+    # Swiglu and GeluTanh outside per_1x32: CK (or ASM for int8) stage 1, CK stage 2.
+    *(
+        (act, dtype, qa, qw, qt, True, False)
+        for act in ("Swiglu", "GeluTanh")
+        for dtype, qa, qw, qt in (
+            ("bfloat16", "fp8", "fp8", "per_Tensor"),
+            ("bfloat16", "int8", "int8", "per_Tensor"),
+            ("bfloat16", "fp8", "fp8", "per_Token"),
+            ("bfloat16", "int8", "int8", "per_Token"),
+            ("bfloat16", "fp8", "uint32", "per_Token"),
+            ("bfloat16", "fp8", "fp8", "per_1x128"),
+            ("bfloat16", "bfloat16", "bfloat16", "No"),
+            ("float16", "float16", "float16", "No"),
+        )
+    ),
+    ("Swiglu", "bfloat16", "fp8", "fp8", "per_Token", True, True),
+    ("Swiglu", "bfloat16", "int8", "int8", "per_Token", False, False),
+    ("Swiglu", "bfloat16", "bfloat16", "bfloat16", "No", False, False),
     # Not the FlyDSL heuristic on preshuffled weights: CK-Tile split-K at decode sizes.
     (
         "Silu",

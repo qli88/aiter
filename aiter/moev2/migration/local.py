@@ -36,7 +36,14 @@ _RELOOKUP_DROPS_EXTRAS = frozenset({"disable_inline_sort"})
 _UNSUPPORTED_ARGS = ("quant_dtype_a2", "ep_source_token_map")
 _BIAS_ARGS = ("bias1", "bias2")
 _ACT_PARAM_ARGS = ("swiglu_limit", "beta", "linear_beta")
-SILU_GELU = (ActivationType.Silu, ActivationType.Gelu)
+# The activations the CK codegen maps (`ACT_OP_MAP`).
+CK_ACTIVATIONS = (
+    ActivationType.Silu,
+    ActivationType.Gelu,
+    ActivationType.Swiglu,
+    ActivationType.GeluTanh,
+)
+CK_ACTIVATION_KINDS = tuple(a.name.lower() for a in CK_ACTIVATIONS)
 SEPARATED = (GateMode.SEPARATED,)
 
 
@@ -75,7 +82,7 @@ def claims(
     *,
     act_dtypes=None,
     act_dtype_arg=False,
-    activations=SILU_GELU,
+    activations=CK_ACTIVATIONS,
     gate_modes=SEPARATED,
     bias=False,
     act_params=False,
@@ -155,7 +162,7 @@ def key_args_supported(
     problem,
     archs,
     *,
-    activations=("silu", "gelu"),
+    activations=CK_ACTIVATION_KINDS,
     gate_modes=SEPARATED,
     act_params=False,
     g1u0=False,

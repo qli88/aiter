@@ -53,6 +53,7 @@ _REPO = _HERE.parents[1]
 # "swiglu_limit", "g1u0" (gate-only w1), "interleave" (gate/up interleaved w1, a16w4,
 # a8w4 and mxfp8), "std_shuffle" (a16w4/a8w4 "fp4" and "mxfp8" weights shuffled as
 # a4w4's, untagged), "env" (environment variables set for the legacy and the v2 runs).
+_SWIGLU_GELUTANH = ("Swiglu", "GeluTanh")
 _A8W8_PT_DEFAULT = (
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 64, 256, 1024, 4096)),
     *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 32, 512)),
@@ -65,6 +66,10 @@ _A8W8_PT_DEFAULT = (
     *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False, "i8") for m in (5, 200)),
     *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True, "i8") for m in (512,)),
     *((m, 6144, 4096, 8, 2, "Silu", False, "bf16", False, "i8") for m in (512,)),
+    # Swiglu and GeluTanh: CK stage 1 (ASM for int8), the CK module of the activation.
+    *((m, 7168, 256, 256, 8, a, False, "bf16", False) for a in _SWIGLU_GELUTANH for m in (1, 64, 1024)),
+    *((m, 2048, 256, 64, 6, "Swiglu", True, "fp16", False) for m in (200,)),
+    *((m, 4096, 384, 128, 8, a, False, "bf16", False, "i8") for a in _SWIGLU_GELUTANH for m in (16, 512)),
 )  # fmt: skip
 
 _A16W16_DEFAULT = (
@@ -77,6 +82,9 @@ _A16W16_DEFAULT = (
     # Shapes with shipped gfx950 cu256 rows (tuned CK there, default elsewhere).
     *((m, 6144, 512, 192, 8, "Silu", False, "bf16", False) for m in (1, 512, 2048)),
     *((m, 4096, 384, 128, 8, "Silu", False, "bf16", False) for m in (64, 1024)),
+    *((m, 7168, 256, 256, 8, a, False, "bf16", False) for a in _SWIGLU_GELUTANH for m in (1, 64, 1024)),
+    *((m, 2048, 256, 64, 6, a, False, "fp16", False) for a in _SWIGLU_GELUTANH for m in (5, 200)),
+    *((m, 7168, 256, 64, 8, "Swiglu", True, "bf16", True) for m in (16,)),
 )  # fmt: skip
 
 # gfx950's default 1-stage ASM region is `token > 16 or inter_dim % 128` (bf16 output,
@@ -115,6 +123,14 @@ _A8W8_PTOK_DEFAULT = (
     *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False, "i4") for m in (8, 300)),
     *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False, "i4") for m in (5, 200)),
     *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True, "i4") for m in (16,)),
+    # Swiglu and GeluTanh: no 1-stage kernel, so CK stage 1 (ASM for int8) at every
+    # token count; and the shape of the gfx942 cu80 MiniMax-M3 rows.
+    *((m, 4096, 384, 128, 8, a, False, "bf16", False) for a in _SWIGLU_GELUTANH for m in (1, 64, 512)),
+    *((m, 6144, 384, 128, 4, "Swiglu", False, "bf16", False) for m in (16, 256)),
+    *((m, 4096, 512, 64, 4, "Swiglu", True, "bf16", False) for m in (8, 300)),
+    *((m, 7168, 256, 64, 8, "GeluTanh", False, "bf16", True) for m in (16,)),
+    *((m, 7168, 256, 256, 8, a, False, "bf16", False, "i8") for a in _SWIGLU_GELUTANH for m in (16, 64)),
+    *((m, 4096, 384, 128, 8, a, False, "bf16", False, "i4") for a in _SWIGLU_GELUTANH for m in (8, 512)),
 )  # fmt: skip
 
 # gfx950's default 1-stage ASM region is `token > 32` (bf16 output, no doweight_stage1,
@@ -147,6 +163,11 @@ _A8W8_BLOCKSCALE_DEFAULT = (
     # the FLAT kernels ignore (todo 5.25).
     *((m, 4096, 1024, 288, 8, "Silu", False, "bf16", False) for m in (4,)),
     *((m, 2048, 512, 512, 10, "Silu", False, "bf16", False) for m in (1,)),
+    # Swiglu and GeluTanh: no 1-stage kernel; the Swiglu module fails to build. At 1
+    # token CK split-K (ksplit 14), whose post-activation takes neither (both raise);
+    # at 16 the tiles fill the CUs (ksplit 0).
+    *((m, 7168, 256, 256, 8, a, False, "bf16", False) for a in _SWIGLU_GELUTANH for m in (1, 16, 512)),
+    *((m, 4096, 384, 128, 8, "Swiglu", True, "bf16", False) for m in (64,)),
 )  # fmt: skip
 
 # gfx950: shapes of each shipped cu256 row family, untuned shapes (the FlyDSL heuristic on
