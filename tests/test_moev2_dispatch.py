@@ -2496,6 +2496,183 @@ def test_mxmoe_candidates_resolve_to_their_segments(monkeypatch):
             assert res.metadata.block_m == block_m
 
 
+def _fhmoe_segments():
+    from aiter.moev2.segments import flydsl_fhmoe
+
+    return (
+        flydsl_fhmoe.FlydslFhmoeGemm1(),
+        flydsl_fhmoe.FlydslFhmoeGemm1Quant(),
+        flydsl_fhmoe.FlydslFhmoeGemm2(),
+    )
+
+
+_HY4 = ((6144, 256, 257, 9), dtypes.fp8)
+_DSV4 = ((7168, 384, 385, 7), dtypes.fp4x2)
+
+
+def _fhmoe_key(contract, out=dtypes.bf16, doweight=False, pads=(0, 0), **kwargs):
+    shape, q_w = contract
+    args = (64, *shape, out, dtypes.fp8, q_w, QuantType.per_1x32, True)
+    args += (ActivationType.Silu, doweight, *pads)
+    kwargs = {**_interleaved(), "is_shuffled": True, **kwargs}
+    return MoeProblem.from_legacy_key(*args, **kwargs, arch="gfx950", cu_num=256)
+
+
+def _fhmoe_space(problem):
+    """`{(stage, block_m): kernel names}` of the FHMoE segments."""
+    out = collections.defaultdict(set)
+    for segment in _fhmoe_segments():
+        stage = 2 if ops.Op.GEMM2 in segment.covers else 1
+        for p in segment.param_space(problem):
+            out[stage, p["block_m"]].add(p["kernel"])
+    return out
+
+
+def test_fhmoe_param_space_contains_the_legacy_tuner_candidates():
+    from moe_dispatch.param_space_checks import _tune_fhmoe
+
+    tf = _tune_fhmoe()
+    space = _fhmoe_space(api.fhmoe_problem(_fhmoe_key(_HY4)))
+    assert {block_m for _, block_m in space} == {32, 64, 128}
+    for block_m in (32, 64, 128):
+        assert set(tf.stage1_candidates(block_m)) <= space[1, block_m]
+        assert set(tf.stage2_candidates(block_m)) <= space[2, block_m]
+    # Widened: unfused stage 1, stage 2 at any tile_n.
+    assert any(not n.endswith("_fp8") for n in space[1, 32])
+    assert set(tf.stage2_candidates(32)) < space[2, 32]
+
+
+def test_fhmoe_param_space_lists_every_shipped_row():
+    import csv
+
+    from aiter.jit.core import AITER_CONFIGS
+
+    with open(AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE, newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    spaces = {
+        contract[0]: _fhmoe_space(api.fhmoe_problem(_fhmoe_key(contract)))
+        for contract in (_HY4, _DSV4)
+    }
+    assert {r["q_dtype_w"] for r in rows} == {
+        "torch.float8_e4m3fn",
+        "torch.float4_e2m1fn_x2",
+    }
+    for r in rows:
+        shape = tuple(int(r[f]) for f in ("model_dim", "inter_dim", "expert", "topk"))
+        space, block_m = spaces[shape], int(r["block_m"])
+        assert r["kernelName1"] in space[1, block_m], r
+        assert r["kernelName2"] in space[2, block_m], r
+
+
+def test_fhmoe_param_space_keeps_the_stage_1_geometry_the_table_checks():
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    def k_waves(model_dim):
+        p = api.fhmoe_problem(_fhmoe_key(((model_dim, 256, 257, 9), dtypes.fp8)))
+        stage1 = (
+            n
+            for (stage, _), names in _fhmoe_space(p).items()
+            if stage == 1
+            for n in names
+        )
+        return {int(get_flydsl_kernel_params(n).get("k_wave", 1)) for n in stage1}
+
+    assert k_waves(6144) == {1, 2, 4}
+    assert k_waves(2304) == {1}  # 2304 / k_wave is no multiple of tile_k 256
+
+
+def test_fhmoe_param_space_keeps_the_tiles_dividing_inter_dim():
+    from aiter.ops.flydsl import moe_kernels
+
+    space = _fhmoe_space(api.fhmoe_problem(_fhmoe_key(_DSV4)))
+    tiles = {1: "tile_n", 2: "tile_k"}
+    for stage, tile in tiles.items():
+        registry = getattr(moe_kernels, f"get_flydsl_stage{stage}_kernels")
+        assert any(384 % int(k[tile]) for k in registry("fp8", "fp4", "bf16").values())
+        names = set().union(*(v for (s, _), v in space.items() if s == stage))
+        params = map(moe_kernels.get_flydsl_kernel_params, names)
+        assert names and not any(384 % int(k[tile]) for k in params), stage
+
+
+def test_fhmoe_param_space_lists_none_outside_the_dedicated_table_contracts():
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    separated = {"gate_mode": GateMode.SEPARATED.value, "gate_up_interleave": False}
+    cases = {
+        "fp16 output": _fhmoe_key(_HY4, out=dtypes.fp16),
+        "intermediate pad": _fhmoe_key(_DSV4, pads=(0, 128)),
+        "hidden pad": _fhmoe_key(_HY4, pads=(128, 0)),
+        "MXFP4 at another shape": _fhmoe_key(((7168, 256, 257, 9), dtypes.fp4x2)),
+        "separated fp8 x MXFP4": _fhmoe_key(_DSV4, **separated),
+        "separated MXFP4": _a4w4_problem(shape=(7168, 384, 385, 7), **separated),
+        "doweight": _fhmoe_key(_HY4, doweight=True),
+    }
+    for segment in _fhmoe_segments():
+        for name, problem in cases.items():
+            assert segment.param_space(api.fhmoe_problem(problem)) == (), name
+        assert segment.param_space(_fhmoe_key(_HY4)) == ()  # no shared expert
+
+
+def test_fhmoe_candidates_resolve_to_their_segments(monkeypatch):
+    """One pair per `block_m` and stage 1 kind resolved; every pair of that kind
+    passes the dedicated table's checks with the resolved metadata."""
+    from aiter.moev2.migration import fhmoe
+    from aiter.moev2.segments import flydsl_fhmoe
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    def table_checks(contract, metadata):
+        flydsl_fhmoe._validate_fhmoe_metadata_consistency(metadata)
+        if contract == _DSV4:
+            return flydsl_fhmoe._is_dsv4_i384_metadata(metadata)
+        return flydsl_fhmoe._is_fhmoe_metadata_compatible(
+            metadata,
+            model_dim=6144,
+            dtype=dtypes.bf16,
+            q_dtype_a=dtypes.fp8,
+            q_dtype_w=dtypes.fp8,
+            gate_mode=GateMode.INTERLEAVE,
+        )
+
+    for contract in (_HY4, _DSV4):
+        p = api.fhmoe_problem(_fhmoe_key(contract))
+        space = _fhmoe_space(p)
+        for stage, block_m in sorted(space):
+            if stage == 2:
+                continue
+            kernel2 = min(space[2, block_m])
+            for fused in (False, True):
+                kernel1 = min(
+                    n for n in space[1, block_m] if n.endswith("_fp8") is fused
+                )
+                row = {"block_m": block_m, "ksplit": 0}
+                row |= {"kernelName1": kernel1, "kernelName2": kernel2}
+                monkeypatch.setattr(tuned, "lookup", lambda _, row=row: row)
+                res = resolver.resolve(p, fhmoe.SEGMENTS)
+                assert res.plan.source == "tuned", (row, res.declined)
+                names = res.plan.structure()[0]
+                if fused:
+                    assert names[2:] == ("flydsl_fhmoe.gemm1_q", "flydsl_fhmoe.gemm2")
+                else:
+                    assert names[2:] == (
+                        "flydsl_fhmoe.gemm1",
+                        "quant.inter",
+                        "flydsl_fhmoe.gemm2",
+                    )
+                assert res.metadata.block_m == block_m
+                assert table_checks(contract, res.metadata)
+                for n1 in space[1, block_m]:
+                    if n1.endswith("_fp8") is not fused:
+                        continue
+                    for n2 in space[2, block_m]:
+                        metadata = types.SimpleNamespace(
+                            block_m=block_m,
+                            fuse_quant=res.metadata.fuse_quant,
+                            stage1=types.SimpleNamespace(keywords={"kernelName": n1}),
+                            stage2=types.SimpleNamespace(keywords={"kernelName": n2}),
+                        )
+                        assert table_checks(contract, metadata), (n1, n2)
+
+
 def _a8w4(activation=ActivationType.Swiglu, **kwargs):
     return _mx_problem(dtypes.fp8, dtypes.fp4x2, activation, **kwargs)
 

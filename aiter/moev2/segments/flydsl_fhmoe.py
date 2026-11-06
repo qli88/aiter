@@ -20,14 +20,20 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
+from ..dispatch import kernel_names
+from ..dispatch.ops import Op
 from ..problem import scale_spec
-from .base import Cap
+from .base import Cap, Params
+from .defaults import tunable
 from .mxfp4 import (
     FlydslGemm1,
     FlydslGemm1Quant,
     FlydslGemm2,
+    _flydsl_kernels,
     a4w4_caps,
     a8w4_caps,
+    mxfp4,
+    mxfp8,
     mxfp8_caps,
 )
 
@@ -545,10 +551,88 @@ def fhmoe_caps():
     )
 
 
+@functools.cache
+def _fhmoe_candidates(w_dtype, model_dim, inter_dim) -> tuple:
+    """`(block_m, stage 1 names, stage 2 names)` of the legacy
+    `op_tests/tuners/tune_fhmoe.py` (`stage1_candidates`, `stage2_candidates`, every
+    pair in its full mode; `--quick` is a tuner filter) at every `block_m` of the stage
+    1 registry (the tuner keeps the row's), its filters widened for every FHMoE
+    contract: stage 1 also unfused, stage 2 any
+    `tile_n`, persist and `b_nt`, its literal 256 read as `inter_dim`; and the stage
+    1 geometry `_valid_fhmoe_kernel_geometry` checks for the dedicated table."""
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    stage1 = _flydsl_kernels("get_flydsl_stage1_kernels", "fp8", w_dtype, "bf16")
+    stage2 = _flydsl_kernels("get_flydsl_stage2_kernels", "fp8", w_dtype, "bf16")
+    out = []
+    for block_m in sorted({int(k["tile_m"]) for k in stage1.values()}):
+        names2 = []
+        for name, k in stage2.items():
+            tile_m = int(k["tile_m"])
+            if block_m % tile_m or inter_dim % int(k["tile_k"]):
+                continue
+            candidate = name if tile_m == block_m else f"{name}_sbm{block_m}"
+            parsed = get_flydsl_kernel_params(candidate)
+            if parsed and int(parsed.get("sort_block_m", 0) or tile_m) == block_m:
+                names2.append((candidate, parsed))
+        names1 = []
+        for name, k in stage1.items():
+            if (
+                int(k["tile_m"]) != block_m
+                or int(k["tile_k"]) != 256
+                or inter_dim % int(k["tile_n"])
+                or k.get("gate_mode") != "interleave"
+            ):
+                continue
+            for candidate in (name, f"{name}_fp8"):
+                parsed = get_flydsl_kernel_params(candidate)
+                if parsed and any(
+                    _valid_fhmoe_kernel_geometry(parsed, p2, model_dim=model_dim)
+                    for _, p2 in names2
+                ):
+                    names1.append(candidate)
+        if names1:
+            out.append((block_m, tuple(names1), tuple(n for n, _ in names2)))
+    return tuple(out)
+
+
+def fhmoe_param_space(segment, p) -> tuple:
+    """The FHMoE candidates `segment` owns, of its stage, for a problem with the shared
+    expert: fp8 activations with the gate and up interleaved, MXFP4 or MXFP8 weights,
+    bf16 output, without doweight or pads (the contracts of the FHMoE rows); MXFP4 at
+    the DeepSeek V4 shape only, the only one `fhmoe_` reads the dedicated table for."""
+    if not (segment.accepts(p) and tunable(p)) or p.shared is None:
+        return ()
+    if (
+        p.gate_mode != GateMode.INTERLEAVE
+        or p.act_in != mxfp8()
+        or p.w1 not in (mxfp4(), mxfp8())
+        or p.out_dtype != dtypes.bf16
+        or "doweight_stage1" in p.features
+        or p.layout.hidden_pad
+        or p.layout.intermediate_pad
+    ):
+        return ()
+    shape = (p.shape.model_dim, p.shape.inter_dim, p.shape.experts, p.shape.topk)
+    layout = (p.layout.hidden_pad, p.layout.intermediate_pad, p.gate_mode)
+    if p.w1 == mxfp4() and not _is_dsv4_i384_fhmoe_contract(
+        *shape, *layout, "doweight_stage1" in p.features
+    ):
+        return ()
+    w_dtype = "fp8" if p.w1 == mxfp8() else "fp4"
+    gemm2 = Op.GEMM2 in segment.covers
+    return tuple(
+        Params(kernel=name, block_m=block_m)
+        for block_m, names1, names2 in _fhmoe_candidates(
+            w_dtype, p.shape.model_dim, p.shape.inter_dim
+        )
+        for name in (names2 if gemm2 else names1)
+        if segment.owns(kernel_names.parse(name))
+    )
+
+
 class _FhmoeStage1:
-    """The FHMoE stage 1 over a plain FlyDSL stage 1 (first base after this one). It
-    lists no candidates: legacy tunes FHMoE calls in `op_tests/tuners/tune_fhmoe.py`,
-    which `param_space` does not mirror yet."""
+    """The FHMoE stage 1 over a plain FlyDSL stage 1 (first base after this one)."""
 
     @property
     def capabilities(self):
@@ -561,7 +645,7 @@ class _FhmoeStage1:
         )
 
     def param_space(self, p):
-        return ()
+        return fhmoe_param_space(self, p)
 
     def call_args(self, c):
         return {
@@ -586,12 +670,12 @@ class FlydslFhmoeGemm1Quant(_FhmoeStage1, FlydslGemm1Quant):
 
 
 class FlydslFhmoeGemm2(FlydslGemm2):
-    """`flydsl.gemm2` with the shared expert; no candidates, as `_FhmoeStage1`."""
+    """`flydsl.gemm2` with the shared expert."""
 
     name = "flydsl_fhmoe.gemm2"
 
     def param_space(self, p):
-        return ()
+        return fhmoe_param_space(self, p)
 
     @property
     def capabilities(self):

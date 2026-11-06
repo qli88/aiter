@@ -24,9 +24,6 @@
   "a4w4 | mxmoe.gemm1 | not a candidate": 3,
   "a4w4 | mxmoe.gemm2 | not a candidate": 9,
   "a8w4 | asm.stage1_cktile | no candidates": 5,
-  "a8w8_blockscale | ck.gemm1 | not a candidate": 7,
-  "fhmoe | flydsl_fhmoe.gemm1 | no candidates": 4,
-  "fhmoe | flydsl_fhmoe.gemm1_q | no candidates": 24,
-  "fhmoe | flydsl_fhmoe.gemm2 | no candidates": 28
+  "a8w8_blockscale | ck.gemm1 | not a candidate": 7
  }
 }

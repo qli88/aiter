@@ -24,7 +24,11 @@ per legacy task: token-major output in `opus` (with stage 2), sorted output in
 block_m, flat)`. MXMOE (`mxmoe`) is the separate `Mxfp4FlydslTuner` at its full search,
 each of its candidate pairs a stage 1 and a stage 2 tag. That tuner filters no key (it
 times a g1u1 a4w4 bf16 call for any row); the harness gives it the a4w4 keys on gfx950,
-where its kernels run, g1u0 included.
+where its kernels run, g1u0 included. FHMoE (`fhmoe`) is `tune_fhmoe.py` with its
+filters widened for every FHMoE contract (decided in 5.1i), checked per snapshot
+FHMoE call (the problem with its shared expert) and on synthetic gfx950 calls: legacy's
+candidates, where its contract matches, must be in the widened rules, and v2 lists
+exactly those.
 
     python tests/moe_dispatch/param_space_checks.py --check [--arch gfx950]
 """
@@ -314,6 +318,143 @@ def _legacy_flydsl(tuner, info, call):
     )
 
 
+@functools.cache
+def _tune_fhmoe():
+    sys.path.insert(0, str(_REPO / "op_tests" / "tuners"))
+    import tune_fhmoe
+
+    return tune_fhmoe
+
+
+_FHMOE_WIDENED = "FHMoE: the rules widened for every contract (5.1i)"
+
+
+def _fhmoe_widened(info, call):
+    """The decided widening of `tune_fhmoe.py` (5.1i), rebuilt from the registries:
+    every FHMoE contract with fp8 activations interleaved, MXFP4 (at 7168/384/385/7,
+    the only shape `fhmoe_` reads the dedicated table for) or MXFP8 weights, bf16
+    output, Silu, without doweight or pads; stage 1 fused or unfused, stage 2 any
+    `tile_n`, persist and `b_nt`, `tile_n` and stage 2 `tile_k` dividing `inter_dim`;
+    a stage 1 kept where it passes `_valid_fhmoe_kernel_geometry` with a stage 2."""
+    import torch
+
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.moev2.segments.flydsl_fhmoe import _valid_fhmoe_kernel_geometry
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    args, kwargs = call
+    if (
+        info[7] != ActivationType.Silu
+        or info[8] != torch.bfloat16
+        or info[9] != dtypes.fp8
+        or info[10] not in (dtypes.fp8, dtypes.fp4x2)
+        or info[11] != QuantType.per_1x32
+        or not info[12]
+        or info[13]
+        or args[12]
+        or args[13]
+        or GateMode(kwargs["gate_mode"]) != GateMode.INTERLEAVE
+        or (info[10] == dtypes.fp4x2 and info[3:7] != (7168, 384, 385, 7))
+    ):
+        return set()
+    model_dim, inter_dim = info[3], info[4]
+    w = "fp8" if info[10] == dtypes.fp8 else "fp4"
+    params = moe_kernels.get_flydsl_kernel_params
+    stage1 = moe_kernels.get_flydsl_stage1_kernels("fp8", w, "bf16")
+    stage2 = moe_kernels.get_flydsl_stage2_kernels("fp8", w, "bf16")
+    out = set()
+    for bm in {int(k["tile_m"]) for k in stage1.values()}:
+        s2 = {}
+        for name, k in stage2.items():
+            if bm % int(k["tile_m"]) or inter_dim % int(k["tile_k"]):
+                continue
+            name = name if int(k["tile_m"]) == bm else f"{name}_sbm{bm}"
+            if params(name) and _tune_fhmoe()._effective_sort_block(name) == bm:
+                s2[name] = params(name)
+        for base, k in stage1.items():
+            if (
+                int(k["tile_m"]) != bm
+                or int(k["tile_k"]) != 256
+                or inter_dim % int(k["tile_n"])
+                or k.get("gate_mode") != "interleave"
+            ):
+                continue
+            for name in (base, base + "_fp8"):
+                if params(name) and any(
+                    _valid_fhmoe_kernel_geometry(params(name), p2, model_dim=model_dim)
+                    for p2 in s2.values()
+                ):
+                    out.add(("stage1", name, bm, False))
+                    out |= {("stage2", n, bm, False) for n in s2}
+    return out
+
+
+def _legacy_fhmoe(tuner, info, call):
+    """`tune_fhmoe.py`'s `stage1_candidates` and `stage2_candidates` at every
+    `block_m` of its stage 1 registry (it keeps the row's), for the calls of its
+    contract (`_matches`), with the widening (`_fhmoe_widened`): `(candidates,
+    dropped reasons)`; the widening counts as a known reason where it adds any."""
+    from aiter.ops.flydsl.moe_common import GateMode
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_stage1_kernels
+
+    tf = _tune_fhmoe()
+    args, kwargs = call
+    fields = ("gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
+    row = {f: str(v) for f, v in zip(fields, info[:7])}
+    row |= {"shared_expert_id": str(info[5] - 1), "act_type": str(info[7])}
+    row |= dict(
+        zip(("dtype", "q_dtype_a", "q_dtype_w", "q_type"), map(str, info[8:12]))
+    )
+    row |= {"use_g1u1": str(int(info[12])), "doweight_stage1": str(int(info[13]))}
+    row |= {"hidden_pad": str(args[12]), "intermediate_pad": str(args[13])}
+    row |= {"gate_mode": str(GateMode(kwargs["gate_mode"])), "ksplit": "0"}
+    legacy = set()
+    if tf._matches(row, tf.Contract(), info[2]):
+        stage1 = get_flydsl_stage1_kernels("fp8", "fp8", "bf16")
+        for bm in {int(k["tile_m"]) for k in stage1.values()}:
+            legacy |= {("stage1", n, bm, False) for n in tf.stage1_candidates(bm)}
+            legacy |= {("stage2", n, bm, False) for n in tf.stage2_candidates(bm)}
+    widened = _fhmoe_widened(info, call)
+    if not legacy <= widened:
+        raise RunsDifferently(f"the widening drops {sorted(legacy - widened)[:2]}")
+    return widened, {_FHMOE_WIDENED} if widened - legacy else set()
+
+
+def synthetic_fhmoe_calls(gfx, cu_num):
+    """gfx950 FHMoE calls the snapshot lacks: HY4 with fp16 output, DeepSeek V4 with
+    an intermediate pad, fp8 x MXFP4 separated, MXFP4 separated and at another shape,
+    MXFP8 at other shapes (`model_dim` 2304: `_valid_fhmoe_kernel_geometry` drops
+    `k_wave` 2 and 4; `inter_dim` 384)."""
+    if gfx != "gfx950":
+        return []
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.moev2.problem import MoeProblem
+    from moe_dispatch.keys import _variant_kwargs
+
+    silu, fp4, fp8 = ActivationType.Silu, dtypes.fp4x2, dtypes.fp8
+    cases = (
+        ((6144, 256, 257, 9), dtypes.fp16, fp8, fp8, "interleave", 0),
+        ((7168, 384, 385, 7), dtypes.bf16, fp8, fp4, "interleave", 128),
+        ((7168, 384, 385, 7), dtypes.bf16, fp8, fp4, "base", 0),
+        ((7168, 256, 257, 9), dtypes.bf16, fp4, fp4, "base", 0),
+        ((7168, 256, 257, 9), dtypes.bf16, fp8, fp4, "interleave", 0),
+        ((7168, 256, 257, 9), dtypes.bf16, fp8, fp8, "interleave", 0),
+        ((2304, 256, 257, 9), dtypes.bf16, fp8, fp8, "interleave", 0),
+        ((7168, 384, 385, 7), dtypes.bf16, fp8, fp8, "interleave", 0),
+    )
+    out = []
+    for shape, dtype, q_a, q_w, variant, pad in cases:
+        info = (gfx, cu_num, 64, *shape, silu, dtype, q_a, q_w, QuantType.per_1x32)
+        info += (True, False)
+        args = (64, *shape, dtype, q_a, q_w, QuantType.per_1x32, True, silu, False)
+        problem = MoeProblem.from_legacy_key(
+            *args, 0, pad, **_variant_kwargs(variant, silu), arch=gfx, cu_num=cu_num
+        )
+        out.append((info, problem.legacy_key()))
+    return out
+
+
 def _legacy_flydsl_layout(tuner, info, call):
     return _tags(tuner.gen_flydsl_v2_2stages_task(info, _BLOCK_MS))
 
@@ -346,12 +487,15 @@ def _legacy_mxmoe(tuner, info, call):
 
 
 Family = collections.namedtuple(
-    "Family", "legacy segments per_call tunes", defaults=(False, legacy_tunes)
+    "Family",
+    "legacy segments per_call tunes fhmoe",
+    defaults=(False, legacy_tunes, False),
 )
 """`legacy(tuner, info, call)`: the legacy candidates, or `(candidates, dropped
 reasons)`; `per_call`: checked for each snapshot call of the key (the call's layout
 matters), else once for the key; `tunes(info)`: whether the legacy tuner tunes `info`
-(else v2 must list nothing)."""
+(else v2 must list nothing); `fhmoe`: checked for each FHMoE call (the snapshot's and
+`synthetic_fhmoe_calls`), with the shared expert in the problem."""
 
 
 def _families():
@@ -399,6 +543,12 @@ def _families():
             _legacy_mxmoe,
             (mxfp4.MxmoeGemm1(), mxfp4.MxmoeQuantGemm1(), mxfp4.MxmoeGemm2()),
             tunes=lambda info: info[0] == "gfx950",
+        ),
+        "fhmoe": Family(
+            _legacy_fhmoe,
+            fhmoe,
+            tunes=lambda info: info[0] == "gfx950",
+            fhmoe=True,
         ),
     }
 
@@ -621,6 +771,7 @@ def check_arch(arch, tuner):
         gfx, cu_num = stack.enter_context(arch_sim.simulated_arch(arch))
         stack.enter_context(captured_logs())
         stack.enter_context(_legacy_pinned(gfx, cu_num))
+        fhmoe_calls = []
         for info, keys in tuner_keys(gfx, cu_num).items():
             counts["keys"] += 1
             problem = MoeProblem.from_legacy_key(
@@ -632,13 +783,26 @@ def check_arch(arch, tuner):
                 for key in keys
                 if not key.call_kwargs().get("config_file")
             ] or _synthetic_calls(info, gfx, cu_num)
+            fhmoe_calls += [
+                (info, (key.args, key.call_kwargs()))
+                for key in keys
+                if key.section == "fhmoe"
+            ]
             for name, family in families.items():
+                if family.fhmoe:
+                    continue
                 if not family.per_call:
                     compare(name, family, info, problem, None)
                     continue
                 for call in calls:
                     counts[f"{name} calls"] += 1
                     compare(name, family, info, api.problem_from_key(*call), call)
+        for info, call in fhmoe_calls + synthetic_fhmoe_calls(gfx, cu_num):
+            problem = api.problem_from_key(*call, fhmoe=True)
+            for name, family in families.items():
+                if family.fhmoe:
+                    counts[f"{name} calls"] += 1
+                    compare(name, family, info, problem, call)
     return counts, known, problems
 
 
