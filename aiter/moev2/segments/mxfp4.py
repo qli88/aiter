@@ -13,11 +13,18 @@ MXMOE read the auxiliary sort (`sort.aux`); MXMOE stage 1 reads the activations
 
 import dataclasses
 import functools
+import itertools
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.ops.flydsl.moe_common import GateMode, get_flydsl_activation_name
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+    get_flydsl_activation_name,
+)
 from aiter.ops.flydsl.mxfp4_kname import (
+    MXFP4_G1_VARIANTS,
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     parse_flydsl_v2_gemm2_kernel,
@@ -517,6 +524,107 @@ def flydsl_param_space(segment, p, layout) -> tuple:
     )
 
 
+def _mxmoe_g1_name(bm, bn, use_nt, inline_quant, hpf, act, k_wave, xcd, num_waves):
+    """Legacy `Mxfp4FlydslTuner._g1_kname`, in `_parse_mxfp4_g1_kname`'s token order."""
+    name = f"flydsl_mxmoe_g1_a4w4_{bm}x{bn}x256"
+    name += "_f16in" if inline_quant else ""
+    name += "_hpf" if hpf else ""
+    name += "_nt" if use_nt else ""
+    name += {"situv2": "_situv2", "swiglu": "_swiglu"}.get(act, "")
+    name += f"_kw{k_wave}" if k_wave > 1 else ""
+    name += f"_xcd{xcd}" if xcd else ""
+    return name + ("_w2" if num_waves == 2 else "")
+
+
+@functools.cache
+def _mxmoe_candidates(act, model_dim, inter_dim) -> tuple:
+    """`(block_m, stage 1 names, stage 2 names)` of the legacy
+    `Mxfp4FlydslTuner._candidate_rows` at its full search (`--mxfp4-search-mode full`;
+    the default prune by tokens per expert is a tuner filter), which pairs every name
+    of a `block_m`'s stage 1 with every one of its stage 2: the a4w4 stage 1 variants
+    the kernel's `_assert_supported` accepts, and the layout GEMM2s with that `tile_m`;
+    a `block_m` without both is left out."""
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
+
+    stage1 = {}
+    for bm, use_nt, inline_quant in sorted(MXFP4_G1_VARIANTS["fp4"]):
+        for bn, num_waves, k_wave in itertools.product(
+            (64, 128, 256), (4, 2), (1, 2, 4)
+        ):
+            for hpf in (False, True) if inline_quant else (False,):
+                try:
+                    _assert_supported(
+                        D_HIDDEN=model_dim,
+                        D_INTER=inter_dim,
+                        BM=bm,
+                        BN=bn,
+                        BK=256,
+                        use_nt=use_nt,
+                        inline_quant=inline_quant,
+                        prefetch_hidden=hpf,
+                        act=act,
+                        situ_beta=DEFAULT_SITUV2_BETA,
+                        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+                        num_waves=num_waves,
+                        k_wave=k_wave,
+                        native_scale_layout=bm == 16,
+                    )
+                except NotImplementedError:
+                    continue
+                for xcd in (0, 2, 4):
+                    name = _mxmoe_g1_name(
+                        bm, bn, use_nt, inline_quant, hpf, act, k_wave, xcd, num_waves
+                    )
+                    stage1.setdefault(bm, []).append(name)
+    out = []
+    for bm, names in sorted(stage1.items()):
+        s2 = _flydsl_kernels(
+            "get_flydsl_stage2_v2_kernels",
+            "fp4",
+            "fp4",
+            "bf16",
+            bm,
+            model_dim,
+            inter_dim,
+        )
+        s2 = tuple(name for name, k in s2.items() if k["tile_m"] == bm)
+        if s2:
+            out.append((bm, tuple(names), s2))
+    return tuple(out)
+
+
+def mxmoe_param_space(segment, p) -> tuple:
+    """The MXMOE candidates `segment` owns, of its stage, each in a pair dispatch does
+    not discard (`mxfp4_row_rejection`: e.g. a shape the generated auxiliary kernels do
+    not cover). None for fp16 output (the legacy tuner times bf16 whatever the key's
+    dtype) or an activation MXMOE has no kernel for."""
+    if not (segment.accepts(p) and tunable(p)) or p.out_dtype != dtypes.bf16:
+        return ()
+    if p.activation.activation not in TUNED_ROW_ACTIVATIONS:
+        return ()
+    act = get_flydsl_activation_name(p.activation.activation)
+    gemm2 = Op.GEMM2 in segment.covers
+    out = []
+    for block_m, names1, names2 in _mxmoe_candidates(
+        act, p.shape.model_dim, p.shape.inter_dim
+    ):
+        names, partners = (names2, names1) if gemm2 else (names1, names2)
+        for name in names:
+            if not segment.owns(kernel_names.parse(name)):
+                continue
+            pairs = (
+                (partner, name) if gemm2 else (name, partner) for partner in partners
+            )
+            row = {"block_m": block_m, "ksplit": 0}
+            if any(
+                mxfp4_row_rejection(p, {**row, "kernelName1": kn1, "kernelName2": kn2})
+                is None
+                for kn1, kn2 in pairs
+            ):
+                out.append(Params(kernel=name, block_m=block_m))
+    return tuple(out)
+
+
 class _FlydslStage1(Segment):
     prefixes = (kernel_names.FLYDSL,)
 
@@ -918,6 +1026,9 @@ class MxmoeGemm1(Segment):
             "has_bias": "bias1" in p.features and p1.get("enable_bias", False),
         }
 
+    def param_space(self, p):
+        return mxmoe_param_space(self, p)
+
 
 class MxmoeQuantGemm1(MxmoeGemm1):
     """MXMOE stage 1 handed the caller's activations, which it quantizes itself
@@ -975,3 +1086,6 @@ class MxmoeGemm2(Segment):
     def metadata_fields(self, p, params):
         is_layout_gemm2 = parse_flydsl_v2_gemm2_kernel(params.kernel) is not None
         return {"stage2_has_bias": "bias2" in p.features and is_layout_gemm2}
+
+    def param_space(self, p):
+        return mxmoe_param_space(self, p)

@@ -2417,6 +2417,85 @@ def test_flydsl_param_space_lists_per_1x32_on_gfx950_only():
         assert bool(mxfp4.FlydslGemm1().param_space(a16w4)) is listed
 
 
+def _mxmoe_segments():
+    from aiter.moev2.segments import mxfp4
+
+    return (mxfp4.MxmoeGemm1(), mxfp4.MxmoeQuantGemm1(), mxfp4.MxmoeGemm2())
+
+
+def test_mxmoe_param_space_pairs_the_legacy_stages_by_block_m():
+    from aiter.moev2.segments import mxfp4
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
+    from aiter.ops.flydsl.mxfp4_kname import (
+        _parse_mxfp4_g1_kname,
+        parse_flydsl_v2_gemm2_kernel,
+    )
+
+    a4w4 = _mx_problem(dtypes.fp4x2, dtypes.fp4x2, ActivationType.Swiglu)
+    gemm1, quant, gemm2 = (s.param_space(a4w4) for s in _mxmoe_segments())
+    assert {p["block_m"] for p in gemm1} == {32, 64, 128}
+    assert {p["block_m"] for p in quant} == {16}
+    for p in gemm1 + quant:
+        g1 = _parse_mxfp4_g1_kname(p["kernel"])
+        assert g1["BM"] == p["block_m"] and g1["act"] == "swiglu"
+        assert g1["inline_quant"] is (p["block_m"] == 16)
+        fields = (g1["BM"], g1["BN"], g1["use_nt"], g1["inline_quant"])
+        fields += (g1["prefetch_hidden"], g1["act"], g1["k_wave"], g1["xcd_swizzle"])
+        assert mxfp4._mxmoe_g1_name(*fields, g1["num_waves"]) == p["kernel"]
+    assert {_parse_mxfp4_g1_kname(p["kernel"])["xcd_swizzle"] for p in gemm1} == {
+        0,
+        2,
+        4,
+    }
+    assert {p["block_m"] for p in gemm2} == {16, 32, 64, 128}
+    for p in gemm2:
+        assert parse_flydsl_v2_gemm2_kernel(p["kernel"])["tile_m"] == p["block_m"]
+
+    # A stage 1 variant runs at inter_dim 192, no layout GEMM2 does: legacy pairs none.
+    no_stage2 = _mx_problem(dtypes.fp4x2, dtypes.fp4x2, inter_dim=192)
+    _assert_supported(
+        D_HIDDEN=7168, D_INTER=192, BM=128, BN=128, BK=256, use_nt=False,
+        inline_quant=False, prefetch_hidden=False, act="silu", situ_beta=4.0,
+        situ_linear_beta=25.0, num_waves=4, k_wave=1, native_scale_layout=False,
+    )  # fmt: skip
+    for segment in _mxmoe_segments():
+        assert segment.accepts(no_stage2) and segment.param_space(no_stage2) == ()
+
+
+def test_mxmoe_param_space_lists_none_where_no_tuned_row_runs_as_timed():
+    cases = {
+        "fp16 output": _mx_problem(dtypes.fp4x2, dtypes.fp4x2, out=dtypes.fp16),
+        "no kernel": _mx_problem(dtypes.fp4x2, dtypes.fp4x2, ActivationType.Gelu),
+        "aux shape": _a4w4_problem(token=64, shape=(4096, 2048, 288, 8)),
+    }
+    doweight = _mx_problem(dtypes.fp4x2, dtypes.fp4x2, doweight=True)
+    for segment in _mxmoe_segments():
+        for name, problem in cases.items():
+            assert segment.accepts(problem), name
+            assert segment.param_space(problem) == (), name
+        assert not segment.accepts(doweight)
+        assert segment.param_space(doweight) == ()
+
+
+def test_mxmoe_candidates_resolve_to_their_segments(monkeypatch):
+    gemm1, quant, gemm2 = (
+        s.param_space(_a4w4_problem(token=64, is_shuffled=True))
+        for s in _mxmoe_segments()
+    )
+    stage2 = {p["block_m"]: p["kernel"] for p in gemm2}
+    for stage1, owner in ((gemm1, "mxmoe.gemm1"), (quant, "mxmoe.quant_gemm1")):
+        for block_m in sorted({p["block_m"] for p in stage1}):
+            kernel1 = next(p["kernel"] for p in stage1 if p["block_m"] == block_m)
+            row = {"block_m": block_m, "ksplit": 0, "run_1stage": 0}
+            row |= {"kernelName1": kernel1, "kernelName2": stage2[block_m]}
+            p = _a4w4_problem(token=64, is_shuffled=True)
+            res = _a4w4_resolve(monkeypatch, p, row)
+            assert res.plan.source == "tuned", (block_m, res.declined)
+            names = res.plan.structure()[0]
+            assert owner in names and "mxmoe.gemm2" in names
+            assert res.metadata.block_m == block_m
+
+
 def _a8w4(activation=ActivationType.Swiglu, **kwargs):
     return _mx_problem(dtypes.fp8, dtypes.fp4x2, activation, **kwargs)
 

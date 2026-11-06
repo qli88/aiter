@@ -17,8 +17,8 @@ TUNE_BLOCK_MS = (16, 32, 64, 128)
 
 
 def tunable(p) -> bool:
-    """The problems the tuner lists candidates for, as the legacy tuner: g1u1 only,
-    per-1x32 only on gfx950."""
+    """The problems the tuner lists candidates for, as legacy `FmoeTuner.tune()`: g1u1
+    only, per-1x32 only on gfx950."""
     return p.is_g1u1 and (p.quant_type != QuantType.per_1x32 or p.arch == "gfx950")
 
 

@@ -21,7 +21,10 @@ goes through legacy dispatch itself (a one-row tuned table swapped into `fused_m
 is a known difference v2 declines on purpose. Opus stage 1 candidates are listed once
 per legacy task: token-major output in `opus` (with stage 2), sorted output in
 `opus_sorted`. A 1-stage candidate (`asm_1stage`) is `(asm_1stage[_xbf16], kernel,
-block_m, flat)`.
+block_m, flat)`. MXMOE (`mxmoe`) is the separate `Mxfp4FlydslTuner` at its full search,
+each of its candidate pairs a stage 1 and a stage 2 tag. That tuner filters no key (it
+times a g1u1 a4w4 bf16 call for any row); the harness gives it the a4w4 keys on gfx950,
+where its kernels run, g1u0 included.
 
     python tests/moe_dispatch/param_space_checks.py --check [--arch gfx950]
 """
@@ -117,7 +120,8 @@ def tuner_keys(gfx, cu_num):
 
 def synthetic_keys(gfx, cu_num):
     """gfx950 per-1x32 keys the snapshot lacks: fp16 output, a4w4 Gelu, the gpt-oss
-    model_dim 2880, a8w4 Swiglu at every CK-Tile token tier."""
+    model_dim 2880, a8w4 Swiglu at every CK-Tile token tier, a4w4 g1u0 (at a shape the
+    MXMOE auxiliary kernels cover)."""
     if gfx != "gfx950":
         return []
     from aiter import ActivationType, QuantType, dtypes
@@ -136,7 +140,12 @@ def synthetic_keys(gfx, cu_num):
         for dtype in (dtypes.bf16, dtypes.fp16)
         for token in (4096, 20000)
     ]
-    return [
+    g1u0 = [
+        (gfx, cu_num, token, 7168, 256, 256, 8, ActivationType.Silu)
+        + (dtypes.bf16, fp4, fp4, QuantType.per_1x32, False, False)
+        for token in (16, 512)
+    ]
+    return g1u0 + [
         (gfx, cu_num, token, model_dim, inter_dim, 128, 4, activation)
         + (dtype, q_a, fp4, QuantType.per_1x32, True, doweight)
         for (dtype, q_a, activation, model_dim, inter_dim), token in tokens
@@ -309,10 +318,40 @@ def _legacy_flydsl_layout(tuner, info, call):
     return _tags(tuner.gen_flydsl_v2_2stages_task(info, _BLOCK_MS))
 
 
-Family = collections.namedtuple("Family", "legacy segments per_call", defaults=(False,))
+@functools.cache
+def _mxmoe_tuner(tune):
+    tuner = tune.Mxfp4FlydslTuner.__new__(tune.Mxfp4FlydslTuner)
+    tuner.keys = []
+    return tuner
+
+
+def _legacy_mxmoe(tuner, info, call):
+    """`Mxfp4FlydslTuner._candidate_rows` at its full search, for the a4w4 keys (it
+    tunes its own table and reads no dtype of the key)."""
+    from aiter import QuantType, dtypes
+
+    if (info[9], info[10], info[11]) != (
+        dtypes.fp4x2,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+    ):
+        return set()
+    row = dict(zip(("token", "model_dim", "inter_dim", "expert", "topk"), info[2:7]))
+    row["act_type"] = str(info[7])
+    tune = sys.modules[type(tuner).__module__]
+    candidates = _mxmoe_tuner(tune)._candidate_rows(row, full_search=True)
+    return {("stage1", c["kernelName1"], c["block_m"], False) for c in candidates} | {
+        ("stage2", c["kernelName2"], c["block_m"], False) for c in candidates
+    }
+
+
+Family = collections.namedtuple(
+    "Family", "legacy segments per_call tunes", defaults=(False, legacy_tunes)
+)
 """`legacy(tuner, info, call)`: the legacy candidates, or `(candidates, dropped
 reasons)`; `per_call`: checked for each snapshot call of the key (the call's layout
-matters), else once for the key."""
+matters), else once for the key; `tunes(info)`: whether the legacy tuner tunes `info`
+(else v2 must list nothing)."""
 
 
 def _families():
@@ -356,13 +395,18 @@ def _families():
             functools.partial(_legacy_opus, sorted_out=True),
             (opus.OpusGemm1Layout(),),
         ),
+        "mxmoe": Family(
+            _legacy_mxmoe,
+            (mxfp4.MxmoeGemm1(), mxfp4.MxmoeQuantGemm1(), mxfp4.MxmoeGemm2()),
+            tunes=lambda info: info[0] == "gfx950",
+        ),
     }
 
 
 def _stage(segment):
     from aiter.moev2.dispatch.ops import Op
 
-    return "stage1" if Op.GEMM1 in segment.covers else "stage2"
+    return "stage1" if segment.covers[0] <= Op.GEMM1 <= segment.covers[1] else "stage2"
 
 
 def _candidate(segment, params):
@@ -408,7 +452,8 @@ def known_difference(family, info, raised):
     or None."""
     import torch
 
-    from aiter import QuantType
+    import aiter
+    from aiter import QuantType, dtypes
 
     gfx, q_a, q_w, q_type = info[0], info[9], info[10], info[11]
     fp8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -425,6 +470,12 @@ def known_difference(family, info, raised):
             and gfx not in ("gfx942", "gfx950")
         ):
             return Known(f"legacy raises: no 1-stage table names on {gfx} (todo 5.52)")
+        if (
+            family == "mxmoe"
+            and isinstance(raised, ValueError)
+            and _activation(info) not in ("silu", "swiglu", "situv2")
+        ):
+            return Known(f"legacy raises: MXMOE has no {_activation(info)} kernel")
         return None
     if gfx == "gfx1201":
         return Known("gfx1201: no v2 path (todo 1b.2)")
@@ -456,6 +507,29 @@ def known_difference(family, info, raised):
         return Known(
             "Opus stage 2 doweight: `opus.gemm2` leaves it out; its only legacy "
             "partner is FlyDSL stage 1 (todo 1e.7)"
+        )
+    if family == "mxmoe" and not info[12]:
+        return Known(
+            "MXMOE g1u0: the capabilities leave it out; the legacy tuner times g1u1 "
+            "whatever the key's"
+        )
+    if family == "mxmoe" and info[8] != dtypes.bf16:
+        return Known(
+            "MXMOE fp16 output: the legacy tuner times bf16 whatever the key's dtype",
+            declined=True,
+        )
+    if family == "mxmoe" and info[13]:
+        return Known(
+            "MXMOE doweight: the capabilities leave it out; the legacy tuner applies "
+            "the routed weights in stage 2 whatever the key's"
+        )
+    if family == "mxmoe" and not aiter.is_mxfp4_moe_shape_supported(
+        info[5], info[3], info[4], info[6]
+    ):
+        return Known(
+            "MXMOE shape outside the generated auxiliary kernels: dispatch discards "
+            "the tuned row (todo 5.61)",
+            declined=True,
         )
     if family == "asm_1stage" and q_w == torch.uint32:
         return Known(
@@ -508,7 +582,7 @@ def check_arch(arch, tuner):
             # The legacy generators print when a kernel table is missing.
             with contextlib.redirect_stdout(io.StringIO()):
                 legacy = (
-                    family.legacy(tuner, info, call) if legacy_tunes(info) else set()
+                    family.legacy(tuner, info, call) if family.tunes(info) else set()
                 )
         except RunsDifferently as exc:
             problem_at(name, info, "runs differently", str(exc))
