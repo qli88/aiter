@@ -2673,6 +2673,167 @@ def test_fhmoe_candidates_resolve_to_their_segments(monkeypatch):
                         assert table_checks(contract, metadata), (n1, n2)
 
 
+def _whole_graph_key(token=64, quant=QuantType.per_Token, arch="gfx942", **kwargs):
+    """A key of the shipped whole-graph rows' shape (Qwen3-Next), with 80 CUs."""
+    w = torch.bfloat16 if quant == QuantType.No else torch.float8_e4m3fnuz
+    kwargs.setdefault("is_shuffled", True)
+    activation = kwargs.pop("activation", ActivationType.Silu)
+    out = kwargs.pop("out", dtypes.bf16)
+    doweight, g1u1 = kwargs.pop("doweight", False), kwargs.pop("g1u1", True)
+    w = kwargs.pop("w", w)
+    args = (token, 2048, 512, 512, 10, out, w, w, quant, g1u1, activation, doweight)
+    return MoeProblem.from_legacy_key(*args, 0, 0, **kwargs, arch=arch, cu_num=80)
+
+
+def _whole_graph_configs(p):
+    """`{(config, block_m)}` of `impl.whole_graph` for `p`, on its arch."""
+    from moe_dispatch.arch_sim import simulated_arch
+
+    from aiter.moev2.segments import whole_graph
+
+    with simulated_arch("gfx942_cu80" if p.arch == "gfx942" else p.arch):
+        return {
+            (c["kernel"].split("__", 2)[2], c["block_m"])
+            for c in whole_graph.WholeGraph().param_space(p)
+        }
+
+
+def test_whole_graph_param_space_lists_the_e2e_tune_configs():
+    from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
+
+    space = set(get_tune_space())
+    fp8 = _whole_graph_configs(_whole_graph_key())
+    assert {c for c, _ in fp8} == space  # every config runs this shape
+    assert all(block_m == Config.from_string(c).BLOCK_M for c, block_m in fp8)
+    per_tensor = _whole_graph_configs(_whole_graph_key(quant=QuantType.per_Tensor))
+    assert per_tensor == fp8
+    # The decode config raises over 256 tokens; bf16 prefill takes BLOCK_K 64 or 128
+    # and no specialized Down path.
+    assert {c for c, _ in _whole_graph_configs(_whole_graph_key(token=512))} == (
+        space - {"16_16_16_False:default:0"}
+    )
+    bf16 = {c for c, _ in _whole_graph_configs(_whole_graph_key(quant=QuantType.No))}
+    assert bf16 == {
+        "16_16_16_False:default:0",
+        "64_256_128_True:default:0",
+        "64_128_128_True:default:0",
+    }
+    # The shape probe: compact Down needs inter_dim in {192, 256, 384, 512, 640}.
+    wide = _whole_graph_key()
+    wide = dataclasses.replace(
+        wide, shape=dataclasses.replace(wide.shape, inter_dim=768)
+    )
+    assert not any("8x1_compact" in c for c, _ in _whole_graph_configs(wide))
+    assert any("1x4_64x256" in c for c, _ in _whole_graph_configs(wide))
+    # The probe charges per-token scales to per-tensor too: at inter_dim 896 the
+    # specialized Down paths exceed its LDS budget, though they would run.
+    narrow = _whole_graph_key(quant=QuantType.per_Tensor)
+    narrow = dataclasses.replace(
+        narrow, shape=dataclasses.replace(narrow.shape, inter_dim=896)
+    )
+    assert not any(":default:" not in c for c, _ in _whole_graph_configs(narrow))
+    assert _whole_graph_configs(narrow)
+
+
+def test_whole_graph_param_space_keeps_the_decode_config_where_it_runs():
+    decode = "16_16_16_False:default:0"
+
+    def lists_decode(token=64, model_dim=2048, inter_dim=512):
+        p = _whole_graph_key(token=token)
+        shape = dataclasses.replace(p.shape, model_dim=model_dim, inter_dim=inter_dim)
+        return decode in {
+            c for c, _ in _whole_graph_configs(dataclasses.replace(p, shape=shape))
+        }
+
+    assert lists_decode(token=1) and lists_decode(token=256)
+    assert not lists_decode(token=257)
+    # Its split-K kernels assert model_dim % 256 (gate/up) and inter_dim % 64 (Down).
+    assert lists_decode(model_dim=2304) and lists_decode(inter_dim=448)
+    assert not lists_decode(model_dim=2880)
+    assert not lists_decode(inter_dim=96)
+
+
+def test_whole_graph_param_space_lists_every_shipped_row():
+    import csv
+
+    names = {"torch": torch, "ActivationType": ActivationType, "QuantType": QuantType}
+    rows = []
+    for path in sorted((_REPO / "aiter" / "configs").rglob("*fmoe*.csv")):
+        with open(path, newline="") as stream:
+            rows += [
+                r
+                for r in csv.DictReader(stream)
+                if r.get("kernelName1", "").startswith("impl__")
+            ]
+    assert rows
+    for r in rows:
+        fields = ("token", "model_dim", "inter_dim", "expert", "topk")
+        args = tuple(int(r[f]) for f in fields)
+        args += tuple(eval(r[f], names) for f in ("dtype", "q_dtype_a", "q_dtype_w"))
+        args += (eval(r["q_type"], names), bool(int(r["use_g1u1"])))
+        args += (eval(r["act_type"], names), bool(int(r["doweight_stage1"])), 0, 0)
+        p = MoeProblem.from_legacy_key(
+            *args, is_shuffled=True, arch=r["gfx"], cu_num=int(r["cu_num"])
+        )
+        config = r["kernelName1"].split("__", 2)[2]
+        if p.activation.activation == ActivationType.Swiglu:
+            assert not _whole_graph_configs(p), r  # no v2 path takes it (todo 1c.4)
+        else:
+            assert (config, int(r["block_m"])) in _whole_graph_configs(p), r
+
+
+def test_whole_graph_param_space_lists_none_where_no_row_runs():
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    cases = {
+        "gfx1201": _whole_graph_key(arch="gfx1201", quant=QuantType.No),
+        "OCP fp8 on gfx950": _whole_graph_key(arch="gfx950", w=dtypes.fp8),
+        "int8": _whole_graph_key(w=dtypes.i8),
+        "fp16 output": _whole_graph_key(out=dtypes.fp16),
+        "Gelu": _whole_graph_key(activation=ActivationType.Gelu),
+        "g1u0": _whole_graph_key(g1u1=False),
+        "doweight": _whole_graph_key(doweight=True),
+        "EP": _whole_graph_key(is_ep=True),
+        "unshuffled": _whole_graph_key(is_shuffled=False),
+        "interleaved": _whole_graph_key(gate_mode=GateMode.INTERLEAVE),
+    }
+    for name, p in cases.items():
+        assert _whole_graph_configs(p) == set(), name
+    assert {
+        c
+        for c, _ in _whole_graph_configs(
+            _whole_graph_key(arch="gfx950", quant=QuantType.No)
+        )
+    }
+
+
+def test_whole_graph_candidates_resolve_to_the_implementation(monkeypatch):
+    from moe_dispatch.arch_sim import simulated_arch
+
+    from aiter.moev2.migration import a8w8_pt, a8w8_ptok, a16w16
+
+    cases = (
+        ("gfx942_cu80", _whole_graph_key(), a8w8_ptok),
+        ("gfx942_cu80", _whole_graph_key(quant=QuantType.per_Tensor), a8w8_pt),
+        ("gfx950", _whole_graph_key(arch="gfx950", quant=QuantType.No), a16w16),
+    )
+    for arch, p, path in cases:
+        configs = _whole_graph_configs(p)
+        assert configs, arch
+        with simulated_arch(arch):
+            for config, block_m in sorted(configs):
+                name = f"impl__flydsl_gfx942__{config}"
+                row = {"block_m": block_m, "ksplit": 0, "run_1stage": 0}
+                row |= {"kernelName1": name, "kernelName2": ""}
+                monkeypatch.setattr(tuned, "lookup", lambda _, row=row: row)
+                res = resolver.resolve(p, path.SEGMENTS)
+                assert res.plan.source == "tuned", (arch, config, res.declined)
+                assert res.plan.structure()[0] == ("impl.whole_graph",)
+                assert res.plan.segments[0].params["kernel"] == name
+                assert (res.metadata.block_m, res.metadata.ksplit) == (block_m, 0)
+                assert res.metadata.full_impl is not None
+
+
 def _a8w4(activation=ActivationType.Swiglu, **kwargs):
     return _mx_problem(dtypes.fp8, dtypes.fp4x2, activation, **kwargs)
 

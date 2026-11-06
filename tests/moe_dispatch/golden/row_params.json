@@ -9,12 +9,9 @@
   "a8w8_blockscale | asm.fmoe_1stage | not a candidate": 4
  },
  "gfx942_cu80": {
-  "a16w16 | impl.whole_graph | no candidates": 27,
   "a16w4 | flydsl.gemm1 | no candidates": 32,
   "a16w4 | flydsl.gemm2 | no candidates": 32,
-  "a8w8_blockscale | asm.fmoe_1stage | differs: xbf16": 4,
-  "a8w8_pt | impl.whole_graph | no candidates": 17,
-  "a8w8_ptok | impl.whole_graph | no candidates": 66
+  "a8w8_blockscale | asm.fmoe_1stage | differs: xbf16": 4
  },
  "gfx950": {
   "a16w4 | asm.fmoe_1stage | no candidates": 6,

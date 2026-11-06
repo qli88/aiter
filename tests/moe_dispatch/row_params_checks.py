@@ -12,12 +12,11 @@ are counted per path, segment and reason (a row counts once per such segment);
 either direction, and `--update` rewrites them. A change that adds such a choice, or
 covers one, updates the file with it.
 
-The groups (todos in docs/fused_moe_revamp_todos.md): legacy tuners `param_space` does
-not mirror yet (the gfx942 whole-graph configs: 5.58), rows no legacy tuner
-produces (per-1x32 1-stage ASM, the a16w4 CK-Tile Swiglu branch, per-1x32 FlyDSL on
-gfx942, MXMOE rows outside the MXMOE tuner's candidates: stage 1 `_xcd1`/`_xcd5`/`_xcd6`,
-stage 2 `_sp*` or at another `tile_m`), the CK blockscale split-K instances (5.57), the
-gfx942 `a16_` 1-stage kernels run with `xbf16` (5.60), and `asm.stage1_cktile` (5.59).
+The groups (todos in docs/fused_moe_revamp_todos.md): rows no legacy tuner produces
+(per-1x32 1-stage ASM, the a16w4 CK-Tile Swiglu branch, per-1x32 FlyDSL on gfx942, MXMOE
+rows outside the MXMOE tuner's candidates: stage 1 `_xcd1`/`_xcd5`/`_xcd6`, stage 2
+`_sp*` or at another `tile_m`), the CK blockscale split-K instances (5.57), the gfx942
+`a16_` 1-stage kernels run with `xbf16` (5.60), and `asm.stage1_cktile` (5.59).
 
     python tests/moe_dispatch/row_params_checks.py --check [--arch gfx950] [-v]
     python tests/moe_dispatch/row_params_checks.py --update [--arch gfx950]

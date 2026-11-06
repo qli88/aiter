@@ -28,7 +28,8 @@ where its kernels run, g1u0 included. FHMoE (`fhmoe`) is `tune_fhmoe.py` with it
 filters widened for every FHMoE contract (decided in 5.1i), checked per snapshot
 FHMoE call (the problem with its shared expert) and on synthetic gfx950 calls: legacy's
 candidates, where its contract matches, must be in the widened rules, and v2 lists
-exactly those.
+exactly those. The whole-graph configs (`whole_graph`, tags `("impl", kernel, block_m,
+False)`) are `FmoeTuner.e2e_tune`'s, on gfx942 and gfx950, where its kernels run.
 
     python tests/moe_dispatch/param_space_checks.py --check [--arch gfx950]
 """
@@ -455,6 +456,61 @@ def synthetic_fhmoe_calls(gfx, cu_num):
     return out
 
 
+def _legacy_e2e(tuner, info, call):
+    """`FmoeTuner.e2e_tune` (`--e2e_tune`): the configs of `get_tune_space()` its shape
+    probe keeps for a key without doweight, less those whose timing fails
+    (`run_flydsl_moe_gfx942` raises: hidden states other than bf16, an activation
+    other than Silu or Swiglu, fp8 weights other than fnuz per-token or per-tensor,
+    g1u0 (its gate-up check); the decode config over 256 tokens, or with `model_dim`
+    not a multiple of 256 or `inter_dim` of 64 (its split-K asserts)), and
+    `QuantType.No` keys with weights other than bf16 (the tuner times bf16 weights
+    whatever the key's; dispatch raises on the row's weight dtype)."""
+    import torch
+
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe_registry import make_fused_moe_impl_kernel_name
+    from aiter.ops.flydsl.fused_moe_gfx942 import Config, _Problem, get_tune_space
+
+    token, model_dim, inter_dim, expert, topk, act, dtype = info[2:9]
+    q_w, q_type, g1u1, doweight = info[10:14]
+    if doweight:
+        return set()
+    bf16 = q_w == torch.bfloat16 and q_type == QuantType.No
+    fp8 = q_w == torch.float8_e4m3fnuz and q_type in (
+        QuantType.per_Token,
+        QuantType.per_Tensor,
+    )
+    if (
+        dtype != torch.bfloat16
+        or act not in (ActivationType.Silu, ActivationType.Swiglu)
+        or not (bf16 or fp8)
+        or not g1u1
+    ):
+        return set()
+    probe = _Problem(
+        batch=token,
+        experts=expert,
+        gateup_dim=inter_dim * 2,
+        hidden_dim=model_dim,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        topk=topk,
+        quant_type="no" if q_type == QuantType.No else "",
+    )
+    out = set()
+    for config_string in get_tune_space():
+        config = Config.from_string(config_string)
+        if config.unsupported_reason(probe) is not None:
+            continue
+        if not config.use_prefill and (
+            not 1 <= token <= 256 or model_dim % 256 or inter_dim % 64
+        ):
+            continue
+        name = make_fused_moe_impl_kernel_name("flydsl_gfx942", config_string)
+        out.add(("impl", name, config.BLOCK_M, False))
+    return out
+
+
 def _legacy_flydsl_layout(tuner, info, call):
     return _tags(tuner.gen_flydsl_v2_2stages_task(info, _BLOCK_MS))
 
@@ -499,7 +555,15 @@ matters), else once for the key; `tunes(info)`: whether the legacy tuner tunes `
 
 
 def _families():
-    from aiter.moev2.segments import asm, ck, ck_tile, flydsl_fhmoe, mxfp4, opus
+    from aiter.moev2.segments import (
+        asm,
+        ck,
+        ck_tile,
+        flydsl_fhmoe,
+        mxfp4,
+        opus,
+        whole_graph,
+    )
 
     fhmoe = (
         flydsl_fhmoe.FlydslFhmoeGemm1(),
@@ -544,6 +608,11 @@ def _families():
             (mxfp4.MxmoeGemm1(), mxfp4.MxmoeQuantGemm1(), mxfp4.MxmoeGemm2()),
             tunes=lambda info: info[0] == "gfx950",
         ),
+        "whole_graph": Family(
+            _legacy_e2e,
+            (whole_graph.WholeGraph(),),
+            tunes=lambda info: info[0] in ("gfx942", "gfx950"),
+        ),
         "fhmoe": Family(
             _legacy_fhmoe,
             fhmoe,
@@ -565,6 +634,8 @@ def _candidate(segment, params):
     from aiter.moev2.dispatch.ops import Op
 
     kernel, block_m = params["kernel"], params["block_m"]
+    if segment.name == "impl.whole_graph":
+        return "impl", kernel, block_m, False
     if segment.covers[0] <= Op.GEMM1 and segment.covers[1] >= Op.GEMM2:
         stage = "asm_1stage_xbf16" if params.get("xbf16") else "asm_1stage"
         return stage, kernel, block_m, int(params.get("flat", 0))
