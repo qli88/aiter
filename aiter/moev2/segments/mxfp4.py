@@ -603,24 +603,63 @@ def _mxmoe_candidates(act, model_dim, inter_dim) -> tuple:
     return tuple(out)
 
 
+# fmt: off
+# Hand-picked MXMOE pairs outside `_mxmoe_candidates` (stage 1 `_xcd1`/`_xcd5`/`_xcd6`,
+# stage 2 `_sp<N>`, a stage 2 `tile_m` below its `block_m`), each a candidate for one
+# tuned key only: `(arch, cu_num, tokens, model_dim, inter_dim, experts, topk,
+# activation)` -> `(block_m, stage 1, stage 2)`, a4w4 with bf16 output.
+_G1, _G2 = "flydsl_mxmoe_g1_a4w4_", "flydsl_moe2_layout_afp4_wfp4_bf16_"
+_SILU, _SITUV2 = ActivationType.Silu, ActivationType.Situv2
+MXMOE_LISTED = {
+    ("gfx950", 256, 4096, 3584, 384, 896, 16, _SITUV2):
+        (128, _G1 + "128x256x256_situv2_xcd1", _G2 + "t64x256x128_reduce_sbm128_sp1601"),
+    ("gfx950", 256, 8192, 3584, 384, 896, 16, _SITUV2):
+        (64, _G1 + "64x256x256_situv2_xcd2", _G2 + "t64x256x128_reduce_sbm64_sp1601"),
+    ("gfx950", 256, 16384, 3584, 384, 896, 16, _SITUV2):
+        (64, _G1 + "64x256x256_situv2_xcd2", _G2 + "t64x256x128_reduce_sbm64_sp2401"),
+    ("gfx950", 256, 4096, 7168, 256, 257, 9, _SILU):
+        (128, _G1 + "128x256x256_xcd5", _G2 + "t128x256x128_reduce_sbm128_sp801"),
+    ("gfx950", 256, 8192, 7168, 256, 257, 9, _SILU):
+        (128, _G1 + "128x256x256_xcd2", _G2 + "t128x256x128_reduce_sbm128_sp6404"),
+    ("gfx950", 256, 32768, 7168, 2048, 64, 8, _SILU):
+        (128, _G1 + "128x256x256", _G2 + "t128x128x128_atomic_sbm128_sp102"),
+    ("gfx950", 256, 16384, 7168, 2048, 32, 8, _SILU):
+        (128, _G1 + "128x256x256", _G2 + "t128x128x128_atomic_sbm128_sp102"),
+    ("gfx950", 256, 32768, 7168, 2048, 32, 8, _SILU):
+        (128, _G1 + "128x256x256", _G2 + "t128x128x128_atomic_sbm128_sp102"),
+    ("gfx950", 256, 16384, 7168, 2048, 33, 8, _SILU):
+        (128, _G1 + "128x256x256_xcd6", _G2 + "t128x128x128_atomic_sbm128_sp102"),
+}
+# fmt: on
+
+
+def _mxmoe_listed(p) -> tuple:
+    """`MXMOE_LISTED`'s pair for `p` as `(block_m, stage 1 names, stage 2 names)`."""
+    s = p.shape
+    key = (p.arch, p.cu_num, s.m, s.model_dim, s.inter_dim, s.experts, s.topk)
+    listed = MXMOE_LISTED.get((*key, p.activation.activation))
+    return () if listed is None else ((listed[0], (listed[1],), (listed[2],)),)
+
+
 def mxmoe_param_space(segment, p) -> tuple:
     """The MXMOE candidates `segment` owns, of its stage, each in a pair dispatch does
     not discard (`mxfp4_row_rejection`: e.g. a shape the generated auxiliary kernels do
-    not cover). None for fp16 output (the legacy tuner times bf16 whatever the key's
-    dtype) or an activation MXMOE has no kernel for."""
+    not cover); with `MXMOE_LISTED`'s pair for the key. None for fp16 output (the
+    legacy tuner times bf16 whatever the key's dtype) or an activation MXMOE has no
+    kernel for."""
     if not (segment.accepts(p) and tunable(p)) or p.out_dtype != dtypes.bf16:
         return ()
     if p.activation.activation not in TUNED_ROW_ACTIVATIONS:
         return ()
     act = get_flydsl_activation_name(p.activation.activation)
     gemm2 = Op.GEMM2 in segment.covers
-    out = []
+    out, seen = [], set()
     for block_m, names1, names2 in _mxmoe_candidates(
         act, p.shape.model_dim, p.shape.inter_dim
-    ):
+    ) + _mxmoe_listed(p):
         names, partners = (names2, names1) if gemm2 else (names1, names2)
         for name in names:
-            if not segment.owns(kernel_names.parse(name)):
+            if (name, block_m) in seen or not segment.owns(kernel_names.parse(name)):
                 continue
             pairs = (
                 (partner, name) if gemm2 else (name, partner) for partner in partners
@@ -631,6 +670,7 @@ def mxmoe_param_space(segment, p) -> tuple:
                 is None
                 for kn1, kn2 in pairs
             ):
+                seen.add((name, block_m))
                 out.append(Params(kernel=name, block_m=block_m))
     return tuple(out)
 

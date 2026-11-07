@@ -2705,6 +2705,39 @@ def test_mxmoe_candidates_resolve_to_their_segments(monkeypatch):
             assert res.metadata.block_m == block_m
 
 
+def test_mxmoe_param_space_lists_the_hand_picked_pairs_for_their_keys(monkeypatch):
+    from aiter.moev2.dispatch import coverage
+    from aiter.moev2.segments import mxfp4
+
+    gemm1, _, gemm2 = _mxmoe_segments()
+    assert len(mxfp4.MXMOE_LISTED) == 9
+    for key, (block_m, kernel1, kernel2) in mxfp4.MXMOE_LISTED.items():
+        arch, cu_num, token, *shape, activation = key
+        problem = functools.partial(
+            _a4w4_problem, shape=tuple(shape), activation=activation, is_shuffled=True
+        )
+        p = problem(token)
+        assert (p.arch, p.cu_num) == (arch, cu_num)
+        stage1, stage2 = gemm1.param_space(p), gemm2.param_space(p)
+        assert Params(kernel=kernel1, block_m=block_m) in stage1, key
+        assert Params(kernel=kernel2, block_m=block_m) in stage2, key
+        for space in (stage1, stage2):
+            assert len({(c["kernel"], c["block_m"]) for c in space}) == len(space)
+        later = problem(token + 1)
+        assert Params(kernel=kernel2, block_m=block_m) not in gemm2.param_space(later)
+        if kernel1.endswith(("_xcd1", "_xcd5", "_xcd6")):
+            assert Params(kernel=kernel1, block_m=block_m) not in (
+                gemm1.param_space(later)
+            )
+        row = {"block_m": block_m, "ksplit": 0, "run_1stage": 0}
+        row |= {"kernelName1": kernel1, "kernelName2": kernel2}
+        res = _a4w4_resolve(monkeypatch, p, row)
+        assert res.plan.source == "tuned", (key, res.declined)
+        reasons = coverage.param_reasons(p, res.plan)
+        assert [s.name for s, _ in reasons] == ["mxmoe.gemm1", "mxmoe.gemm2"]
+        assert all(reason is None for _, reason in reasons), (key, reasons)
+
+
 def _fhmoe_segments():
     from aiter.moev2.segments import flydsl_fhmoe
 

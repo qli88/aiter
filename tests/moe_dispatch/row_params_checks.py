@@ -12,9 +12,7 @@ are counted per path, segment and reason (a row counts once per such segment);
 either direction, and `--update` rewrites them. A change that adds such a choice, or
 covers one, updates the file with it.
 
-The groups (todos in docs/fused_moe_revamp_todos.md): rows no legacy tuner produces
-(MXMOE rows outside the MXMOE tuner's candidates: stage 1 `_xcd1`/`_xcd5`/`_xcd6`,
-stage 2 `_sp*` or at another `tile_m`), and `asm.stage1_cktile` (5.59).
+The group left (todos in docs/fused_moe_revamp_todos.md): `asm.stage1_cktile` (5.59).
 
     python tests/moe_dispatch/row_params_checks.py --check [--arch gfx950] [-v]
     python tests/moe_dispatch/row_params_checks.py --update [--arch gfx950]

@@ -14,8 +14,8 @@ off gfx950, so v2 must list nothing there (but for FlyDSL on gfx942, below). On 
 few synthetic keys add what the snapshot lacks. Candidates v2 adds by decision, beyond
 the legacy tuners, are rebuilt here independently and count as legacy's under a known
 reason where they add any (1-stage ASM 5.1k1, CK-Tile a16w4 5.1k2, CK 1x128 split-K
-5.1k3, FlyDSL int4 `_reduce` stage 2 and per-1x32 bf16 X on gfx942 5.1k4, FHMoE's
-widened rules 5.1i).
+5.1k3, FlyDSL int4 `_reduce` stage 2 and per-1x32 bf16 X on gfx942 5.1k4, the shipped
+MXMOE pairs outside its tuner 5.1k5, FHMoE's widened rules 5.1i).
 
 CK-Tile (`cktile`) is checked per snapshot call, since the call's weight layout picks
 the branch: no legacy branch reads the tuner's `cktile_a8w4_bm*` stage 1 names, so each
@@ -738,9 +738,36 @@ def _mxmoe_tuner(tune):
     return tuner
 
 
+_MXMOE_SHIPPED_ADDED = (
+    "MXMOE: the shipped pairs outside `Mxfp4FlydslTuner`'s search, for their tuned "
+    "key (5.1k5)"
+)
+
+
+@functools.cache
+def _mxmoe_shipped():
+    """`{tuned key: {(block_m, kernelName1, kernelName2)}}` of the tuned rows naming an
+    MXMOE stage 1, the key's enums and dtypes as the table writes them."""
+    from moe_dispatch.keys import tuned_table
+
+    df = tuned_table()
+    out = {}
+    for _, r in df[
+        df["kernelName1"].astype(str).str.startswith("flydsl_mxmoe_")
+    ].iterrows():
+        key = (r["gfx"], *(int(r[c]) for c in ("cu_num", "token", "model_dim")))
+        key += tuple(int(r[c]) for c in ("inter_dim", "expert", "topk"))
+        key += tuple(r[c] for c in ("act_type", "dtype", "q_dtype_a", "q_dtype_w"))
+        key += (r["q_type"], int(r["use_g1u1"]), int(r["doweight_stage1"]))
+        pair = (int(r["block_m"]), r["kernelName1"], r["kernelName2"])
+        out.setdefault(key, set()).add(pair)
+    return out
+
+
 def _legacy_mxmoe(tuner, info, call):
     """`Mxfp4FlydslTuner._candidate_rows` at its full search, for the a4w4 keys (it
-    tunes its own table and reads no dtype of the key)."""
+    tunes its own table and reads no dtype of the key), with the 5.1k5 addition as a
+    known reason where it adds any: the shipped pairs of the key outside it."""
     from aiter import QuantType, dtypes
 
     if (info[9], info[10], info[11]) != (
@@ -753,9 +780,17 @@ def _legacy_mxmoe(tuner, info, call):
     row["act_type"] = str(info[7])
     tune = sys.modules[type(tuner).__module__]
     candidates = _mxmoe_tuner(tune)._candidate_rows(row, full_search=True)
-    return {("stage1", c["kernelName1"], c["block_m"], False) for c in candidates} | {
-        ("stage2", c["kernelName2"], c["block_m"], False) for c in candidates
-    }
+    pairs = {(c["block_m"], c["kernelName1"], c["kernelName2"]) for c in candidates}
+    key = (*info[:7], *(str(v) for v in info[7:12]), int(info[12]), int(info[13]))
+    added = _mxmoe_shipped().get(key, set()) - pairs
+
+    def tags(rows):
+        return {("stage1", kn1, bm, False) for bm, kn1, _ in rows} | {
+            ("stage2", kn2, bm, False) for bm, _, kn2 in rows
+        }
+
+    legacy = tags(pairs | added)
+    return legacy, {_MXMOE_SHIPPED_ADDED} if legacy - tags(pairs) else set()
 
 
 Family = collections.namedtuple(
