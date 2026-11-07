@@ -14,11 +14,12 @@ kernelName1 that neither those branches nor FlyDSL's default take goes to legacy
 stage 1 and stays unowned. `cktile.gemm2` also runs the `cktile_*` stage 2 of tuned
 rows.
 
-Tuner candidates (a8w4): for the legacy tuner's `cktile_a8w4_bm*` stage 1 names,
+Tuner candidates: for a8w4, for the legacy tuner's `cktile_a8w4_bm*` stage 1 names,
 `cktile.gemm1` lists what the CK-Tile branch that takes them runs (the interleaved Swiglu
 branch, `CKTILE_A8W4_STAGE1`; the split-K branch, `cktile_a8w4_split_k_stage1`), and
 `cktile.gemm2` lists the legacy tuner's stage 2 names; `aiter/moev2/kernel_name_map.csv`
-shows the mapping.
+shows the mapping. For a16w4 Swiglu, which no legacy tuner times on CK-Tile, both list
+the alias row (`cktile_a16w4_stage1`).
 """
 
 import functools
@@ -526,6 +527,41 @@ def _tuned_a8w4(p) -> bool:
     )
 
 
+def _a16w4_swiglu(p) -> bool:
+    """bf16 activations into MXFP4 weights with Swiglu, where the alias row is a
+    candidate (`cktile_a16w4_stage1`)."""
+    return (
+        p.quant_type == QuantType.per_1x32
+        and p.act_in.dtype == dtypes.bf16
+        and p.w1.dtype == dtypes.fp4x2
+        and p.activation.activation == ActivationType.Swiglu
+    )
+
+
+def cktile_a16w4_stage1(p) -> Params | None:
+    """The alias row for an a16w4 Swiglu problem as legacy's CK-Tile branch runs it:
+    the branch's `block_m`, the row's split-K 0; None where no CK-Tile branch takes
+    the row, or dispatch declines or discards it."""
+    branch = cktile_branch(p, 0, tuned_row=True)
+    if branch is None:
+        return None
+    params = Params(kernel=kernel_names.CKTILE_ALIAS, block_m=branch.block_m, ksplit=0)
+    return params if _alias_row_runs(p, params) else None
+
+
+def _alias_row_runs(p, params) -> bool:
+    """Whether a tuned row naming `params`' kernel in both stages runs as CK-Tile."""
+    row = {
+        "kernelName1": params.kernel,
+        "kernelName2": params.kernel,
+        "ksplit": params.ksplit,
+    }
+    return (
+        CktileGemm1().declines_row(p, row) is None
+        and CktileGemm2().check_row(p, row) is None
+    )
+
+
 class CktileGemm1(Segment):
     """CK-Tile stage 1: a legacy default branch, also for an alias tuned row."""
 
@@ -622,8 +658,14 @@ class CktileGemm1(Segment):
         interleaved Swiglu branch takes that row, `cktile_a8w4_split_k_stage1` where
         the split-K branch does (`gate_up_interleave` False, where FlyDSL's default
         does not take it); none where FlyDSL's default or ASM stage 1 (todo 5.17)
-        runs it, or dispatch discards the row."""
-        if not (self.accepts(p) and tunable(p) and _tuned_a8w4(p)):
+        runs it, or dispatch discards the row. For a16w4 Swiglu, which no legacy tuner
+        times here, the alias row (`cktile_a16w4_stage1`)."""
+        if not (self.accepts(p) and tunable(p)):
+            return ()
+        if _a16w4_swiglu(p):
+            params = cktile_a16w4_stage1(p)
+            return () if params is None else (params,)
+        if not _tuned_a8w4(p):
             return ()
         if cktile_interleaved_swiglu(p):
             params = CKTILE_A8W4_STAGE1
@@ -631,17 +673,7 @@ class CktileGemm1(Segment):
             params = cktile_a8w4_split_k_stage1(p.shape.m)
         else:
             return ()
-        row = {
-            "kernelName1": params.kernel,
-            "kernelName2": params.kernel,
-            "ksplit": params.ksplit,
-        }
-        if (
-            self.declines_row(p, row) is not None
-            or CktileGemm2().check_row(p, row) is not None
-        ):
-            return ()
-        return (params,)
+        return (params,) if _alias_row_runs(p, params) else ()
 
 
 class CktileGemm2(Segment):
@@ -690,8 +722,17 @@ class CktileGemm2(Segment):
         """The legacy tuner's `cktile_a8w4_bm<block_m>` stage 2, except where dispatch
         discards it. Legacy runs it at the row's `block_m` after a FlyDSL, Opus or ASM
         stage 1, and at its CK-Tile branch's `block_m` after that branch's stage 1;
-        which stage 1 it follows is the structure's (5.2)."""
-        if not (self.accepts(p) and tunable(p) and _tuned_a8w4(p)):
+        which stage 1 it follows is the structure's (5.2). For a16w4 Swiglu, the alias
+        at its stage 1's `block_m` (`cktile_a16w4_stage1`): dispatch declines it after
+        another stage 1."""
+        if not (self.accepts(p) and tunable(p)):
+            return ()
+        if _a16w4_swiglu(p):
+            stage1 = cktile_a16w4_stage1(p)
+            if stage1 is None:
+                return ()
+            return (Params(kernel=kernel_names.CKTILE_ALIAS, block_m=stage1.block_m),)
+        if not _tuned_a8w4(p):
             return ()
         names = (
             (f"cktile_a8w4_bm{block_m}", block_m) for block_m in CKTILE_A8W4_BLOCK_MS

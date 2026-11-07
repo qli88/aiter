@@ -11,7 +11,9 @@ v2's guard is the fix, todo 5.46) or the reason says v2 declines on purpose. No
 candidate may be listed twice. A tuner key is the 14 fields the legacy tuner tunes
 on, per-128x128 tuned as per-1x128; legacy `tune()` skips g1u0 keys, and per-1x32 keys
 off gfx950, so v2 must list nothing there. On gfx950 a few synthetic keys add what the
-snapshot lacks.
+snapshot lacks. Candidates v2 adds by decision, beyond the legacy tuners, are rebuilt
+here independently and count as legacy's under a known reason where they add any
+(1-stage ASM 5.1k1, CK-Tile a16w4 5.1k2, FHMoE's widened rules 5.1i).
 
 CK-Tile (`cktile`) is checked per snapshot call, since the call's weight layout picks
 the branch: no legacy branch reads the tuner's `cktile_a8w4_bm*` stage 1 names, so each
@@ -125,8 +127,9 @@ def tuner_keys(gfx, cu_num):
 
 def synthetic_keys(gfx, cu_num):
     """gfx950 per-1x32 keys the snapshot lacks: fp16 output, a4w4 Gelu, the gpt-oss
-    model_dim 2880, a8w4 Swiglu at every CK-Tile token tier, a4w4 g1u0 (at a shape the
-    MXMOE auxiliary kernels cover)."""
+    model_dim 2880, a16w4 Swiglu with fp16 output or at `inter_dim % 256`, a8w4 Swiglu
+    at every CK-Tile token tier, a4w4 g1u0 (at a shape the MXMOE auxiliary kernels
+    cover); each with and without doweight."""
     if gfx != "gfx950":
         return []
     from aiter import ActivationType, QuantType, dtypes
@@ -138,11 +141,13 @@ def synthetic_keys(gfx, cu_num):
         (dtypes.bf16, fp4, ActivationType.Gelu, 7168, 256),
         (dtypes.bf16, fp8, ActivationType.Swiglu, 2880, 2880),
         (dtypes.bf16, dtypes.bf16, ActivationType.Situv2, 2880, 384),
+        (dtypes.fp16, dtypes.bf16, ActivationType.Swiglu, 7168, 256),
+        (dtypes.bf16, dtypes.bf16, ActivationType.Swiglu, 7168, 384),
     )
     tokens = [(shape, token) for token in (16, 512) for shape in shapes]
     tokens += [
-        ((dtype, fp8, ActivationType.Swiglu, 7168, 256), token)
-        for dtype in (dtypes.bf16, dtypes.fp16)
+        ((dtype, q_a, ActivationType.Swiglu, 7168, 256), token)
+        for dtype, q_a in ((dtypes.bf16, fp8), (dtypes.fp16, fp8), (dtypes.bf16,) * 2)
         for token in (4096, 20000)
     ]
     g1u0 = [
@@ -292,9 +297,9 @@ class _EveryKey(dict):
         return self.row
 
 
-def _legacy_runs(call, kernel1, kernel2, block_m, ksplit=0):
-    """`(stage 1 function name, block_m, ksplit, stage 1 options)` legacy dispatch runs
-    for `call` with a one-row tuned table naming `kernel1` and `kernel2`."""
+def _legacy_metadata(call, kernel1, kernel2, block_m, ksplit=0):
+    """Legacy `get_2stage_cfgs` for `call` with a one-row tuned table naming `kernel1`
+    and `kernel2`."""
     import aiter.fused_moe as fm
 
     row = {"block_m": block_m, "ksplit": ksplit, "kernelName1": kernel1}
@@ -303,13 +308,62 @@ def _legacy_runs(call, kernel1, kernel2, block_m, ksplit=0):
     saved = fm.cfg_2stages
     fm.cfg_2stages = (_EveryKey(row), {})
     try:
-        metadata = fm.get_2stage_cfgs.__wrapped__(*args, **kwargs)
+        return fm.get_2stage_cfgs.__wrapped__(*args, **kwargs)
     finally:
         fm.cfg_2stages = saved
+
+
+def _func_name(stage):
+    return getattr(stage, "func", stage).__name__
+
+
+def _legacy_runs(call, kernel1, kernel2, block_m, ksplit=0):
+    """`(stage 1 function name, block_m, ksplit, stage 1 options)` legacy dispatch runs
+    for `call` with a one-row tuned table naming `kernel1` and `kernel2`."""
+    metadata = _legacy_metadata(call, kernel1, kernel2, block_m, ksplit)
     stage1 = metadata.stage1
-    func = getattr(stage1, "func", stage1)
     options = tuple(sorted(getattr(stage1, "keywords", {}).items(), key=str))
-    return func.__name__, metadata.block_m, metadata.ksplit, repr(options)
+    return _func_name(stage1), metadata.block_m, metadata.ksplit, repr(options)
+
+
+_CKTILE_A16W4_ADDED = (
+    "CK-Tile a16w4: the alias row the shipped rows name, which no legacy tuner "
+    "lists (5.1k2)"
+)
+
+
+def _cktile_a16w4_added(info, call):
+    """The CK-Tile candidates added in 5.1k2 for a bf16 or fp16 x MXFP4 call: the alias
+    row with split-K 0 through legacy dispatch, as `(stage, alias, block_m, False)` for
+    both stages at the `block_m` legacy runs, where legacy runs CK-Tile for both and
+    keeps the row (not at `inter_dim % 256`, where dispatch discards it). v2's stage 1
+    candidate must carry the split-K the row ran with (0), which the tags leave out."""
+    from aiter import QuantType, dtypes
+    from aiter.moev2 import api
+    from aiter.moev2.dispatch.kernel_names import CKTILE_ALIAS
+    from aiter.moev2.segments.ck_tile import CktileGemm1
+
+    a16w4 = (
+        info[11] == QuantType.per_1x32
+        and info[9] in (dtypes.bf16, dtypes.fp16)
+        and info[10] == dtypes.fp4x2
+    )
+    if not a16w4 or info[4] % 256:
+        return set()
+    metadata = _legacy_metadata(call, CKTILE_ALIAS, CKTILE_ALIAS, 16)
+    ran = (_func_name(metadata.stage1), _func_name(metadata.stage2))
+    if ran != ("cktile_moe_stage1", "cktile_moe_stage2"):
+        return set()
+    ksplits = {
+        p["ksplit"] for p in CktileGemm1().param_space(api.problem_from_key(*call))
+    }
+    if ksplits - {0}:
+        raise RunsDifferently(
+            f"v2 lists split-K {sorted(ksplits)}, the alias row ran 0"
+        )
+    return {
+        (stage, CKTILE_ALIAS, metadata.block_m, False) for stage in ("stage1", "stage2")
+    }
 
 
 _LEGACY_STAGE1_RUNS = {
@@ -328,13 +382,15 @@ def _legacy_cktile(tuner, info, call):
     `(candidates, dropped reasons)`. Stage 1 goes through a one-row table naming the
     candidate in both stages; where CK-Tile runs, the candidate becomes the alias at
     the `block_m` legacy runs, and the alias row with the split-K of v2's candidate at
-    that `block_m` must run the same."""
+    that `block_m` must run the same. Other keys: the a16w4 additions
+    (`_cktile_a16w4_added`)."""
     from aiter.moev2 import api
     from aiter.moev2.dispatch.kernel_names import CKTILE_ALIAS
     from aiter.moev2.segments.ck_tile import CktileGemm1
 
     if not _is_a8w4(info):
-        return set()
+        added = _cktile_a16w4_added(info, call)
+        return added, {_CKTILE_A16W4_ADDED} if added else set()
     candidates, dropped = set(), set()
     for tag, *_rest in tuner.gen_2stages_task(info, _BLOCK_MS):
         stage, name, block_m = tag[1], tag[2], tag[3]

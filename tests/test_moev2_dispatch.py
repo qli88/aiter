@@ -10,6 +10,7 @@ import collections
 import dataclasses
 import functools
 import inspect
+import itertools
 import logging
 import pathlib
 import subprocess
@@ -2968,15 +2969,52 @@ def test_cktile_param_space_lists_none_where_dispatch_discards_the_row():
         assert segment.param_space(unsafe) == ()
 
 
-def test_cktile_param_space_lists_a8w4_only():
+def test_cktile_param_space_lists_the_alias_row_for_a16w4_swiglu(monkeypatch):
+    from aiter.moev2.dispatch import coverage
+    from aiter.moev2.migration import a16w4 as path
     from aiter.moev2.segments import ck_tile
 
-    a16w4 = _mx_problem(
-        dtypes.bf16, dtypes.fp4x2, ActivationType.Swiglu, **_interleaved()
-    )
-    for segment in (ck_tile.CktileGemm1(), ck_tile.CktileGemm2()):
-        assert segment.accepts(a16w4)
-        assert segment.param_space(a16w4) == ()
+    gemm1, gemm2 = ck_tile.CktileGemm1(), ck_tile.CktileGemm2()
+    alias = kernel_names.CKTILE_ALIAS
+    row = {"block_m": 16, "ksplit": 0, "run_1stage": 0}
+    row |= {"kernelName1": alias, "kernelName2": alias}
+    monkeypatch.setattr(tuned, "lookup", lambda _: row)
+    interleave_gate = {**_interleaved(), "gate_up_interleave": False}
+    layouts = (({}, 2), (_interleaved(), 1), (interleave_gate, 2))
+    for (kwargs, split_k), (token, block_m) in itertools.product(
+        layouts, ((64, 16), (2048, 32), (16384, 64))
+    ):
+        p = _mx_problem(dtypes.bf16, dtypes.fp4x2, ActivationType.Swiglu, **kwargs)
+        p = dataclasses.replace(p, shape=dataclasses.replace(p.shape, m=token))
+        (stage1,) = gemm1.param_space(p)
+        assert stage1 == Params(kernel=alias, block_m=block_m, ksplit=0)
+        assert gemm2.param_space(p) == (Params(kernel=alias, block_m=block_m),)
+        res = resolver.resolve(p, path.SEGMENTS)
+        assert res.plan.source == "tuned", res.declined
+        names = [c.segment.name for c in res.plan.segments]
+        assert {"cktile.gemm1", "cktile.gemm2"} <= set(names)
+        assert res.metadata.block_m == block_m
+        assert res.metadata.stage1.keywords["split_k"] == split_k
+        reasons = coverage.param_reasons(p, res.plan)
+        assert [s.name for s, _ in reasons] == ["cktile.gemm1", "cktile.gemm2"]
+        assert all(reason is None for _, reason in reasons), reasons
+    for p in (
+        _mx_problem(dtypes.bf16, dtypes.fp4x2, ActivationType.Situv2),
+        _mx_problem(dtypes.bf16, dtypes.fp4x2, ActivationType.Swiglu, inter_dim=384),
+        _mx_problem(
+            dtypes.bf16,
+            dtypes.fp4x2,
+            ActivationType.Swiglu,
+            inter_dim=384,
+            doweight=True,
+        ),
+        _mx_problem(
+            dtypes.bf16, dtypes.fp4x2, ActivationType.Swiglu, gate_up_interleave=True
+        ),
+    ):
+        for segment in (gemm1, gemm2):
+            assert segment.accepts(p)
+            assert segment.param_space(p) == ()
 
 
 def test_opus_param_space_follows_the_legacy_filters():
