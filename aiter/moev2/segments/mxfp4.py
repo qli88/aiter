@@ -439,7 +439,8 @@ def _flydsl_candidates(a, b, out, model_dim, inter_dim) -> tuple:
 
 @functools.cache
 def _flydsl_int4_candidates(out, model_dim) -> tuple:
-    """`(stage, kernel, block_m)` of the legacy tuner's `gen_flydsl_i4_2stages_task`."""
+    """`(stage, kernel, block_m)` of the legacy tuner's `gen_flydsl_i4_2stages_task`,
+    and the `_reduce` stage 2s it leaves out."""
     s1 = _flydsl_kernels("get_flydsl_stage1_kernels_int4_bf16", out)
     s2 = _flydsl_kernels("get_flydsl_stage2_kernels_int4_bf16", out)
     out_list = []
@@ -461,9 +462,7 @@ def _flydsl_int4_candidates(out, model_dim) -> tuple:
         out_list += [
             (2, name, block_m)
             for name, k in s2.items()
-            if k["tile_m"] == block_m
-            and k.get("mode", "atomic") == "atomic"
-            and k.get("persist") is None
+            if k["tile_m"] == block_m and k.get("persist") is None
         ]
     return tuple(out_list)
 
@@ -508,11 +507,22 @@ def flydsl_candidates(p, layout) -> tuple:
     return _flydsl_candidates(a, b, _out_token(p), s.model_dim, s.inter_dim)
 
 
+def _gfx942_a16w(p) -> bool:
+    """A g1u1 per-1x32 problem with bf16 X and MXFP4 or int4 weights on gfx942."""
+    return (
+        p.arch == "gfx942"
+        and p.is_g1u1
+        and p.quant_type == QuantType.per_1x32
+        and p.act_in.dtype == dtypes.bf16
+        and p.w1.dtype in (dtypes.fp4x2, dtypes.i4x2)
+    )
+
+
 def flydsl_param_space(segment, p, layout) -> tuple:
     """The FlyDSL candidates `segment` runs: its stage, and the kernels it owns. None
     for an activation whose FlyDSL tuned rows dispatch discards (the legacy tuner lists
-    them)."""
-    if not (segment.accepts(p) and tunable(p)):
+    them). Also on gfx942 for bf16 X with MXFP4 or int4 weights (todo 5.49)."""
+    if not (segment.accepts(p) and (tunable(p) or _gfx942_a16w(p))):
         return ()
     if p.activation.activation not in TUNED_ROW_ACTIVATIONS:
         return ()

@@ -2531,9 +2531,25 @@ def test_flydsl_param_space_splits_the_legacy_candidates_by_segment():
         assert fhmoe.param_space(a4w4) == ()
 
     a16wi4 = _mx_problem(dtypes.bf16, dtypes.i4x2)
-    gemm2 = mxfp4.FlydslGemm2().param_space(a16wi4)
-    assert gemm2 and all("_atomic" in p["kernel"] for p in gemm2)
+    assert mxfp4.FlydslGemm2().param_space(a16wi4)
     assert mxfp4.FlydslGemm1Layout().param_space(a16wi4) == ()
+
+
+def test_flydsl_param_space_lists_the_int4_atomic_and_reduce_stage2():
+    from aiter.moev2.segments import mxfp4
+    from aiter.ops.flydsl import moe_kernels
+
+    for arch, out, token in (
+        ("gfx950", dtypes.bf16, "bf16"),
+        ("gfx942", dtypes.fp16, "f16"),
+    ):
+        a16wi4 = _mx_problem(dtypes.bf16, dtypes.i4x2, arch=arch, out=out)
+        s2 = moe_kernels.get_flydsl_stage2_kernels_int4_bf16(token)
+        space = mxfp4.FlydslGemm2().param_space(a16wi4)
+        assert {(p["kernel"], p["block_m"]) for p in space} == {
+            (name, k["tile_m"]) for name, k in s2.items()
+        }
+        assert {s2[p["kernel"]]["mode"] for p in space} == {"atomic", "reduce"}
 
 
 def test_flydsl_param_space_follows_the_legacy_name_rules():
@@ -2570,13 +2586,44 @@ def test_flydsl_param_space_lists_none_where_dispatch_discards_the_row():
         assert segment.param_space(gelu) == ()
 
 
-def test_flydsl_param_space_lists_per_1x32_on_gfx950_only():
+def test_flydsl_param_space_lists_a16w4_and_a16wi4_on_gfx942(monkeypatch):
+    from aiter.moev2.dispatch import coverage
+    from aiter.moev2.migration import a16wi4 as path
     from aiter.moev2.segments import mxfp4
 
-    for arch, listed in (("gfx942", False), ("gfx950", True)):
-        a16w4 = _mx_problem(dtypes.bf16, dtypes.fp4x2, ActivationType.Situv2, arch)
-        assert mxfp4.FlydslGemm1().accepts(a16w4)
-        assert bool(mxfp4.FlydslGemm1().param_space(a16w4)) is listed
+    segments = (mxfp4.FlydslGemm1(), mxfp4.FlydslGemm1Quant(), mxfp4.FlydslGemm2())
+
+    def space(*args, **kwargs):
+        p = _mx_problem(*args, **kwargs)
+        assert any(s.accepts(p) for s in segments), p
+        return [(s.name, c) for s in segments for c in s.param_space(p)]
+
+    situv2 = ActivationType.Situv2
+    for q_w in (dtypes.fp4x2, dtypes.i4x2):
+        for out in (dtypes.bf16, dtypes.fp16):
+            on_gfx942 = space(dtypes.bf16, q_w, situv2, "gfx942", out=out)
+            assert on_gfx942 == space(dtypes.bf16, q_w, situv2, "gfx950", out=out)
+            assert on_gfx942
+    # No FlyDSL segment accepts these on gfx942; a later capability must not list them.
+    for q_a, q_w in ((dtypes.fp4x2, dtypes.fp4x2), (dtypes.fp8, dtypes.fp4x2)):
+        assert not mxfp4._gfx942_a16w(_mx_problem(q_a, q_w, situv2, "gfx942"))
+
+    # A shipped gfx942 row (3584/3072 E112 top15, 16 tokens).
+    args = (16, 3584, 3072, 112, 15, dtypes.bf16, dtypes.bf16, dtypes.i4x2)
+    p = MoeProblem.from_legacy_key(
+        *args, QuantType.per_1x32, True, situv2, False, 0, 0, arch="gfx942", cu_num=304
+    )
+    row = {"block_m": 16, "ksplit": 0, "run_1stage": 0, "nt": 0}
+    row |= {
+        "kernelName1": "flydsl_moe1_abf16_wint4_bf16_t16x64x128",
+        "kernelName2": "flydsl_moe2_abf16_wint4_bf16_t16x128x256_reduce",
+    }
+    monkeypatch.setattr(tuned, "lookup", lambda _: row)
+    res = resolver.resolve(p, path.SEGMENTS)
+    assert res.plan.source == "tuned", res.declined
+    reasons = coverage.param_reasons(p, res.plan)
+    assert [s.name for s, _ in reasons] == ["flydsl.gemm1", "flydsl.gemm2"]
+    assert all(reason is None for _, reason in reasons), reasons
 
 
 def _mxmoe_segments():

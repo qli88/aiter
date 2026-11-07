@@ -10,11 +10,12 @@ nothing and no segment of the family accepts the problem, unless legacy raises (
 v2's guard is the fix, todo 5.46) or the reason says v2 declines on purpose. No
 candidate may be listed twice. A tuner key is the 14 fields the legacy tuner tunes
 on, per-128x128 tuned as per-1x128; legacy `tune()` skips g1u0 keys, and per-1x32 keys
-off gfx950, so v2 must list nothing there. On gfx950 a few synthetic keys add what the
-snapshot lacks. Candidates v2 adds by decision, beyond the legacy tuners, are rebuilt
-here independently and count as legacy's under a known reason where they add any
-(1-stage ASM 5.1k1, CK-Tile a16w4 5.1k2, CK 1x128 split-K 5.1k3, FHMoE's widened
-rules 5.1i).
+off gfx950, so v2 must list nothing there (but for FlyDSL on gfx942, below). On gfx950 a
+few synthetic keys add what the snapshot lacks. Candidates v2 adds by decision, beyond
+the legacy tuners, are rebuilt here independently and count as legacy's under a known
+reason where they add any (1-stage ASM 5.1k1, CK-Tile a16w4 5.1k2, CK 1x128 split-K
+5.1k3, FlyDSL int4 `_reduce` stage 2 and per-1x32 bf16 X on gfx942 5.1k4, FHMoE's
+widened rules 5.1i).
 
 CK-Tile (`cktile`) is checked per snapshot call, since the call's weight layout picks
 the branch: no legacy branch reads the tuner's `cktile_a8w4_bm*` stage 1 names, so each
@@ -477,10 +478,61 @@ def _tags(tasks):
     return {(tag[1], tag[2], tag[3], False) for (tag, *_rest) in tasks}
 
 
+_FLYDSL_I4_REDUCE_ADDED = (
+    "FlyDSL int4 stage 2: the `_reduce` kernels `gen_flydsl_i4_2stages_task` leaves "
+    "out (todo 5.68) (5.1k4)"
+)
+_FLYDSL_GFX942_ADDED = (
+    "FlyDSL per-1x32 on gfx942: bf16 X with MXFP4 or int4 weights, keys legacy "
+    "`tune()` skips off gfx950 (todo 5.49) (5.1k4)"
+)
+
+
+def _gfx942_a16w_key(info):
+    """A g1u1 per-1x32 gfx942 key with bf16 X and MXFP4 or int4 weights."""
+    from aiter import QuantType, dtypes
+
+    return (
+        info[0] == "gfx942"
+        and bool(info[12])
+        and info[11] == QuantType.per_1x32
+        and info[9] == dtypes.bf16
+        and info[10] in (dtypes.fp4x2, dtypes.i4x2)
+    )
+
+
+def _flydsl_tunes(info):
+    return legacy_tunes(info) or _gfx942_a16w_key(info)
+
+
+def _flydsl_i4_reduce_added(info):
+    """The int4 `_reduce` stage 2s, at the `block_m` of their `tile_m`, for the keys
+    `gen_flydsl_i4_2stages_task` takes."""
+    from aiter import QuantType, dtypes
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_stage2_kernels_int4_bf16
+
+    if not (info[11] == QuantType.per_1x32 and info[10] == dtypes.i4x2 and info[12]):
+        return set()
+    out = "bf16" if info[8] == dtypes.bf16 else "f16"
+    return {
+        ("stage2", name, k["tile_m"], False)
+        for name, k in get_flydsl_stage2_kernels_int4_bf16(out).items()
+        if k["mode"] == "reduce" and k["tile_m"] in _BLOCK_MS
+    }
+
+
 def _legacy_flydsl(tuner, info, call):
-    return _tags(tuner.gen_flydsl_2stages_task(info, _BLOCK_MS)) | _tags(
+    """`gen_flydsl_2stages_task` and `gen_flydsl_i4_2stages_task`, with the 5.1k4
+    additions as known reasons where they add any: the int4 `_reduce` stage 2s, and
+    the generators' lists on the gfx942 keys `_gfx942_a16w_key` takes."""
+    legacy = _tags(tuner.gen_flydsl_2stages_task(info, _BLOCK_MS)) | _tags(
         tuner.gen_flydsl_i4_2stages_task(info, _BLOCK_MS)
     )
+    added = _flydsl_i4_reduce_added(info) - legacy
+    reasons = {_FLYDSL_I4_REDUCE_ADDED} if added else set()
+    if not legacy_tunes(info) and legacy | added:
+        reasons.add(_FLYDSL_GFX942_ADDED)
+    return legacy | added, reasons
 
 
 @functools.cache
@@ -750,6 +802,7 @@ def _families():
             _legacy_flydsl,
             (mxfp4.FlydslGemm1(), mxfp4.FlydslGemm1Quant(), mxfp4.FlydslGemm2())
             + fhmoe,
+            tunes=_flydsl_tunes,
         ),
         "flydslv2": Family(
             _legacy_flydsl_layout,

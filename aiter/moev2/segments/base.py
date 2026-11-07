@@ -224,8 +224,8 @@ class Segment:
       other segments of the plan must share. It reads the family's own instance list,
       filtered by the problem as the legacy tuner's `gen_*_task` for the family
       filters it; () for a problem the segment does not accept, one the legacy
-      `tune()` skips (`defaults.tunable`), or one where dispatch would discard the
-      tuned row. `params_reason(p, params)` / `params_valid`: whether a tuned row's
+      `tune()` skips (`defaults.tunable`; FlyDSL lists per-1x32 bf16 X with MXFP4 or
+      int4 weights on gfx942 too), or one where dispatch would discard the tuned row. `params_reason(p, params)` / `params_valid`: whether a tuned row's
       choice is one of them, by `effective_kernel` (what runs under a name) and the
       candidate's other fields; only a report reads it, not dispatch.
     - Stage 2 only: `stage2_kernel` (a rename of the tuned name, e.g. fp4 to fp8);
