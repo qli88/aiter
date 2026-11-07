@@ -13,7 +13,8 @@ on, per-128x128 tuned as per-1x128; legacy `tune()` skips g1u0 keys, and per-1x3
 off gfx950, so v2 must list nothing there. On gfx950 a few synthetic keys add what the
 snapshot lacks. Candidates v2 adds by decision, beyond the legacy tuners, are rebuilt
 here independently and count as legacy's under a known reason where they add any
-(1-stage ASM 5.1k1, CK-Tile a16w4 5.1k2, FHMoE's widened rules 5.1i).
+(1-stage ASM 5.1k1, CK-Tile a16w4 5.1k2, CK 1x128 split-K 5.1k3, FHMoE's widened
+rules 5.1i).
 
 CK-Tile (`cktile`) is checked per snapshot call, since the call's weight layout picks
 the branch: no legacy branch reads the tuner's `cktile_a8w4_bm*` stage 1 names, so each
@@ -277,13 +278,58 @@ def _legacy_asm_1stage(tuner, info, call):
     return legacy | added, {_ASM_1STAGE_ADDED} if added - legacy else set()
 
 
+_CK_SPLITK_ADDED = (
+    "CK 1x128 split-K: the stage 1 list legacy's tuner builds and never queues "
+    "(todo 5.57) (5.1k3)"
+)
+
+
+def _ck_splitk_added(info):
+    """The 1x128 fp8 split-K stage 1 candidates added in 5.1k3, as tags with the
+    tuner's `_sk{ksplit}` name suffix: legacy's list (`get_gemm1_kernels_list(...,
+    splitk=True)`, split-K 2 to 8 dividing `model_dim` into multiples of 128)."""
+    import torch
+
+    from aiter import QuantType
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_ck2stages_common import (
+        get_gemm1_kernels_list,
+    )
+
+    fp8 = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    model_dim, act = info[3], _activation(info)
+    if not (
+        info[11] == QuantType.per_1x128
+        and info[9] in fp8
+        and info[10] in fp8
+        and info[12]
+    ):
+        return set()
+    c = {torch.bfloat16: "b16", torch.float16: "f16"}[info[8]]
+    _, kernels = get_gemm1_kernels_list(
+        "f8", "f8", c, False, int(info[11]), act, info[13], True, True, arch=info[0]
+    )
+
+    return {
+        ("stage1", f"{k.name}_sk{ksplit}", k.MPerBlock, nt)
+        for k in kernels.values()
+        if k.MPerBlock in _BLOCK_MS
+        for ksplit in range(2, 9)
+        if model_dim % ksplit == 0 and (model_dim // ksplit) % 128 == 0
+        for nt in (False, True)
+    }
+
+
 def _legacy_ck(tuner, info, call):
+    """`gen_2stages_task`, with the 1x128 split-K additions (`_ck_splitk_added`) as a
+    known reason on the archs the CK segments take."""
     if _is_a8w4(info) or _ck_module_fails(info):
         return set()  # a8w4: the CK-Tile generator, family `cktile`
-    return {
+    legacy = {
         (tag[1], tag[2], tag[3], bool(tag[6]))
         for (tag, *_rest) in tuner.gen_2stages_task(info, _BLOCK_MS)
     }
+    added = _ck_splitk_added(info) if info[0] in ("gfx942", "gfx950") else set()
+    return legacy | added, {_CK_SPLITK_ADDED} if added else set()
 
 
 class _EveryKey(dict):
@@ -748,7 +794,9 @@ def _stage(segment):
 
 def _candidate(segment, params):
     """The legacy tuner's tag for a v2 candidate: `(stage, kernel, block_m, nt)`, for a
-    1-stage segment `(asm_1stage[_xbf16], kernel, block_m, flat)`."""
+    1-stage segment `(asm_1stage[_xbf16], kernel, block_m, flat)`. A CK 1x128 stage 1
+    kernel carries a split-K other than 0 as the tuner's `_sk{ksplit}` name suffix; any
+    other CK candidate setting `ksplit` gets a suffix no legacy tag has."""
     from aiter.moev2.dispatch.ops import Op
 
     kernel, block_m = params["kernel"], params["block_m"]
@@ -757,6 +805,11 @@ def _candidate(segment, params):
     if segment.covers[0] <= Op.GEMM1 and segment.covers[1] >= Op.GEMM2:
         stage = "asm_1stage_xbf16" if params.get("xbf16") else "asm_1stage"
         return stage, kernel, block_m, int(params.get("flat", 0))
+    if segment.name == "ck.gemm1" and "blkscale" in kernel:
+        ksplit = params.get("ksplit")
+        kernel = kernel if ksplit == 0 else f"{kernel}_sk{ksplit}"
+    elif segment.name.startswith("ck.") and "ksplit" in params:
+        kernel = f"{kernel}_ksplit{params['ksplit']}"
     return _stage(segment), kernel, block_m, bool(params.get("nt", False))
 
 

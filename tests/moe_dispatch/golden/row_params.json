@@ -13,7 +13,6 @@
  "gfx950": {
   "a4w4 | mxmoe.gemm1 | not a candidate": 3,
   "a4w4 | mxmoe.gemm2 | not a candidate": 9,
-  "a8w4 | asm.stage1_cktile | no candidates": 5,
-  "a8w8_blockscale | ck.gemm1 | not a candidate": 7
+  "a8w4 | asm.stage1_cktile | no candidates": 5
  }
 }

@@ -2321,10 +2321,14 @@ def test_param_space_matches_the_legacy_tuner_for_every_key():
 
 
 def _tuning_problem(
-    activation=ActivationType.Silu, quant=QuantType.per_Token, g1u1=True, **kw
+    activation=ActivationType.Silu,
+    quant=QuantType.per_Token,
+    g1u1=True,
+    dtype=dtypes.bf16,
+    **kw,
 ):
     fp8 = dtypes.fp8
-    args = (64, 7168, 256, 256, 8, dtypes.bf16, fp8, fp8, quant, g1u1, activation)
+    args = (64, 7168, 256, 256, 8, dtype, fp8, fp8, quant, g1u1, activation)
     args += (kw.pop("doweight", False), 0, 0)
     return MoeProblem.from_legacy_key(*args, **kw, arch="gfx950", cu_num=256)
 
@@ -2344,9 +2348,89 @@ def test_ck_param_space_lists_the_codegen_instances():
             assert params["kernel"].startswith(f"moe_ck2stages_gemm{stage}_")
             assert params["block_m"] in TUNE_BLOCK_MS and params["nt"] is False
         blockscale = segment.param_space(_tuning_problem(quant=QuantType.per_1x128))
-        kernels = collections.Counter(p["kernel"] for p in blockscale)
+        plain = [p for p in blockscale if "Splitk" not in p["kernel"]]
+        kernels = collections.Counter(p["kernel"] for p in plain)
         assert kernels and set(kernels.values()) == {2}
         assert {p["nt"] for p in blockscale} == {False, True}
+        assert {p.get("ksplit") for p in plain} == ({0} if stage == 1 else {None})
+        assert {p.get("ksplit") for p in space} == {None}
+
+
+def test_ck_param_space_lists_the_1x128_split_k_codegen_list(monkeypatch):
+    from aiter.moev2.dispatch import coverage
+    from aiter.moev2.migration import a8w8_blockscale as path
+    from aiter.moev2.segments import ck
+
+    def split_k(problem, suffix="_B16"):
+        act, doweight = problem.activation.kind, "doweight_stage1" in problem.features
+        space = ck.CkGemm1().param_space(problem)
+        assert all(f"_{act}_" in p["kernel"] for p in space)
+        assert all(f"MulRoutedWeight{int(doweight)}" in p["kernel"] for p in space)
+        assert all(("Splitk" in p["kernel"]) == bool(p.get("ksplit")) for p in space)
+        out = collections.defaultdict(set)
+        for p in space:
+            if p.get("ksplit"):
+                assert p["kernel"].endswith(suffix), p["kernel"]
+                parts = p["kernel"].split("_")
+                out[parts[3], parts[6]].add((p["ksplit"], p["block_m"], p["nt"]))
+        return out
+
+    blockscale = functools.partial(_tuning_problem, quant=QuantType.per_1x128)
+    space = split_k(blockscale())
+    # 7168: split-K 2, 4, 7 and 8 leave multiples of 128.
+    every = {(k, nt) for k in (2, 4, 7, 8) for nt in (False, True)}
+    assert space == {
+        ("128x16x128x128", "v1"): {(k, 16, nt) for k, nt in every},
+        ("256x16x128x256", "v1"): {(k, 16, nt) for k, nt in every},
+        ("256x32x128x128", "v1"): {(k, 32, nt) for k, nt in every},
+        ("256x64x128x128", "v1"): {(k, 64, nt) for k, nt in every},
+        ("256x64x128x128", "v3"): {(k, 64, nt) for k, nt in every},
+    }
+    assert split_k(blockscale(dtype=dtypes.fp16), "_F16") == space
+    assert split_k(blockscale(ActivationType.Gelu)) == space
+    assert split_k(blockscale(ActivationType.GeluTanh)) == space
+    assert split_k(blockscale(doweight=True)) == space
+    assert not split_k(_tuning_problem())
+    assert not any(
+        "Splitk" in p["kernel"] for p in ck.CkGemm2().param_space(blockscale())
+    )
+
+    # A shipped row (qwen3_235b, 2 tokens): its kernel, `block_m` and split-K.
+    fp8 = dtypes.fp8
+    args = (2, 4096, 384, 128, 8, dtypes.bf16, fp8, fp8, QuantType.per_1x128, True)
+    p = MoeProblem.from_legacy_key(
+        *args, ActivationType.Silu, False, 0, 0, arch="gfx950", cu_num=256
+    )
+    stage1 = (
+        "moe_ck2stages_gemm1_256x32x128x128_1x4_MulABScaleExpertWeightA8W8blkscale"
+        "Splitk_v1_Nswizzle0_Quant4_MulRoutedWeight0_silu_F8_F8_B16"
+    )
+    stage2 = (
+        "moe_ck2stages_gemm2_256x32x128x128_1x4_MulABScaleExpertWeightA8W8blkscale"
+        "_v1_Nswizzle0_Quant4_MulRoutedWeight1_F8_F8_B16"
+    )
+    assert Params(kernel=stage1, block_m=32, nt=False, ksplit=4) in (
+        ck.CkGemm1().param_space(p)
+    )
+    at_3072 = dataclasses.replace(p, shape=dataclasses.replace(p.shape, model_dim=3072))
+    ksplits = {k for k, _, _ in split_k(at_3072)[("256x32x128x128", "v1")]}
+    assert ksplits == {2, 3, 4, 6, 8}
+    plain = stage1.replace("Splitk", "")
+    assert Params(kernel=plain, block_m=32, nt=False, ksplit=0) in (
+        ck.CkGemm1().param_space(p)
+    )
+    for kernel, ksplit in ((stage1, 4), (plain, 0)):
+        row = {"block_m": 32, "ksplit": ksplit, "run_1stage": 0, "nt": 0}
+        row |= {"kernelName1": kernel, "kernelName2": stage2}
+        monkeypatch.setattr(tuned, "lookup", lambda _, row=row: row)
+        res = resolver.resolve(p, path.SEGMENTS)
+        assert res.plan.source == "tuned", res.declined
+        assert res.metadata.ksplit == ksplit
+        keywords = res.metadata.stage1.keywords
+        assert (keywords["kernelName"], keywords["splitk"]) == (kernel, ksplit)
+        reasons = coverage.param_reasons(p, res.plan)
+        assert [s.name for s, _ in reasons] == ["ck.gemm1", "ck.gemm2"]
+        assert all(reason is None for _, reason in reasons), reasons
 
 
 def test_ck_param_space_lists_the_activations_the_codegen_builds():

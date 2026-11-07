@@ -258,8 +258,9 @@ def _ck_tunable(p) -> bool:
 
 
 @functools.cache
-def _ck_instances(stage, arch, a, b, c, quant, act, doweight):
-    """`(name, MPerBlock)` of the CK instances the codegen builds for one call."""
+def _ck_instances(stage, arch, a, b, c, quant, act, doweight, splitk=False):
+    """`(name, MPerBlock)` of the CK instances the codegen builds for one call;
+    `splitk`: the 1x128 split-K stage 1 ones."""
     from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_ck2stages_common import (
         get_gemm1_kernels_list,
         get_gemm2_kernels_list,
@@ -267,7 +268,7 @@ def _ck_instances(stage, arch, a, b, c, quant, act, doweight):
 
     if stage == 1:
         _, kernels = get_gemm1_kernels_list(
-            a, b, c, False, quant, act, doweight, True, arch=arch
+            a, b, c, False, quant, act, doweight, True, splitk=splitk, arch=arch
         )
     else:
         _, kernels = get_gemm2_kernels_list(
@@ -280,20 +281,36 @@ def ck_param_space(segment, p, stage):
     names = tuple(_ck_dtype(d) for d in (p.act_in.dtype, p.w1.dtype, p.out_dtype))
     if not (segment.accepts(p) and tunable(p) and _ck_tunable(p)) or None in names:
         return ()
-    instances = _ck_instances(
-        stage,
+    key = (
         p.arch,
         *names,
         int(p.quant_type),
         p.activation.kind,
         "doweight_stage1" in p.features,
     )
-    nts = (False, True) if p.quant_type == QuantType.per_1x128 else (False,)
-    return tuple(
-        Params(kernel=name, block_m=block_m, nt=nt)
+    blockscale = p.quant_type == QuantType.per_1x128
+    nts = (False, True) if blockscale else (False,)
+    fields = {"ksplit": 0} if blockscale and stage == 1 else {}
+    plain = tuple(
+        Params(kernel=name, block_m=block_m, nt=nt, **fields)
         for block_m in TUNE_BLOCK_MS
-        for name, m_per_block in instances
+        for name, m_per_block in _ck_instances(stage, *key)
         if m_per_block == block_m
+        for nt in nts
+    )
+    if not (blockscale and stage == 1 and names[:2] == ("f8", "f8")):
+        return plain
+    # Some candidates fail and the tuner drops them: GeluTanh raises in the split-K
+    # post-activation (todo 5.63), the launcher rejects some splits for KPerBlock
+    # 256 (7168 / 8), pipeline v3 writes zeros (todo 5.67).
+    model_dim = p.shape.model_dim
+    ksplits = [k for k in range(2, 9) if model_dim % (128 * k) == 0]
+    return plain + tuple(
+        Params(kernel=name, block_m=block_m, nt=nt, ksplit=ksplit)
+        for block_m in TUNE_BLOCK_MS
+        for name, m_per_block in _ck_instances(1, *key, splitk=True)
+        if m_per_block == block_m
+        for ksplit in ksplits
         for nt in nts
     )
 

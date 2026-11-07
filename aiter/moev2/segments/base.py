@@ -220,8 +220,8 @@ class Segment:
       also hold the plan's `block_m`, `ksplit` and `nt`, as legacy's default branches pick
       them; `default_warning(p)` is the line legacy logs when it runs them.
     - Tuning: `param_space(p)`, the candidates the tuner may try for `p`, one `Params`
-      each: `kernel` and the structure values (`block_m`, `nt`) that the other
-      segments of the plan must share. It reads the family's own instance list,
+      each: `kernel` and the structure values (`block_m`, `nt`, `ksplit`) that the
+      other segments of the plan must share. It reads the family's own instance list,
       filtered by the problem as the legacy tuner's `gen_*_task` for the family
       filters it; () for a problem the segment does not accept, one the legacy
       `tune()` skips (`defaults.tunable`), or one where dispatch would discard the
