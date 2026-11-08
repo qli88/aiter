@@ -152,6 +152,14 @@ def a16wi4_caps():
     )
 
 
+def with_doweight(caps) -> tuple:
+    """`caps` with `doweight_stage1` (stage 1 applies the routed weights)."""
+    return tuple(
+        dataclasses.replace(cap, features=cap.features | {"doweight_stage1"})
+        for cap in caps
+    )
+
+
 def swiglu_bias(p, tuned=True) -> bool:
     """The legacy `enable_bias`: FlyDSL stages add the bias for Swiglu with a 16-bit
     output only, and ignore it otherwise. For a tuned row legacy also requires fp4
@@ -715,13 +723,7 @@ class FlydslGemm1(_FlydslStage1):
 
     @property
     def capabilities(self):
-        return (
-            a4w4_caps(pads=True)
-            + a8w4_caps(pads=True)
-            + mxfp8_caps(pads=True)
-            + a16w4_caps()
-            + a16wi4_caps()
-        )
+        return with_doweight(super().capabilities + a16w4_caps() + a16wi4_caps())
 
     def owns(self, kernel) -> bool:
         return (
@@ -748,6 +750,10 @@ class FlydslGemm1Quant(_FlydslStage1):
     name = "flydsl.gemm1_q"
     reach = "tuned"
     covers = (Op.GEMM1, Op.QUANT_INTER)
+
+    @property
+    def capabilities(self):
+        return with_doweight(super().capabilities)
 
     def owns(self, kernel) -> bool:
         return (
@@ -888,7 +894,7 @@ class FlydslGemm2(Segment):
 
     @property
     def capabilities(self):
-        return (
+        return with_doweight(
             a4w4_caps(pads=True)
             + a8w4_caps(pads=True)
             + mxfp8_caps(pads=True)

@@ -35,6 +35,7 @@ from .mxfp4 import (
     layout_gemm2_inter,
     mxfp4_row_rejection,
     swiglu_bias,
+    with_doweight,
 )
 
 
@@ -201,7 +202,7 @@ class OpusGemm2(Segment):
 
     @property
     def capabilities(self):
-        return a8w4_caps()
+        return with_doweight(a8w4_caps())
 
     def owns(self, kernel) -> bool:
         return (

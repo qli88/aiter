@@ -968,10 +968,6 @@ def known_difference(family, info, raised):
             f"FlyDSL {_activation(info)}: dispatch discards the tuned row (todo 5.48)",
             declined=True,
         )
-    if family == "flydsl" and q_type == QuantType.per_1x32 and info[13]:
-        return Known(
-            "per-1x32 doweight: the FlyDSL capabilities leave it out (todo 1e.7)"
-        )
     if family == "cktile" and info[4] % 256:
         return Known(
             "CK-Tile MXFP4 at inter_dim % 256: dispatch discards the stage 2 row",
@@ -979,11 +975,6 @@ def known_difference(family, info, raised):
         )
     if family == "opus" and _activation(info) not in ("silu", "swiglu", "situv2"):
         return Known(f"Opus stage 2 for {_activation(info)}: no a8w4 stage 1 runs it")
-    if family == "opus" and info[13]:
-        return Known(
-            "Opus stage 2 doweight: `opus.gemm2` leaves it out; its only legacy "
-            "partner is FlyDSL stage 1 (todo 1e.7)"
-        )
     if family == "mxmoe" and not info[12]:
         return Known(
             "MXMOE g1u0: the capabilities leave it out; the legacy tuner times g1u1 "

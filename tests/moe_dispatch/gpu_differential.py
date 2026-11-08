@@ -25,7 +25,9 @@ gfx942 only, the arch's own CK rows are also added with stage 1 swapped for the 
 ASM kernel of the same tile M (when it ships one), so that branch runs too; for a8w8_pt,
 the gfx942 int8 rows whose ASM kernel the arch ships are copied as well; for a8w8_ptok,
 1-stage rows are added for the formats only a tuned row runs on the arch
-(`asm.FMOE_1STAGE_TUNED_KEYS`).
+(`asm.FMOE_1STAGE_TUNED_KEYS`); for the per-1x32 paths, the arch's own rows with a
+token-major FlyDSL stage 1 and a token-major FlyDSL, Opus or CK stage 2 are copied with
+`doweight_stage1` (no shipped row has it).
 
 A case that does not fit in the free GPU memory is reported as skipped and fails the run
 (it was not compared); one that raises the same error on legacy and v2 passes, with the
@@ -280,6 +282,8 @@ _A16WI4 = (
     *((m, 2048, 768, 128, 8, "Silu", False, "fp16", False, "wi4") for m in (40,)),
     *((m, 2048, 768, 128, 8, "Silu", False, "bf16", True, "wi4") for m in (64,)),
     *((m, 2048, 768, 128, 8, "Silu", False, "bf16", False, "wi4", _BIAS) for m in (64,)),
+    # Routed weights in stage 1: the untuned fallback takes them.
+    *((m, 2048, 768, 128, 8, a, True, "bf16", False, "wi4") for a in ("Silu", "Situv2") for m in (64,)),
 )  # fmt: skip
 
 _FP8_A = {"q_a": "fp8"}
@@ -655,7 +659,10 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
         parsed = kernel_names.try_parse(name)
         return parsed is None or parsed.family == kernel_names.CK2STAGES
 
-    src = src[src["kernelName1"].map(portable) & src["kernelName2"].map(portable)]
+    src = src[
+        src["kernelName1"].map(portable).astype(bool)
+        & src["kernelName2"].map(portable).astype(bool)
+    ]
     src["gfx"], src["cu_num"] = gfx, cu_num
     if w_dtype == "float8":
         fp8 = "torch.float8_e4m3fn" if gfx == "gfx950" else "torch.float8_e4m3fnuz"
@@ -672,16 +679,21 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
         extra = _asm_int8_rows(df, gfx, cu_num)
     elif path_name == "a8w8_ptok":
         extra = _asm_1stage_rows(df, gfx, cu_num)
+    elif path_name in _FLYDSL_DOWEIGHT:
+        extra = _flydsl_doweight_rows(own, path_name)
     sample = pd.concat([extra, sample])
     table = pd.concat([extra, own, src]).drop_duplicates(_KEY_COLUMNS)
     cases = []
     for r in sample.itertuples():
         act = str(r.act_type).split(".")[-1]
         out = "bf16" if "bfloat16" in str(r.dtype) else "fp16"
-        cases.append(
-            (int(r.token), int(r.model_dim), int(r.inter_dim), int(r.expert),
-             int(r.topk), act, bool(r.doweight_stage1), out, False, _weights(r))
+        case = (
+            int(r.token), int(r.model_dim), int(r.inter_dim), int(r.expert),
+            int(r.topk), act, bool(r.doweight_stage1), out, False, _weights(r),
         )  # fmt: skip
+        if path_name in _FLYDSL_DOWEIGHT and str(r.kernelName1).startswith("flydsl_"):
+            case = (*case[:9], *_FLYDSL_DOWEIGHT[path_name][2:])
+        cases.append(case)
     return table, cases
 
 
@@ -689,6 +701,49 @@ def _weights(row):
     """The case weight format of a tuned row."""
     w = str(row.q_dtype_w)
     return "i8" if "int8" in w else "i4" if "uint32" in w or "int4" in w else "fp8"
+
+
+# Per path: the rows' q_dtype_a and q_dtype_w, and the case's weight format and options.
+_FLYDSL_DOWEIGHT = {
+    "a4w4": ("float4", "float4", "fp4", {"q_a": "fp4"}),
+    "a16w4": ("bfloat16", "float4", "fp4", {"q_a": "bf16"}),
+    "a16wi4": ("bfloat16", "int4", "wi4", {}),
+    "a8w4": ("float8", "float4", "fp4", {"q_a": "fp8"}),
+    "mxfp8": ("float8", "float8", "mxfp8", {}),
+}
+
+
+def _flydsl_doweight_rows(own, path_name):
+    """`own`'s 2-stage rows of the path with a token-major FlyDSL stage 1 (fused quant or
+    not) and a token-major FlyDSL, an Opus or a CK stage 2, copied with
+    `doweight_stage1`: per activation, stage 1 kind and stage 2 family, the rows at the
+    fewest and the median tokens. v2 declines the layout FlyDSL stage 2s with it, and
+    CK-Tile stage 2 faults when stage 1 applies the weights (todo 5.5). a16w4 SiTUv2
+    copies raise on both sides before dispatch (todo 5.13)."""
+    q_a, q_w = _FLYDSL_DOWEIGHT[path_name][:2]
+    rows = own[
+        (own["q_type"] == "QuantType.per_1x32")
+        & own["q_dtype_a"].str.contains(q_a)
+        & own["q_dtype_w"].str.contains(q_w)
+        & (own["run_1stage"] == 0)
+        & (own["use_g1u1"] == 1)
+        & (own["doweight_stage1"] == 0)
+        & own["kernelName1"].str.startswith("flydsl_moe1_")
+        & own["kernelName2"].str.startswith(
+            ("flydsl_moe2_", "opus_moe2", "moe_ck2stages_gemm2_")
+        )
+        & ~own["kernelName2"].str.startswith("flydsl_moe2_layout_")
+    ].copy()
+    rows["doweight_stage1"] = 1
+    fused = rows["kernelName1"].str.split("_t").str[-1].str.extract(r"(_fp[48])")[0]
+    family = rows["kernelName2"].str.extract(
+        r"^(moe_ck2stages|[a-z]+_moe2(?:_layout)?)"
+    )[0]
+    picked = []
+    for _, group in rows.groupby([rows["act_type"], fused.fillna(""), family]):
+        group = group.sort_values("token")
+        picked += sorted({group.index[0], group.index[len(group) // 2]})
+    return rows.loc[picked]
 
 
 _KEY_COLUMNS = [

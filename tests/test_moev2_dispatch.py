@@ -717,9 +717,9 @@ def _a16wi4_op_call():
     }
 
 
-def _a16wi4_problem(activation=ActivationType.Silu, token=64, **kwargs):
+def _a16wi4_problem(activation=ActivationType.Silu, token=64, doweight=False, **kwargs):
     args = (token, 7168, 256, 384, 8, dtypes.bf16, dtypes.bf16, dtypes.i4x2)
-    args += (QuantType.per_1x32, True, activation, False, 0, 0)
+    args += (QuantType.per_1x32, True, activation, doweight, 0, 0)
     kwargs.setdefault("is_shuffled", True)
     return MoeProblem.from_legacy_key(*args, **kwargs, arch="gfx950", cu_num=256)
 
@@ -2632,6 +2632,134 @@ def _mxmoe_segments():
     return (mxfp4.MxmoeGemm1(), mxfp4.MxmoeQuantGemm1(), mxfp4.MxmoeGemm2())
 
 
+def test_doweight_on_the_token_major_flydsl_stages_and_opus_stage2():
+    from aiter.moev2.segments import flydsl_fhmoe, mxfp4, opus
+
+    takes = (
+        mxfp4.FlydslGemm1(),
+        mxfp4.FlydslGemm1Quant(),
+        mxfp4.FlydslGemm2(),
+        opus.OpusGemm2(),
+    )
+    leaves = (
+        mxfp4.FlydslGemm1Layout(),
+        mxfp4.FlydslLayoutGemm2(),
+        mxfp4.FlydslLayoutGemm2Scatter(),
+        *_mxmoe_segments(),
+        opus.OpusGemm1(),
+        opus.OpusGemm1Layout(),
+        flydsl_fhmoe.FlydslFhmoeGemm1(),
+        flydsl_fhmoe.FlydslFhmoeGemm1Quant(),
+        flydsl_fhmoe.FlydslFhmoeGemm2(),
+    )
+    accepted = set()
+    for q_a, q_w in (
+        (dtypes.fp4x2, dtypes.fp4x2),
+        (dtypes.fp8, dtypes.fp4x2),
+        (dtypes.fp8, dtypes.fp8),
+        (dtypes.bf16, dtypes.fp4x2),
+        (dtypes.bf16, dtypes.i4x2),
+    ):
+        act = ActivationType.Situv2 if q_a == dtypes.bf16 else ActivationType.Silu
+        plain = _mx_problem(q_a, q_w, act)
+        doweight = _mx_problem(q_a, q_w, act, doweight=True)
+        for segment in takes + leaves:
+            if not segment.accepts(plain):
+                continue
+            accepted.add(segment.name)
+            key = (segment.name, q_a, q_w)
+            assert segment.accepts(doweight) == (segment in takes), key
+            space = segment.param_space(doweight)
+            assert space == (segment.param_space(plain) if segment in takes else ())
+            assert space or segment not in takes, key
+    assert accepted == {s.name for s in takes + leaves}
+
+
+def test_doweight_resolves_tuned_flydsl_and_opus_rows(monkeypatch):
+    from aiter.moev2.dispatch import coverage
+    from aiter.moev2.migration import a4w4, a8w4, a16wi4
+
+    def resolve(path, p, row=None):
+        monkeypatch.setattr(tuned, "lookup", lambda _: row)
+        return resolver.resolve(p, path.SEGMENTS)
+
+    def row(block_m, kn1, kn2):
+        return {"block_m": block_m, "ksplit": 0, "run_1stage": 0, "nt": 0} | {
+            "kernelName1": kn1,
+            "kernelName2": kn2,
+        }
+
+    fp4 = "flydsl_moe1_afp4_wfp4_bf16_t32x64x256_w4"
+    fp8 = "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w2_gui"
+    opus2 = "opus_moe2_afp8_wfp4_atomic_t32x128x256_sbm32_occ1_cache_b3_ws2"
+    ck1 = (
+        "moe_ck2stages_gemm1_256x32x128x128_1x4_MulABScaleShuffled_v3_Nswizzle0_"
+        "Quant3_MulRoutedWeight1_silu_FP4X2_FP4X2_B16"
+    )
+    ck2 = (
+        "moe_ck2stages_gemm2_64x32x32x128_1x1_MulABScaleExpertWeightShuffled_v1_"
+        "Nswizzle0_Quant3_MulRoutedWeight1_FP4X2_FP4X2_B16"
+    )
+    a4w4_p = _mx_problem(dtypes.fp4x2, dtypes.fp4x2, doweight=True, is_shuffled=True)
+    a8w4_p = _a8w4(ActivationType.Silu, doweight=True, is_shuffled=True)
+    cases = (
+        (a4w4, a4w4_p, row(32, fp4, "flydsl_moe2_afp4_wfp4_bf16_t32x256x256_atomic")),
+        (a4w4, a4w4_p, row(32, fp4 + "_fp4", "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2")),
+        (a8w4, a8w4_p, row(32, fp8, opus2)),
+        (a8w4, a8w4_p, row(32, fp8 + "_fp8", opus2.replace("_moe2_", "_moe2_layout_"))),
+        # Faults on legacy and v2 alike (todo 5.5).
+        (a8w4, a8w4_p, row(32, fp8 + "_fp8", "cktile_a8w4_bm32")),
+    )  # fmt: skip
+    for path, p, tuned_row in cases:
+        res = resolve(path, p, tuned_row)
+        assert res.plan.source == "tuned", (tuned_row, res.declined)
+        reasons = coverage.param_reasons(p, res.plan)
+        assert all(reason is None for _, reason in reasons), (tuned_row, reasons)
+        assert res.metadata.stage1.keywords["kernelName"] == tuned_row["kernelName1"]
+        kernels = {c.params.get("kernel") for c in res.plan.segments}
+        assert tuned_row["kernelName2"] in kernels, (tuned_row, kernels)
+    # The named instance applies the weights: neither side finds it in the CK module
+    # built for stage 1 weights, and both run its heuristic instance.
+    res = resolve(a4w4, a4w4_p, row(32, fp4 + "_fp4", ck2))
+    assert res.plan.source == "tuned", res.declined
+    reasons = coverage.param_reasons(a4w4_p, res.plan)
+    assert [(s.name, r) for s, r in reasons] == [
+        ("flydsl.gemm1_q", None),
+        ("ck.gemm2", "not a candidate"),
+    ]
+    # Wrong output on legacy and v2 alike (todo 5.72).
+    fly2 = "flydsl_moe2_afp4_wfp4_bf16_t32x256x256_atomic"
+    res = resolve(a4w4, a4w4_p, row(32, ck1, fly2))
+    assert res.plan.source == "tuned", res.declined
+    assert [c.segment.name for c in res.plan.segments][-1] == "flydsl.gemm2"
+    assert {ck1, fly2} <= {c.params.get("kernel") for c in res.plan.segments}
+    # The layout GEMM2s leave doweight out: legacy runs the row.
+    layout2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_atomic_sbm32"
+    plain = _mx_problem(dtypes.fp4x2, dtypes.fp4x2, is_shuffled=True)
+    assert resolve(a4w4, plain, row(32, fp4 + "_fp4", layout2)).plan.source == "tuned"
+    res = resolve(a4w4, a4w4_p, row(32, fp4 + "_fp4", layout2))
+    assert res.declined
+    # Untuned, the MXFP4 FlyDSL default stays without doweight, as legacy's.
+    for doweight, family in ((False, "flydsl"), (True, "cktile")):
+        p = _mx_problem(
+            dtypes.fp4x2,
+            dtypes.fp4x2,
+            ActivationType.Swiglu,
+            doweight=doweight,
+            is_shuffled=True,
+        )
+        names = [c.segment.name for c in resolve(a4w4, p).plan.segments]
+        assert names[2:] == [f"{family}.gemm1", "quant.inter", f"{family}.gemm2"]
+    # The untuned a16wi4 fallback takes doweight (legacy's has no doweight check).
+    res = resolve(a16wi4, _a16wi4_problem(doweight=True))
+    assert res.plan.structure()[0][2:] == (
+        "flydsl.gemm1",
+        "quant.inter",
+        "flydsl.gemm2",
+    )
+    assert any("untuned a16wi4 fallback" in m for _, m in res.logs)
+
+
 def test_mxmoe_param_space_pairs_the_legacy_stages_by_block_m():
     from aiter.moev2.segments import mxfp4
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
@@ -3198,6 +3326,7 @@ def test_opus_param_space_follows_the_legacy_filters():
         assert gemm1.param_space(no_stage1) == ()
         assert layout1.param_space(no_stage1) == ()
     assert gemm2.param_space(_a8w4(out=dtypes.fp16))
+    assert gemm2.param_space(_a8w4(doweight=True)) == gemm2.param_space(p)
 
 
 def _fmoe_problem(
