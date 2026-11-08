@@ -206,6 +206,25 @@ def with_stage2(plan, choice):
     return replace(plan, segments=segments)
 
 
+def execute(c, resolution, q_dtype_a, after_sort=None):
+    """Run `resolution` (a plan with its metadata) on the prologued call `c`
+    (`executor.prologue`): the 1-stage, MXFP4 or 2-stage executor, as the local paths
+    run their resolved plans. `after_sort()`, if given, runs after the sort of a
+    2-stage plan."""
+    if resolution.metadata.run_1stage:
+        return executor.run_one_stage(
+            c, resolution.metadata, resolution.plan, q_dtype_a
+        )
+    run = (
+        executor.run_mxfp4
+        if c.quant_type == QuantType.per_1x32
+        else executor.run_two_stage
+    )
+    return run(
+        c, resolution.metadata, resolution.plan, q_dtype_a, after_sort=after_sort
+    )
+
+
 class LocalDispatch:
     """`fhmoe`: the calls come from `fhmoe_` (the shared expert in the problem, the
     selected block size enforced)."""
@@ -275,25 +294,14 @@ class LocalDispatch:
                 f"FHMoE block_size_M={c.block_size_M} does not match the selected "
                 f"kernel block size {resolution.metadata.block_m}"
             )
-        if resolution.metadata.run_1stage:
-            return executor.run_one_stage(
-                c, resolution.metadata, resolution.plan, q_dtype_a
-            )
         after_sort = None
-        if problem is not None:
+        if problem is not None and not resolution.metadata.run_1stage:
             token = get_padded_M(c["hidden_states"].shape[0])
 
             def after_sort():
                 self._check_fhmoe(self.relookup(problem, token))
 
-        run = (
-            executor.run_mxfp4
-            if c.quant_type == QuantType.per_1x32
-            else executor.run_two_stage
-        )
-        return run(
-            c, resolution.metadata, resolution.plan, q_dtype_a, after_sort=after_sort
-        )
+        return execute(c, resolution, q_dtype_a, after_sort)
 
     def resolve_call(self, call, q_dtype_a=None, config_file=None):
         """The resolution `run(call)` runs, inline-sort fallback included, through the

@@ -291,3 +291,229 @@ def test_build_resolves_a_whole_graph_config():
     assert res.plan.segments[0].params["kernel"] == combo["impl.whole_graph"].kernel
     assert res.metadata.full_impl is not None
     assert (res.metadata.stage1, res.metadata.stage2) == (None, None)
+
+
+def test_check_output_passes_on_the_error_ratio_or_the_cosine_distance():
+    import torch
+
+    from aiter.moev2.tuning import measure as tm
+
+    ref = torch.linspace(1.0, 2.0, 1000)
+    assert tm.check_output(ref.clone(), ref) is None
+    off = ref.clone()
+    off[:50] += 1.0  # 5% of the elements wrong, cosine distance above 0.01
+    assert tm.errors(off, ref)[1] > tm.COS_TOL
+    assert tm.check_output(off, ref) is None
+    scaled = ref * 1.05  # every element wrong, cosine distance about 1.2e-3
+    assert tm.errors(scaled, ref)[0] == 1.0
+    assert tm.check_output(scaled, ref) is None
+    assert tm.check_output(-ref, ref).startswith("mismatch: error ratio 1 > 0.1")
+    nan = ref.clone()
+    nan[3] = float("nan")
+    assert tm.check_output(nan, ref) == "non-finite output"
+    assert tm.check_output(ref, nan) == "non-finite reference"
+    assert tm.check_output(torch.zeros_like(ref), ref) == "all-zero output"
+    assert tm.check_output(torch.zeros(4), torch.zeros(4)) is None
+
+
+def test_stats_reports_the_median_and_the_spread():
+    from aiter.moev2.tuning import measure as tm
+
+    t = tm.stats([10.0, 12.0, 8.0, 30.0], "graph")
+    assert (t.median_us, t.samples, t.mode) == (11.0, 4, "graph")
+    assert t.cov == pytest.approx(77**0.5 / 15)
+    assert tm.stats([5.0], "eager").cov == 0.0
+
+
+def test_rotating_copies_exceed_the_cache_and_share_weights_that_do_not_fit():
+    import torch
+
+    from aiter.moev2.tuning import measure as tm
+
+    w1 = torch.zeros(64 << 20, dtype=torch.uint8)
+    w1.is_shuffled = True
+    x = torch.zeros(64 << 10, dtype=torch.uint8)
+    call = {"hidden_states": x, "w1": w1, "w2": w1, "topk": 8}
+    assert tm.copy_count(call, free_bytes=1 << 34) == (4, True)
+    assert tm.copy_count(call, free_bytes=1 << 20) == (tm.MAX_COPIES, False)
+    calls = tm.rotations(call, 3, with_weights=False)
+    assert calls[0] is call and len(calls) == 3
+    assert all(c["w1"] is w1 and c["topk"] == 8 for c in calls)
+    assert len({c["hidden_states"].data_ptr() for c in calls}) == 3
+    copied = tm.rotations(call, 2, with_weights=True)[1]["w1"]
+    assert copied.data_ptr() != w1.data_ptr() and copied.is_shuffled
+
+
+def test_problems_and_params_pickle_into_another_process():
+    import pickle
+
+    from aiter.moev2.problem import FrozenMap
+
+    p = Params(kernel="k", block_m=32)
+    q = pickle.loads(pickle.dumps(p))
+    assert type(q) is Params and q == p and q.kernel == "k"
+    m = FrozenMap({"a": "x"})
+    object.__setattr__(m, "_hash", 0)  # as hashed by a process with another seed
+    assert hash(pickle.loads(pickle.dumps(m))) == hash(FrozenMap({"a": "x"}))
+    problem = _mx(dtypes.fp4x2)
+    assert pickle.loads(pickle.dumps(problem)) == problem
+
+
+def test_a_task_measures_the_plan_it_names():
+    from aiter.moev2.tuning import task as tt
+
+    found, _ = _a4w4_structures()
+    s = found["flydsl.gemm1 | quant.inter | flydsl.gemm2"]
+    combo = next(s.combinations())
+    names = tuple(x.name for x in s.structure)
+    p = _mx(dtypes.fp4x2)
+    res = tt.resolution(tt.Task(p, "a4w4", names, tuple(combo.items())))
+    assert res.plan == resolver.build(p, s.structure, combo).plan
+    assert res.plan.source == "tuned"
+    resolved = tt.resolution(tt.Task(p, "a4w4"))
+    assert resolved.plan == resolver.resolve(p, _path_segments("a4w4")).plan
+    res = tt.resolution(tt.Task(p, "a4w4", ("sort", "nothing"), ()))
+    assert res.plan is None and res.declined.startswith("no feasible structure")
+
+
+def _path_segments(name):
+    from aiter.moev2 import paths
+
+    return paths.registered()[name].segments
+
+
+def _toy(payload):
+    import os
+    import time
+
+    from aiter.moev2.tuning.pool import Restart
+
+    kind, value = payload
+    if kind == "crash":
+        os._exit(7)
+    if kind == "hang":
+        time.sleep(60)
+    if kind == "raise":
+        raise ValueError(value)
+    if kind == "restart":
+        raise Restart(value)
+    return value, os.environ.get("HIP_VISIBLE_DEVICES"), os.getpid()
+
+
+def test_the_pool_survives_crashes_hangs_and_restarts():
+    from aiter.moev2.tuning.pool import Failed, Pool
+
+    payloads = [("ok", 0), ("crash", 1), ("ok", 2), ("hang", 3), ("raise", "bad")]
+    payloads += [("restart", 5), ("ok", 6), ("ok", 7)]
+    with Pool(_toy, devices=("3", "4"), timeout=3) as pool:
+        results = list(pool.map(payloads))
+    out = dict(results)
+    assert sorted(i for i, _ in results) == list(range(len(payloads)))
+    assert out[1] == Failed("worker died (exit code 7)")
+    assert out[3] == Failed("timed out after 3 s")
+    assert out[4] == Failed("ValueError: bad")
+    assert out[5] == 5
+    ok = [out[i] for i in (0, 2, 6, 7)]
+    assert [v for v, _, _ in ok] == [0, 2, 6, 7]
+    assert {device for _, device, _ in ok} <= {"3", "4"}
+
+
+class _DiesOnLoad:
+    def __reduce__(self):
+        import os
+
+        return os._exit, (3,)
+
+
+def test_the_pool_gives_up_on_dead_starts_and_drops_closed_maps():
+    from aiter.moev2.tuning.pool import Pool
+
+    dead = Pool(_DiesOnLoad(), start_timeout=2)
+    with dead, pytest.raises(RuntimeError, match="no worker started in 2 s"):
+        list(dead.map([("ok", 0)]))
+    with Pool(_DiesOnLoad()) as dead:
+        slot = dead.slots[0]
+        slot.process.join()
+        since = slot.started
+        slot.restart()
+        assert slot.started == since
+    with Pool(_toy, devices=(None, None), timeout=60) as pool:
+        first = pool.map([("hang", 0), ("ok", 1)])
+        assert next(first)[0] == 1
+        first.close()
+        assert [slot.task for slot in pool.slots] == [None, None]
+        second = pool.map([("ok", 2)])
+        index, (value, _, _) = next(second)
+        assert (index, value) == (0, 2)
+        assert list(second) == []
+        ready = next(slot for slot in pool.slots if slot.ready)
+        since = ready.started
+        ready.restart()
+        assert ready.started > since
+
+
+def test_inputs_decline_what_they_cannot_build():
+    import dataclasses
+
+    from aiter.moev2 import api
+    from aiter.moev2.tuning import inputs as tin
+
+    p = _mx(dtypes.fp4x2)
+    big = dataclasses.replace(p, shape=dataclasses.replace(p.shape, m=65536))
+    with pytest.raises(tin.Unsupported, match="M=65536 is not a dispatch bucket"):
+        tin.build(big, device="cpu")
+    with pytest.raises(
+        tin.Unsupported, match="format .*float4_e2m1fn_x2 x .*, separated"
+    ):
+        tin._fhmoe_format(api.fhmoe_problem(p))
+    with pytest.raises(tin.Unsupported, match="format .* separated"):
+        tin._fhmoe_format(api.fhmoe_problem(_mx(dtypes.fp8)))
+    args = (64, 7168, 384, 385, 7, dtypes.bf16, dtypes.fp8, dtypes.fp4x2)
+    args += (QuantType.per_1x32, True, ActivationType.Silu, False, 0, 0)
+    dsv4 = MoeProblem.from_legacy_key(
+        *args, True, "interleave", arch="gfx950", cu_num=256
+    )
+    assert tin._fhmoe_format(api.fhmoe_problem(dsv4)) == "fp4"
+    fp4_act = MoeProblem.from_legacy_key(
+        *args[:6],
+        dtypes.fp4x2,
+        *args[7:],
+        True,
+        "interleave",
+        arch="gfx950",
+        cu_num=256
+    )
+    with pytest.raises(tin.Unsupported, match="format .*, interleave gates"):
+        tin._fhmoe_format(api.fhmoe_problem(fp4_act))
+    with pytest.raises(tin.Unsupported, match="no input builder for a shared expert"):
+        tin._format(api.fhmoe_problem(dsv4))
+
+
+def test_a_task_restarts_its_worker_when_the_device_is_gone(monkeypatch):
+    from aiter.moev2.tuning import inputs as tin
+    from aiter.moev2.tuning import measure as tm
+    from aiter.moev2.tuning import task as tt
+    from aiter.moev2.tuning.pool import Restart
+
+    def no_builder(problem, seed):
+        raise tin.Unsupported("no builder")
+
+    task = tt.Task(_mx(dtypes.fp4x2), "a4w4")
+    monkeypatch.setattr(tt, "_inputs", no_builder)
+    assert tt.run(task).reason == "unsupported: no builder"
+    monkeypatch.setattr(tt, "_inputs", lambda problem, seed: None)
+    monkeypatch.setattr(tm, "measure", lambda *args: tm.Result("HIP error"))
+    monkeypatch.setattr(tt, "_device_usable", lambda: True)
+    assert tt.run(task).reason == "HIP error"
+    monkeypatch.setattr(tt, "_device_usable", lambda: False)
+    with pytest.raises(Restart) as raised:
+        tt.run(task)
+    assert raised.value.result.reason == "HIP error (device unusable)"
+
+    def build_fault(problem, seed):
+        raise RuntimeError("HIP fault")
+
+    monkeypatch.setattr(tt, "_inputs", build_fault)
+    with pytest.raises(Restart) as raised:
+        tt.run(task)
+    assert raised.value.result.reason == "RuntimeError: HIP fault (device unusable)"

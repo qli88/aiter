@@ -182,6 +182,10 @@ class FrozenMap(Mapping):
     def __hash__(self):
         return self._hash
 
+    def __reduce__(self):
+        # Rebuilt, not restored: `_hash` hashes strings, which differ per process.
+        return type(self), (self._items,)
+
     def __eq__(self, other):
         return isinstance(other, FrozenMap) and self._items == other._items
 
