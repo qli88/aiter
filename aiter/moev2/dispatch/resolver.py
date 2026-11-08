@@ -273,6 +273,36 @@ def match_row(plans, row):
     return f"no segments run kernelName1={k1}, kernelName2={k2}"
 
 
+def _row_rejection(problem, structure, row):
+    """For a structure of two or more segments: `(declined, reason)` if one of them
+    declines tuned `row` (the call goes back to the legacy code) or discards it (it
+    runs untuned, `reason` the warning logged), else None."""
+    reason = next(filter(None, (s.declines_row(problem, row) for s in structure)), None)
+    if reason is not None:
+        return True, reason
+    rejection = next(filter(None, (s.check_row(problem, row) for s in structure)), None)
+    if rejection is not None:
+        return False, rejection.warning
+    return None
+
+
+def _row_values(row):
+    """`(nt, run_1stage, xbf16, flat)` of tuned `row`, read as legacy reads them."""
+    nt = False
+    if "nt" in row:
+        try:
+            nt = bool(int(float(row["nt"])))
+        except (TypeError, ValueError):
+            pass  # blank or malformed column: keep the pre-column behaviour
+    run_1stage = row.get("run_1stage", False)
+    if "xbf16" in row:
+        xbf16 = run_1stage and bool(int(row["xbf16"]))
+    else:
+        xbf16 = run_1stage and "blockscaleBf16" in str(row["kernelName1"])
+    flat = int(row["flat"]) if "flat" in row and run_1stage else 0
+    return nt, run_1stage, xbf16, flat
+
+
 def _covers(segment, op) -> bool:
     return segment.covers[0] <= op <= segment.covers[1]
 
@@ -452,17 +482,13 @@ def resolve(problem, segments) -> Resolution:
         if isinstance(matched, str):
             return declined(matched)
     if matched is not None and len(matched) > 1:
-        reason = next(
-            filter(None, (s.declines_row(problem, cfg) for s in matched)), None
-        )
-        if reason is not None:
-            return declined(reason)
-        rejection = next(
-            filter(None, (s.check_row(problem, cfg) for s in matched)), None
-        )
+        rejection = _row_rejection(problem, matched, cfg)
         if rejection is not None:
-            logs.append((WARNING, rejection.warning))
-            note(f"tuned row discarded: {rejection.warning}")
+            is_decline, reason = rejection
+            if is_decline:
+                return declined(reason)
+            logs.append((WARNING, reason))
+            note(f"tuned row discarded: {reason}")
             cfg = None
             matched = None
     bypass_tuned_config = overrides.bypass_tuned()
@@ -543,29 +569,14 @@ def resolve(problem, segments) -> Resolution:
         note(f"ranking: {_plan_name(structure)} ({region})")
     else:
         structure = matched
-        use_non_temporal_load = False
         block_m = cfg["block_m"]
+        use_non_temporal_load, run_1stage, run_1stage_xbf16, flat = _row_values(cfg)
         nt_override = overrides.nt_override()
         if nt_override != -1:
             use_non_temporal_load = bool(nt_override)
-        elif "nt" in cfg:
-            try:
-                use_non_temporal_load = bool(int(float(cfg["nt"])))
-            except (TypeError, ValueError):
-                # blank or malformed column: keep the pre-column behaviour
-                use_non_temporal_load = False
         ksplit = 0 if overrides.ksplit_disabled() else cfg["ksplit"]
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
-        run_1stage = cfg.get("run_1stage", False)
-        if "xbf16" in cfg:
-            run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
-        else:
-            run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
-        if "flat" in cfg:
-            flat = int(cfg["flat"]) if run_1stage else 0
-        else:
-            flat = 0
         if not problem.any_shuffled and not run_1stage:
             message = (
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
@@ -636,3 +647,135 @@ def resolve(problem, segments) -> Resolution:
     plan, metadata = built
     note(f"selected {plan.describe()}")
     return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))
+
+
+# The `param_space` fields a candidate may set; each is a tuned-row column.
+_CANDIDATE_FIELDS = frozenset({"kernel", "block_m", "ksplit", "nt", "xbf16", "flat"})
+
+
+def tunable(segment) -> bool:
+    """Whether `segment` runs a named kernel, chosen from its `param_space`."""
+    return bool(segment.prefixes)
+
+
+def candidate_row(structure, candidates) -> dict:
+    """The tuned row naming `candidates`, `{segment name: Params}` with one
+    `param_space` entry per tunable segment of `structure`: the columns dispatch reads.
+    Raises where the candidates disagree on a shared column or set a field no column
+    holds."""
+    chosen = {s.name: candidates.get(s.name) for s in structure if tunable(s)}
+    missing = sorted(name for name, c in chosen.items() if c is None)
+    extra = sorted(candidates.keys() - chosen.keys())
+    if missing or extra:
+        raise ValueError(f"candidates missing for {missing}, not tunable: {extra}")
+    unknown = sorted({f for c in chosen.values() for f in c} - _CANDIDATE_FIELDS)
+    if unknown:
+        raise ValueError(f"candidate fields with no tuned-row column: {unknown}")
+
+    def shared(field, default):
+        values = {c[field] for c in chosen.values() if field in c}
+        if len(values) > 1:
+            raise ValueError(f"the candidates disagree on {field}: {sorted(values)}")
+        return next(iter(values), default)
+
+    one_stage = len(structure) == 1 or _one_stage(structure) is not None
+    if one_stage:
+        (only,) = chosen.values()
+        kernel1, kernel2 = only.kernel, ""
+    else:
+        kernel1 = chosen[_gemm1(structure).name].kernel
+        gemm2 = next(s for s in structure if s.covers[0] == Op.GEMM2)
+        kernel2 = chosen[gemm2.name].kernel
+    return {
+        "kernelName1": kernel1,
+        "kernelName2": kernel2,
+        "block_m": int(shared("block_m", BLOCK_SIZE_M)),
+        "ksplit": int(shared("ksplit", 0)),
+        "nt": int(bool(shared("nt", False))),
+        "run_1stage": int(_one_stage(structure) is not None),
+        "xbf16": int(bool(shared("xbf16", False))),
+        "flat": int(shared("flat", 0)),
+    }
+
+
+def build(problem, structure, candidates) -> Resolution:
+    """What dispatch runs for the tuned row naming `candidates` (`candidate_row`) on
+    `structure`, one of `feasible_plans(problem, ...)`: the plan and its metadata, or
+    declined with the reason dispatch would not run that row as tuned. The env
+    overrides of a tuned row (`overrides`) are not applied. Declined too: a row
+    `match_row` does not put on `structure` (a 1-stage kernel on the sort of the other
+    `flat`), and a plan whose tunable segments do not run their candidate."""
+    row = candidate_row(structure, candidates)
+
+    def declined(reason):
+        return Resolution(None, declined=reason)
+
+    if _plain_1stage_row(row) and problem.activation.kind not in ONE_STAGE_ACTIVATIONS:
+        return declined(f"no 1-stage kernel for {problem.activation.activation}")
+    matched = match_row((structure,), row)
+    if matched is not structure:
+        return declined(f"dispatch would not put the row on this structure: {matched}")
+    kernel1, block_m, ksplit = row["kernelName1"], row["block_m"], row["ksplit"]
+    if len(structure) == 1:
+        (whole,) = structure
+        try:
+            full_impl = resolve_fused_moe_impl(kernel1)
+        except FusedMoeImplResolutionError as error:
+            return declined(str(error))
+        if full_impl is None:
+            return declined(f"{kernel1!r} names no fused-MoE implementation")
+        rejection = whole.check_row(problem, row, kernel1)
+        if rejection is not None:
+            return declined(f"discarded: {rejection.warning or 'expert_mask'}")
+        plan = MoePlan(
+            (SegmentChoice(whole, Params(kernel=kernel1, impl=full_impl)),),
+            "tuned",
+            Params(block_m=block_m, ksplit=ksplit),
+        )
+        return Resolution(
+            plan, MOEMetadata(None, None, block_m, ksplit, full_impl=full_impl)
+        )
+    rejection = _row_rejection(problem, structure, row)
+    if rejection is not None:
+        is_decline, reason = rejection
+        return declined(reason if is_decline else f"discarded: {reason}")
+    nt, run_1stage, xbf16, flat = _row_values(row)
+    if run_1stage:
+        built = _one_stage_plan(
+            problem,
+            structure,
+            "tuned",
+            kernel1,
+            block_m,
+            ksplit,
+            xbf16,
+            run_1stage,
+            flat,
+        )
+    else:
+        gemm2 = next(s for s in structure if s.covers[0] == Op.GEMM2)
+        kernel2 = gemm2.stage2_kernel(problem, kernel1, row["kernelName2"])
+        built = _two_stage_plan(
+            problem,
+            structure,
+            "tuned",
+            kernel1,
+            kernel2,
+            block_m,
+            ksplit,
+            nt,
+            run_1stage,
+            NO_OPTIONS,
+            row,
+        )
+    if isinstance(built, str):
+        return declined(f"the chosen kernels disagree: {built}")
+    plan, metadata = built
+    for choice in plan.segments:
+        if not tunable(choice.segment):
+            continue
+        params = Params(plan.params, **choice.params)
+        reason = choice.segment.params_reason(problem, params)
+        if reason is not None:
+            return declined(f"{choice.segment.name} runs no candidate: {reason}")
+    return Resolution(plan, metadata)
