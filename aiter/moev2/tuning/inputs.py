@@ -285,15 +285,18 @@ def unsupported(problem) -> str | None:
     return None
 
 
-def build(problem, seed=0, device="cuda") -> Inputs:
+def build(problem, seed=0, device="cuda", weight_seed=None) -> Inputs:
     """The call and reference for `problem`; raises `Unsupported` (no builder for its
-    format, or the call would key elsewhere)."""
+    format, or the call would key elsewhere). `weight_seed`: the weights' own seed
+    (the activations and routing still from `seed`); None: all from `seed`."""
     from ..reference.torch_moe import torch_moe_stage1, torch_moe_stage2
 
     reason = unsupported(problem)
     if reason is not None:
         raise Unsupported(reason)
     if problem.shared is not None:
+        if weight_seed is not None:
+            raise Unsupported("no weight seed for the FHMoE builder")
         return _build_fhmoe(problem, seed, device)
     fmt = _format(problem)
     s, act = problem.shape, problem.activation
@@ -302,8 +305,11 @@ def build(problem, seed=0, device="cuda") -> Inputs:
     a_dtype = problem.act_in.dtype
     doweight = "doweight_stage1" in problem.features
     generator = torch.Generator(device=device).manual_seed(seed)
+    weight_generator = generator
+    if weight_seed is not None:
+        weight_generator = torch.Generator(device=device).manual_seed(weight_seed)
 
-    def randn(*shape):
+    def randn(*shape, generator=generator):
         return torch.randn(shape, dtype=dtype, device=device, generator=generator)
 
     hidden = randn(token, H).to(problem.in_dtype or dtype)
@@ -311,7 +317,7 @@ def build(problem, seed=0, device="cuda") -> Inputs:
     topk_weight, topk_ids = _route(score, topk)
     weights = []
     for shape, first in (((E, 2 * inter, H), True), ((E, H, inter), False)):
-        w = randn(*shape) / shape[-1] ** 0.5
+        w = randn(*shape, generator=weight_generator) / shape[-1] ** 0.5
         qt, scale = _quant_weight(fmt, w, a_dtype)
         del w
         weights.append((qt, scale, *_kernel_weight(fmt, qt, scale, E, first)))

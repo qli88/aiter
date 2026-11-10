@@ -241,9 +241,45 @@ def _runs(problem, resolution):
     )
 
 
-def tune(problem, path, evaluate, settings=DEFAULTS, filters=NO_FILTERS, log=None):
-    """The `Outcome` of each structure of `problem` on `path` (a registered path name),
-    winner first, then the other ranked ones, then the failed ones."""
+@dataclass
+class Level1:
+    """Level 1 of a problem: `found` (`StructureCandidates`), the structures already
+    failed, and per structure index its combinations by summed stage time (`queues`;
+    every combination, unranked, for the `single` ones), with the reasons runs failed
+    (`why`) and the declines of `resolver.build` (`declined`)."""
+
+    problem: object
+    found: list
+    failed: list
+    queues: dict = dataclasses.field(default_factory=dict)
+    single: set = dataclasses.field(default_factory=set)
+    refused: set = dataclasses.field(default_factory=set)
+    why: defaultdict = dataclasses.field(default_factory=lambda: defaultdict(list))
+    declined: defaultdict = dataclasses.field(default_factory=lambda: defaultdict(list))
+
+    def builds(self, i, combo) -> bool:
+        built = resolver.build(self.problem, self.found[i].structure, combo)
+        if built.plan is None and built.declined not in self.declined[i]:
+            self.declined[i].append(built.declined)
+        return built.plan is not None
+
+
+def _task(problem, path, settings, structure, combo, **kwargs):
+    return Task(
+        problem,
+        path,
+        _names(structure),
+        tuple(combo.items()),
+        iters=settings.iters,
+        warmup=settings.warmup,
+        seed=settings.seed,
+        **kwargs,
+    )
+
+
+def level1(problem, path, evaluate, settings=DEFAULTS, filters=NO_FILTERS, log=None):
+    """Level 1 of `problem` on `path`: a `Level1`, or the outcome when `problem` is
+    not tuned at all."""
     log = log or (lambda line: None)
     reason = unsupported(problem)
     if reason is not None:
@@ -253,32 +289,16 @@ def tune(problem, path, evaluate, settings=DEFAULTS, filters=NO_FILTERS, log=Non
         Outcome(structure_names(name), reason=f"skipped: {why}")
         for name, why in skipped.items()
     ]
-
-    def task(structure, combo, **kwargs):
-        return Task(
-            problem,
-            path,
-            _names(structure),
-            tuple(combo.items()),
-            iters=settings.iters,
-            warmup=settings.warmup,
-            seed=settings.seed,
-            **kwargs,
-        )
+    state = Level1(problem, found, failed)
+    queues, single, refused, why = state.queues, state.single, state.refused, state.why
+    builds = state.builds
 
     def level1_task(structure, combo, stages):
-        return task(structure, combo, segments=stages, e2e=False)
+        return _task(
+            problem, path, settings, structure, combo, segments=stages, e2e=False
+        )
 
-    declined = defaultdict(list)
-
-    def builds(i, combo) -> bool:
-        built = resolver.build(problem, found[i].structure, combo)
-        if built.plan is None and built.declined not in declined[i]:
-            declined[i].append(built.declined)
-        return built.plan is not None
-
-    queues, single, refused, why = {}, set(), set(), defaultdict(list)
-    level1 = []  # (structure index, group lists, {segment name: stage})
+    grouped = []  # (structure index, group lists, {segment name: stage})
     for i, sc in enumerate(found):
         tunables = [s for s in sc.structure if resolver.tunable(s)]
         stages = {s.name: stage(s) for s in tunables}
@@ -289,7 +309,7 @@ def tune(problem, path, evaluate, settings=DEFAULTS, filters=NO_FILTERS, log=Non
             found_groups = [(i, lists, stages) for _, lists in groups(sc.candidates)]
             if not found_groups:
                 why[i].append("no block_m and nt every tunable segment has")
-            level1 += found_groups
+            grouped += found_groups
         else:
             refused.add(i)
             failed.append(
@@ -308,10 +328,12 @@ def tune(problem, path, evaluate, settings=DEFAULTS, filters=NO_FILTERS, log=Non
                 yield combo
 
     bases = {}
-    trials = {j: built_combinations(i, lists) for j, (i, lists, _) in enumerate(level1)}
+    trials = {
+        j: built_combinations(i, lists) for j, (i, lists, _) in enumerate(grouped)
+    }
     for _ in range(settings.base_tries):
         tasks, index = [], []
-        for j, (i, _, stages) in enumerate(level1):
+        for j, (i, _, stages) in enumerate(grouped):
             combo = next(trials[j], None) if j not in bases else None
             if combo is not None:
                 tasks.append(
@@ -325,11 +347,11 @@ def tune(problem, path, evaluate, settings=DEFAULTS, filters=NO_FILTERS, log=Non
             if result.ok:
                 bases[j] = (combo, result)
             else:
-                why[level1[j][0]].append(f"base: {result.reason}")
+                why[grouped[j][0]].append(f"base: {result.reason}")
     timed = defaultdict(list)  # (group, segment name) -> [(us, candidate)]
     tasks, index = [], []
     for j, (combo, result) in bases.items():
-        i, lists, stages = level1[j]
+        i, lists, stages = grouped[j]
         for name, cs in lists.items():
             for c in cs:
                 if c == combo[name]:
@@ -347,13 +369,34 @@ def tune(problem, path, evaluate, settings=DEFAULTS, filters=NO_FILTERS, log=Non
             timed[j, name].append((result.stages[stage_].median_us, c))
     sums = defaultdict(list)
     for j in bases:
-        i, lists, _ = level1[j]
+        i, lists, _ = grouped[j]
         kept = [keep(timed[j, name], settings) for name in lists]
         for chosen in itertools.product(*kept):
             combo = dict(zip(lists, (c for _, c in chosen)))
             sums[i].append((sum(us for us, _ in chosen), combo))
     for i, ranked in sums.items():
         queues[i] = sorted(ranked, key=lambda t: t[0])
+    return state
+
+
+def tune(problem, path, evaluate, settings=DEFAULTS, filters=NO_FILTERS, log=None):
+    """The `Outcome` of each structure of `problem` on `path` (a registered path name),
+    winner first, then the other ranked ones, then the failed ones."""
+    log = log or (lambda line: None)
+    state = level1(problem, path, evaluate, settings, filters, log)
+    if not isinstance(state, Level1):
+        return state
+    found, failed, queues = state.found, state.failed, state.queues
+    single, refused, why, declined = (
+        state.single,
+        state.refused,
+        state.why,
+        state.declined,
+    )
+    builds = state.builds
+
+    def task(structure, combo, **kwargs):
+        return _task(problem, path, settings, structure, combo, **kwargs)
 
     # Level 2: finalists end to end, refilled from the queue while some fail, and
     # the current plan.

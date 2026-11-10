@@ -3,7 +3,7 @@
 """Worker processes for tuning: one per device, one task at a time.
 
 `Pool(handler, devices)` starts a spawned process per device (`HIP_VISIBLE_DEVICES` set
-to it before the device is first used) running `handler(payload)` for each task it is
+to it when the process starts) running `handler(payload)` for each task it is
 sent. A task taking longer than `timeout`, or whose worker dies (a crash, a device
 fault), comes back as `Failed` with the reason; the worker is then killed if needed and
 restarted, and the remaining tasks go on. A handler raising `Restart(result)` returns
@@ -16,6 +16,10 @@ import pickle
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import wait
+
+# s for a killed process to exit: one stuck in the driver (after a device fault) may
+# never exit, and is then left to die with the parent (daemon).
+KILL_WAIT = 10.0
 
 
 @dataclass(frozen=True)
@@ -35,10 +39,27 @@ class Restart(Exception):
         self.result = result
 
 
-def _worker(pickled_handler, device, connection):
-    if device is not None:
-        os.environ["HIP_VISIBLE_DEVICES"] = str(device)
-    # Unpickled after the device is set: importing the handler's module may use it.
+def start_spawned(target, args, env):
+    """Start a spawned process of `target(*args)` whose environment has `env` from its
+    first instruction: a spawned child imports the parent's main module before
+    `target` runs, and that import may initialize the device runtime, which reads
+    `HIP_VISIBLE_DEVICES` once."""
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=target, args=args, daemon=True)
+    saved = {name: os.environ.get(name) for name in env}
+    try:
+        os.environ.update(env)
+        process.start()
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return process
+
+
+def _worker(pickled_handler, connection):
     handler = pickle.loads(pickled_handler)
     connection.send(("ready", None, False))
     while True:
@@ -63,14 +84,9 @@ class _Slot:
         self._start()
 
     def _start(self, waiting_since=None):
-        context = multiprocessing.get_context("spawn")
-        parent, child = context.Pipe()
-        self.process = context.Process(
-            target=_worker,
-            args=(self.pool.pickled_handler, self.device, child),
-            daemon=True,
-        )
-        self.process.start()
+        parent, child = multiprocessing.get_context("spawn").Pipe()
+        env = {} if self.device is None else {"HIP_VISIBLE_DEVICES": str(self.device)}
+        self.process = start_spawned(_worker, (self.pool.pickled_handler, child), env)
         child.close()
         self.connection = parent
         self.ready = False
@@ -82,7 +98,7 @@ class _Slot:
         self.process.join(grace)
         if self.process.is_alive():
             self.process.kill()
-        self.process.join()
+        self.process.join(KILL_WAIT)
         self.connection.close()
         self.task = self.deadline = None
         self._start(None if self.ready else self.started)
@@ -101,7 +117,7 @@ class _Slot:
             self.process.join(5)
             if self.process.is_alive():
                 self.process.kill()
-                self.process.join()
+                self.process.join(KILL_WAIT)
         self.connection.close()
 
 

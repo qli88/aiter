@@ -12,15 +12,18 @@ the a8w4 path declines goes back to the legacy runtime, before any collective.
 runner set (`prepare` creates it on the engine's `GroupCoordinator`).
 """
 
+import csv
 import functools
 import inspect
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 
 import torch
 
 from aiter import ActivationType, QuantType
 
-from .. import api, paths
+from .. import api, envs, paths
+from ..dispatch import resolver, tuned_plans
 from ..dispatch.plan import SegmentChoice
 from ..engine import (
     LOCAL_SIDE_INPUTS,
@@ -30,12 +33,15 @@ from ..engine import (
     _fused_moe_defaults,
     bucket_range,
 )
+from ..execute.executor import prologue
+from ..policy import quant_remap
 from ..segments import comm_fused as stage2_rs
 from ..segments.base import Params
 from . import a8w4
-from .local import with_stage2
+from .local import execute, with_stage2
 
 NAME = "comm_fused"
+logger = logging.getLogger("aiter")
 
 # `CommFusedMoeRuntime.run` keyword arguments besides the `fused_moe` ones.
 RUN_ARGS = (
@@ -141,6 +147,24 @@ def run_padded(segment, padded, fused):
     return stage2_rs.finish(fused, out)
 
 
+def run_tuned(segment, padded, fused, resolution):
+    """Run a call `prepare_call` padded through `resolution` (an a8w4 plan of its key)
+    with `segment` as its stage 2, or DECLINED where `run_padded` declines it."""
+    op = api.op_call(padded)
+    if a8w4.LOCAL.resolve_call(op) is None:
+        return paths.DECLINED
+    stage2_rs.wait_for_reuse(fused)
+    op["comm_fused"] = fused
+    c = prologue(op, quant_remap)
+    _, _, q_dtype_a = api.dispatch_key(c, None, None)
+    choice = SegmentChoice(
+        segment, Params(runner=stage2_rs.runner_label(fused.runner.config))
+    )
+    plan = with_stage2(resolution.plan, choice)
+    out = execute(c, replace(resolution, plan=plan), q_dtype_a)
+    return stage2_rs.finish(fused, out)
+
+
 def run(call):
     runners = call["runtime"].runners
     padded, fused = stage2_rs.prepare_call(
@@ -168,6 +192,19 @@ class CommFusedTemplate(LocalTemplate):
     pad to; counts no runner takes are not served (`engine.supports`), as
     `CommFusedMoeRuntime.supports` says. `capture()` warms up nothing: a warm-up would
     be a collective with a shared partial the caller owns.
+
+    While `AITER_MOEV2_TUNED_PLANS` names a plan file, its comm_fused rows of
+    this geometry and GPU model (`tuned_plans.comm_lookup`, the key of the call padded
+    to the row's token count) override the winner table's runner buckets: a runner row
+    gives its bucket that runner (built from the row) with the row's a8w4 plan; an
+    ordinary row leaves its bucket unserved. A row is not used (logged) at a token
+    count calls do not key at, or when its runner or plan does not build or the
+    runner's `sort_block_m` is not the plan's `block_m`; none is when the runner set
+    would not fit the flat-VA stride. The runner set is then built over the resulting
+    configs (the Window MXFP8 fallback applied to the rows' as to the table's), or is
+    the table's own when they are the table's.
+    Buckets without a row are as above. Each rank reads the file on its own; `prepare`
+    fails on every rank unless all read the same rows.
     """
 
     tp_size: int = 1
@@ -181,6 +218,69 @@ class CommFusedTemplate(LocalTemplate):
     def __post_init__(self):
         super().__post_init__()
         self._segment = None
+        self._tuned = {}  # runner bucket -> the plan file's a8w4 Resolution
+
+    def _local_problem(self, bucket):
+        """The a8w4 key of a call padded to `bucket` tokens."""
+        c = prologue(api.op_call(self._meta_call(bucket)), quant_remap)
+        args, kwargs, _ = api.dispatch_key(c, None, None)
+        return api.problem_from_key(args, kwargs)
+
+    def _file_rows(self, shape) -> dict:
+        """`{token count: (structure names, candidates)}`: the plan file's
+        comm_fused rows of this geometry, each the row of the call padded to it (rows
+        at a count calls do not key at are not used, logged)."""
+        from aiter.ops.flydsl.comm_fused_moe_host import get_gpu_model
+
+        if not envs.tuned_plans_file():
+            return {}
+        key = (self.tp_size, self.comm, self.add_shared, get_gpu_model() or "")
+        try:
+            rows = {}
+            for m in tuned_plans.comm_tokens(self._local_problem(1), *key):
+                problem = self._local_problem(m)
+                if problem.shape.m != m:
+                    logger.warning(
+                        f"[fused_moe] moev2 tuned comm_fused row for M={m} not used: "
+                        f"calls of {m} tokens key as M={problem.shape.m}"
+                    )
+                    continue
+                row = tuned_plans.comm_lookup(problem, *key)
+                if row is not None:
+                    rows[m] = row
+            return rows
+        except (OSError, ValueError, KeyError, csv.Error) as error:
+            logger.warning(f"[fused_moe] moev2 tuned plan file not read: {error}")
+            return {}
+
+    def _tuned_resolution(self, m, names, candidates):
+        """The row's a8w4 plan for the call padded to `m`; raises ValueError when it
+        does not build."""
+        problem = self._local_problem(m)
+        local = {k: v for k, v in candidates.items() if k != tuned_plans.RUNNER}
+        plans, _ = resolver.feasible_plans(problem, a8w4.SEGMENTS)
+        structure = next(
+            (s for s in plans if tuple(x.name for x in s) == tuple(names)), None
+        )
+        if structure is None:
+            raise ValueError("its plan's structure is not feasible")
+        built = resolver.build(problem, structure, local)
+        if built.plan is None:
+            raise ValueError(f"its plan does not build: {built.declined}")
+        return built
+
+    def _tuned_runner(self, shape, m, names, candidates):
+        """`(runner config, a8w4 Resolution)` of the plan file's runner row at `m`;
+        raises with the reason it cannot be used."""
+        config = stage2_rs.runner_config(candidates[tuned_plans.RUNNER], shape, m)
+        resolution = self._tuned_resolution(m, names, candidates)
+        sort_block_m = getattr(config, "sort_block_m", None)
+        if sort_block_m is not None and sort_block_m != resolution.metadata.block_m:
+            raise ValueError(
+                f"the runner's sort_block_m={sort_block_m} is not its plan's "
+                f"block_m={resolution.metadata.block_m}"
+            )
+        return config, resolution
 
     def _stage2(self):
         if self._segment is None:
@@ -200,8 +300,63 @@ class CommFusedTemplate(LocalTemplate):
                 comm=self.comm,
                 add_shared=self.add_shared,
             )
-            self._segment = stage2_rs.CommFusedStage2.for_shape(shape)
+            rows = self._file_rows(shape)
+            read = tuple(
+                (m, tuple(names), tuned_plans.encode_candidates(candidates))
+                for m, (names, candidates) in sorted(rows.items())
+            )
+            configs = self._tuned_configs(shape, rows) if rows else None
+            if configs is None:
+                self._segment = stage2_rs.CommFusedStage2.for_shape(shape)
+                self._segment.rows = read
+                return self._segment
+            if not configs:
+                raise KeyError(f"unsupported comm_fused shape {shape}")
+            self._segment = stage2_rs.CommFusedStage2(
+                configs, shape=shape, tuned=True, rows=read
+            )
         return self._segment
+
+    def _tuned_configs(self, shape, rows):
+        """The runner config per bucket with the plan file's `rows` applied (their a8w4
+        plans into `_tuned`), or None when the table's runner set is to be used (the
+        same configs: its shared set)."""
+        from aiter.ops.flydsl.comm_fused_moe_host import (
+            FLAT_VA_RANK_STRIDE,
+            comm_fused_configs,
+            runner_arena_bytes,
+        )
+
+        try:
+            configs, _ = comm_fused_configs(shape)
+        except KeyError:
+            configs = {}
+        table, configs = dict(configs), dict(configs)
+        for m, (names, candidates) in rows.items():
+            if tuned_plans.RUNNER not in candidates:
+                configs.pop(m, None)
+                continue
+            try:
+                config, resolution = self._tuned_runner(shape, m, names, candidates)
+            except Exception as error:  # noqa: BLE001 - the row is not used
+                logger.warning(
+                    f"[fused_moe] moev2 tuned comm_fused row for M={m} not used: "
+                    f"{type(error).__name__}: {error}"
+                )
+                continue
+            configs[m] = config
+            self._tuned[m] = resolution
+        if self._tuned:
+            arena = runner_arena_bytes(configs)
+            if arena > FLAT_VA_RANK_STRIDE:
+                logger.warning(
+                    "[fused_moe] moev2 tuned comm_fused rows not used: their runner "
+                    f"set needs {arena} bytes per rank, over the flat-VA stride "
+                    f"{FLAT_VA_RANK_STRIDE}"
+                )
+                self._tuned.clear()
+                return None
+        return None if configs == table else configs
 
     def resolve(self, bucket: int, graph_capture: bool) -> BucketPlan:
         segment = self._stage2()
@@ -251,7 +406,7 @@ class CommFusedTemplate(LocalTemplate):
         """`(description, identity)` of the plan of a runner bucket."""
         if runner_bucket is None:
             return "not served (no comm_fused runner)", "not served"
-        resolution = a8w4.LOCAL.resolve_call(
+        resolution = self._tuned.get(runner_bucket) or a8w4.LOCAL.resolve_call(
             api.op_call(self._meta_call(runner_bucket))
         )
         if resolution is None or resolution.plan is None:
@@ -276,7 +431,11 @@ class CommFusedTemplate(LocalTemplate):
             stage2_stream=self.stage2_stream,
             **run_args,
         )
-        result = run_padded(segment, padded, fused)
+        tuned = self._tuned.get(fused.bucket)
+        if tuned is not None:
+            result = run_tuned(segment, padded, fused, tuned)
+        else:
+            result = run_padded(segment, padded, fused)
         if result is paths.DECLINED:
             raise RuntimeError(f"{NAME}: the a8w4 path declined a prepared bucket")
         return result

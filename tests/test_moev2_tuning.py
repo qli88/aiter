@@ -421,6 +421,29 @@ def test_the_pool_survives_crashes_hangs_and_restarts():
     assert {device for _, device, _ in ok} <= {"3", "4"}
 
 
+def test_pool_workers_start_with_their_device(monkeypatch):
+    import multiprocessing.context
+    import os
+
+    from aiter.moev2.tuning.pool import Pool
+
+    started = []
+    start = multiprocessing.context.SpawnProcess.start
+
+    def recording(process):
+        started.append(os.environ.get("HIP_VISIBLE_DEVICES"))
+        start(process)
+
+    monkeypatch.setattr(multiprocessing.context.SpawnProcess, "start", recording)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,1,2,3")
+    with Pool(_toy, devices=("3", "4", None), timeout=60):
+        assert started == ["3", "4", "0,1,2,3"]
+        assert os.environ["HIP_VISIBLE_DEVICES"] == "0,1,2,3"
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES")
+    with Pool(_toy, devices=("5",), timeout=60):
+        assert started[-1] == "5" and "HIP_VISIBLE_DEVICES" not in os.environ
+
+
 class _DiesOnLoad:
     def __reduce__(self):
         import os
@@ -1254,7 +1277,8 @@ def test_the_plan_file_round_trips_and_resolve_reads_it_only_when_named(
     with open(plan_file, "w", newline="") as f:
         writer = csv.DictWriter(f, tuned_plans.COLUMNS)
         writer.writeheader()
-        writer.writerow(cli._plan_row(problem, "a8w8_ptok", outcomes[0]))
+        keys = tuned_plans.key_values(problem)
+        writer.writerow(cli._plan_row(keys, "a8w8_ptok", outcomes[0]))
     winner = outcomes[0]
     assert winner.rank == 1
     segments = _path_segments("a8w8_ptok")
@@ -1317,7 +1341,7 @@ def test_the_plan_file_round_trips_and_resolve_reads_it_only_when_named(
     with open(plan_file, "w", newline="") as f:
         writer = csv.DictWriter(f, cli.LOG_COLUMNS)
         writer.writeheader()
-        writer.writerows(cli._log_row(problem, "a8w8_ptok", o) for o in outcomes)
+        writer.writerows(cli._log_row(keys, "a8w8_ptok", o) for o in outcomes)
     tuned.clear_cache()
     log_read = resolver.resolve(problem, segments)
     assert log_read.plan == plain.plan

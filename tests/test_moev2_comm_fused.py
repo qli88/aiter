@@ -491,13 +491,20 @@ def test_segment_lifecycle(monkeypatch):
     created = stage2_rs.CommFusedStage2(configs, shape=shape)
     assert created.workspace_bytes() == MemoryNeed(symmetric=4096)
     ctx = engine_mod.EngineContext(SimpleNamespace(cpu_group=1), 0, 2, None, None)
-    made = []
+    made, gathered = [], []
+
+    def gather(out, mine, group):
+        gathered.append((mine, group))
+        out[:] = [mine] * len(out)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     monkeypatch.setattr(
         host,
         "create_flydsl_comm_fused_runners",
         lambda **kw: made.append(kw) or SimpleNamespace(configs=configs),
     )
     created.prepare(ctx)
+    assert gathered == [(None, 1)]  # the ranks' plan file rows: none
     assert made == [
         {
             "tp_group": ctx.comm,
@@ -602,3 +609,13 @@ def test_engine_supports_reports_unserved_counts(monkeypatch):
     supported = [eng.supports(t) for t in (1, 2, 3, 4, 5, 8, 9)]
     assert supported == [True, True, True, True, False, False, False]
     assert "not served" in eng.explain()
+
+
+def test_padded_and_tuned_runs_decline_before_the_reuse_wait(monkeypatch):
+    waits = []
+    monkeypatch.setattr(comm_fused.api, "op_call", lambda padded: {})
+    monkeypatch.setattr(comm_fused.a8w4.LOCAL, "resolve_call", lambda op: None)
+    monkeypatch.setattr(stage2_rs, "wait_for_reuse", waits.append)
+    assert comm_fused.run_padded(None, {}, "fused") is comm_fused.paths.DECLINED
+    assert comm_fused.run_tuned(None, {}, "fused", None) is comm_fused.paths.DECLINED
+    assert waits == []

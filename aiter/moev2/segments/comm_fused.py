@@ -15,7 +15,7 @@ statement: before `_fused_moe_impl`, its `stage2_override`, and after it.
 """
 
 import functools
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -24,6 +24,8 @@ from aiter import dtypes
 from ..dispatch.ops import Op
 from .base import Cap, MemoryNeed, Segment
 from .mxfp4 import mxfp4, mxfp8
+
+_TUNED_RUNNERS = {}  # (id(group), shape, sorted configs) -> _LazyRunners
 
 
 def bucket_for(configs, tokens: int) -> int:
@@ -64,6 +66,31 @@ def supports(configs, tokens: int) -> bool:
     except ValueError:
         return False
     return True
+
+
+def runner_config(params, shape, m: int):
+    """The runner config of a plan file's candidate `params` (the family and the
+    config's non-default params, flat) for `shape` (a `ShapeKey`) at bucket `m`, as
+    the runtime runs it: Window AR payloads rewritten to MXFP8 while
+    `AITER_COMM_FUSED_WINDOW_MXFP8_FALLBACK` is on, as `comm_fused_configs` does."""
+    from aiter.ops.flydsl.comm_fused_moe_host import (
+        WindowConfig,
+        _config,
+        _window_mxfp8_fallback_enabled,
+    )
+
+    values = dict(params)
+    family = values.pop("family")
+    config = _config(
+        {"family": family, "params": values}, shape.kernel_shape(), m, shape.comm
+    )
+    if (
+        isinstance(config, WindowConfig)
+        and config.gather_output
+        and _window_mxfp8_fallback_enabled()
+    ):
+        config = replace(config, partial_payload_bits=8, reduced_payload_bits=8)
+    return config
 
 
 def runner_label(config) -> str:
@@ -291,6 +318,21 @@ def finish(fused: CommFusedCall, output: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _same_rows_on_every_rank(comm, world_size, rows) -> None:
+    import torch.distributed as dist
+
+    every = [None] * world_size
+    dist.all_gather_object(every, rows, group=comm.cpu_group)
+    differ = [rank for rank, r in enumerate(every) if r != every[0]]
+    if differ:
+        raise RuntimeError(
+            "comm_fused: the ranks read different v2 plan file rows (ranks "
+            f"{differ} differ from rank 0): AITER_MOEV2_TUNED_PLANS differs between "
+            "them, or the file changed while they read it (a process keeps its "
+            "first read)"
+        )
+
+
 class CommFusedStage2(Segment):
     """A runner set as a stateful segment: one per TP group and geometry.
 
@@ -298,8 +340,13 @@ class CommFusedStage2(Segment):
     allocated: nothing to prepare). `for_shape(shape)` creates it at `prepare(ctx)`
     through `create_flydsl_comm_fused_runners` on the engine's `GroupCoordinator`,
     sharing that function's cache (one arena per group, geometry and MXFP8 fallback).
-    `configs`: the runner config per token bucket. The runners have no health, reset or
-    free in legacy, so neither has the segment.
+    `configs`: the runner config per token bucket. `tuned`: `configs` are not the
+    shape's winner table's (the v2 plan file's): `prepare` builds a runner set over
+    them (`_LazyRunners`, cached like the table's, per group, geometry and configs).
+    `rows`: what the v2 plan file gave the segment (None: nothing); `prepare` raises
+    on every rank unless every rank has the same, as each reads the file (or not)
+    on its own. The runners have no health,
+    reset or free in legacy, so neither has the segment.
     """
 
     name = "comm_fused.stage2_rs"
@@ -321,10 +368,12 @@ class CommFusedStage2(Segment):
     reach = "tuned"
     stateful = True
 
-    def __init__(self, configs, runners=None, shape=None):
+    def __init__(self, configs, runners=None, shape=None, tuned=False, rows=None):
         self.configs = dict(configs)
         self.runners = runners
         self.shape = shape
+        self.tuned = tuned
+        self.rows = rows
 
     @classmethod
     def adopt(cls, runners) -> "CommFusedStage2":
@@ -358,10 +407,18 @@ class CommFusedStage2(Segment):
                 f"{ctx.world_size} ranks"
             )
         from aiter.ops.flydsl.comm_fused_moe_host import (
+            _LazyRunners,
             create_flydsl_comm_fused_runners,
         )
 
+        _same_rows_on_every_rank(comm, ctx.world_size, self.rows)
         s = self.shape
+        if self.tuned:
+            key = (id(comm), s, tuple(sorted(self.configs.items())))
+            if key not in _TUNED_RUNNERS:
+                _TUNED_RUNNERS[key] = _LazyRunners(comm, s, self.configs)
+            self.runners = _TUNED_RUNNERS[key]
+            return
         self.runners = create_flydsl_comm_fused_runners(
             tp_group=comm,
             model_dim=s.model_dim,

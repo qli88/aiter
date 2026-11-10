@@ -32,7 +32,9 @@ WORLD = 8
 
 # name: (comm, tokens, variant, options). Variants: how the shared partial arrives
 # ("shared", "for_rows", "producer"), "stream" (a separate stage 2 stream), "graph"
-# (captured, then replayed), "engine" (`CommFusedTemplate`). Options: "route",
+# (captured, then replayed), "engine" (`CommFusedTemplate`), "tuned" (the engine with
+# a plan file giving the call's bucket a runner other than the shipped one, the plan
+# dispatch resolves; it must match legacy within the same noise). Options: "route",
 # "sizes" (ragged reduce-scatter), "bound" (AITER_BF16_FP8_MOE_BOUND; default 0, as
 # the production test runs).
 CASES = {
@@ -62,6 +64,7 @@ CASES = {
     "engine ar M=3": ("ar", 3, "engine", {}),
     "engine rs M=64": ("rs", 64, "engine", {}),
     "engine rs M=3984, ragged": ("rs", 3984, "engine", {"sizes": (512,) * 7 + (400,)}),
+    "engine rs M=64, plan file runner": ("rs", 64, "tuned", {}),
 }
 
 
@@ -233,9 +236,63 @@ def _run(session, mode, fn, graph=False):
     return out, bench, logs
 
 
-def _engine_fn(session, comm, tokens, moe_args, run_kw):
-    """`MoeEngine.forward` of a `CommFusedTemplate` engine over the TP group."""
+TUNED_RUNNER = {"family": "direct", "grid_cap": 16}
+
+
+def _write_plan_file(session, template, comm, bucket, path):
+    """A plan file whose only row gives `bucket` the plan dispatch resolves for it,
+    with `TUNED_RUNNER` (written by rank 0)."""
+    import torch.distributed as dist
+
+    error = None
+    if session.rank == 0:
+        try:
+            _write_row(template, comm, bucket, path)
+        except Exception as exc:  # noqa: BLE001 - every rank gives up on the case
+            error = f"{type(exc).__name__}: {exc}"
+    errors = [None] * WORLD
+    dist.all_gather_object(errors, error, group=session.tp.cpu_group)
+    if errors[0] is not None:
+        raise RuntimeError(f"the plan file was not written: {errors[0]}")
+
+
+def _write_row(template, comm, bucket, path):
+    import csv
+
+    from aiter.moev2 import api
+    from aiter.moev2.dispatch import tuned_plans
+    from aiter.moev2.migration import a8w4
+    from aiter.moev2.segments.base import Params
+    from aiter.moev2.tuning import cli, search
+    from aiter.moev2.tuning.candidates import plan_candidates
+    from aiter.moev2.tuning.measure import Timing
+    from aiter.ops.flydsl.comm_fused_moe_host import get_gpu_model
+
+    problem = template._local_problem(bucket)
+    resolution = a8w4.LOCAL.resolve_call(api.op_call(template._meta_call(bucket)))
+    candidates = plan_candidates(problem, resolution.plan)
+    candidates[tuned_plans.RUNNER] = Params(
+        TUNED_RUNNER, sort_block_m=int(resolution.metadata.block_m)
+    )
+    outcome = search.Outcome(
+        tuple(c.segment.name for c in resolution.plan.segments),
+        candidates,
+        Timing(1.0, 0.0, 1, "graph"),
+        rank=1,
+    )
+    keys = tuned_plans.comm_key_values(problem, WORLD, comm, True, get_gpu_model())
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, tuned_plans.COLUMNS)
+        writer.writeheader()
+        writer.writerow(cli._plan_row(keys, tuned_plans.COMM_FUSED_PATH, outcome))
+
+
+def _engine_fn(session, comm, tokens, moe_args, run_kw, tuned=False):
+    """`MoeEngine.forward` of a `CommFusedTemplate` engine over the TP group; with
+    `tuned`, built while `AITER_MOEV2_TUNED_PLANS` names `_write_plan_file`'s file."""
     from aiter.moev2 import engine as eng
+    from aiter.moev2 import envs
+    from aiter.moev2.dispatch import tuned as tuned_cache
     from aiter.moev2.migration.comm_fused import CommFusedTemplate
     from aiter.moev2.problem import ParallelSpec
     from aiter.ops.comm_fused_moe_runtime import CommFusedMoeRuntime
@@ -266,10 +323,24 @@ def _engine_fn(session, comm, tokens, moe_args, run_kw):
     sizes = run_kw["reduce_scatter_sizes"]
     # The count the runtime buckets by (ragged: max(sizes) * ranks).
     rows = tokens if sizes is None else max(sizes) * len(sizes)
-    engine = eng.MoeEngine.create(
-        template, max_tokens=max(rows, 64), parallel=parallel, comm=session.tp
-    )
-    engine.prepare()  # no captured buckets: READY
+    env = {}
+    if tuned:
+        path = f"/tmp/moev2_cf_differential_plans_{os.getppid()}.csv"
+        _write_plan_file(session, template, comm, rows, path)
+        env = {envs.AITER_MOEV2_TUNED_PLANS: path}
+    with mock.patch.dict(os.environ, env):
+        tuned_cache.clear_cache()
+        try:
+            engine = eng.MoeEngine.create(
+                template, max_tokens=max(rows, 64), parallel=parallel, comm=session.tp
+            )
+            engine.prepare()  # no captured buckets: READY
+        finally:
+            tuned_cache.clear_cache()
+    if tuned:
+        session.t._barrier(session.group)  # every rank has read the file
+        if session.rank == 0:
+            os.remove(path)
     for count in sorted({tokens, rows}):
         legacy = CommFusedMoeRuntime(runners=session.runners[comm]).supports(count)
         if engine.supports(count) != legacy:
@@ -278,8 +349,17 @@ def _engine_fn(session, comm, tokens, moe_args, run_kw):
             )
     if not engine.supports(rows):
         raise AssertionError(f"the engine does not serve {rows} tokens")
-    shared_runners = engine._stateful[0].runners is session.runners[comm]
-    if not shared_runners:
+    runners = engine._stateful[0].runners
+    if tuned:
+        config = runners.configs[rows]
+        if (
+            runners is session.runners[comm]
+            or config.grid_cap != TUNED_RUNNER["grid_cap"]
+        ):
+            raise AssertionError(f"the engine does not run the file's runner: {config}")
+        if session.runners[comm].configs[rows] == config:
+            raise AssertionError("the file's runner is the shipped one")
+    elif runners is not session.runners[comm]:
         raise AssertionError("the engine made a runner set of its own")
 
     def forward():
@@ -320,9 +400,11 @@ def run_case(session, name):
         _run(session, "off", legacy)  # warm-up: JIT and runner compiles log here
         ref, legacy_bench, legacy_logs = _run(session, "off", legacy, graph)
         ref2, _, _ = _run(session, "off", legacy, graph)
-        if variant == "engine":
+        if variant in ("engine", "tuned"):
             try:
-                v2 = _engine_fn(session, comm, tokens, moe_args, run_kw)
+                v2 = _engine_fn(
+                    session, comm, tokens, moe_args, run_kw, variant == "tuned"
+                )
             except Exception as exc:  # noqa: BLE001
                 return f"{name}: engine: {type(exc).__name__}: {exc}"
             out, _, _ = _run(session, "off", v2)
@@ -406,6 +488,9 @@ def _rank_main():
         t.aiter.logger.setLevel("WARNING")
     session = _Session(t, rank, device, group)
     cpu_group = session.tp.cpu_group
+    # The per-expert weight builds can keep some ranks past NCCL's 10 min watchdog
+    # while the others wait in the first case's barrier; gloo waits 30 min.
+    dist.barrier(group=cpu_group)
     problems = []
     selected = os.environ.get("_MOEV2_CF_CASES")
     names = selected.split("|") if selected else list(CASES)
