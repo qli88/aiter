@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass
 
 from ..dispatch.resolver import feasible_plans, tunable
+from ..dispatch.tuned_plans import STRUCTURE_SEPARATOR
+from ..segments.base import Params
 
 # The legacy `TUNE_ONLY` names: the segments of the candidates each generator lists.
 # Legacy's default when unset ("flydslv2") is not kept: unset or empty tunes all. The
@@ -99,7 +101,7 @@ class StructureCandidates:
 
     @property
     def name(self) -> str:
-        return " | ".join(s.name for s in self.structure)
+        return STRUCTURE_SEPARATOR.join(s.name for s in self.structure)
 
     def block_ms(self) -> tuple:
         """The `block_m` values every tunable segment has a candidate for, ascending
@@ -127,6 +129,32 @@ class StructureCandidates:
 
 
 NO_FILTERS = Filters()
+
+
+def plan_candidates(problem, plan):
+    """`{segment name: candidate}`: the `param_space` candidate each tunable segment
+    of `plan` runs (the same effective kernel and fields), or the name of the first
+    segment running none."""
+    found = {}
+    for c in plan.segments:
+        s = c.segment
+        if not tunable(s):
+            continue
+        full = Params(plan.params, **c.params)
+        kernel = s.effective_kernel(problem, full)
+        match = next(
+            (
+                cand
+                for cand in s.param_space(problem)
+                if s.effective_kernel(problem, cand) == kernel
+                and all(full.get(f) == v for f, v in cand.items() if f != "kernel")
+            ),
+            None,
+        )
+        if match is None:
+            return s.name
+        found[s.name] = match
+    return found
 
 
 def structures(problem, segments, filters=NO_FILTERS):

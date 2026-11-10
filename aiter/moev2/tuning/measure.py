@@ -11,8 +11,10 @@ and times its replays. The rotating copies of the call (`rotations`) keep each r
 reading the previous one's data from the caches. A segment in context: the plan runs
 once per copy with `hooks.set_kernel_bench_callable`, which collects each stage launch
 with its real inputs (sorted rows, quantized activations); those launches are timed
-alone. Failures in-process (an exception, a capture error, a wrong output) come back as
-a reason; a crash or a hang is the worker pool's (`tuning.pool`).
+alone; the search's level 1 asks for the stages only (`e2e=False`). `interleaved`
+times several plans end to end in alternating order over a few rounds, for near-ties.
+Failures in-process (an exception, a capture error, a wrong output) come back as a
+reason; a crash or a hang is the worker pool's (`tuning.pool`).
 """
 
 import math
@@ -149,6 +151,11 @@ def time_calls(fns, mode, iters=50, warmup=3, check=None):
     """`(Timing, reason)`: time the zero-argument callables `fns` (one per rotating
     copy) run in turn; `reason` is the first `check(output)` failing on what a copy
     returned in its timed runs (the graph's outputs after its replays), else None."""
+    samples, reason = _samples(fns, mode, iters, warmup, check)
+    return stats(samples, mode), reason
+
+
+def _samples(fns, mode, iters, warmup, check):
     for i in range(max(warmup, len(fns))):
         fns[i % len(fns)]()
     torch.cuda.synchronize()
@@ -185,7 +192,7 @@ def time_calls(fns, mode, iters=50, warmup=3, check=None):
                 reason = f"copy {i}, {mode}: {reason}"
                 break
     del outputs
-    return stats(samples, mode), reason
+    return samples, reason
 
 
 @dataclass
@@ -199,6 +206,25 @@ class Result:
         return self.reason is None
 
 
+def _failure(error) -> Result:
+    return Result(f"{type(error).__name__}: {str(error)[:500]}")
+
+
+def _calls(inputs, free_bytes):
+    if free_bytes is None:
+        free_bytes = torch.cuda.mem_get_info()[0]
+    return rotations(inputs.call, *copy_count(inputs.call, free_bytes))
+
+
+def _verified(inputs, resolution, err_ratio) -> str | None:
+    """None if `resolution` runs and passes on `inputs.call`, else the reason."""
+    if resolution.plan is None:
+        return f"declined: {resolution.declined}"
+    out = plan_runner(inputs.call, resolution)()
+    torch.cuda.synchronize()
+    return check_output(out, inputs.reference, err_ratio)
+
+
 def measure(
     inputs,
     resolution,
@@ -208,33 +234,28 @@ def measure(
     segments=False,
     err_ratio=ERR_RATIO,
     free_bytes=None,
+    e2e=True,
 ) -> Result:
     """Verify `resolution` (a plan) on `inputs` (`tuning.inputs.build`), then time it end
-    to end in `mode`, verifying each copy's output from the timed runs again; with
-    `segments`, also each stage launch alone, in context."""
-    if resolution.plan is None:
-        return Result(f"declined: {resolution.declined}")
+    to end in `mode` (unless not `e2e`), verifying each copy's output from the timed runs
+    again; with `segments` (True for every stage, or stage names), also each stage
+    launch alone, in context."""
     try:
-        out = plan_runner(inputs.call, resolution)()
-        torch.cuda.synchronize()
-        reason = check_output(out, inputs.reference, err_ratio)
+        reason = _verified(inputs, resolution, err_ratio)
         if reason is not None:
             return Result(reason)
-        if free_bytes is None:
-            free_bytes = torch.cuda.mem_get_info()[0]
-        copies, with_weights = copy_count(inputs.call, free_bytes)
-        calls = rotations(inputs.call, copies, with_weights)
-        runners = [plan_runner(c, resolution) for c in calls]
-        e2e, reason = time_calls(
-            runners,
-            mode,
-            iters,
-            warmup,
-            lambda out: check_output(out, inputs.reference, err_ratio),
-        )
-        if reason is not None:
-            return Result(reason)
-        result = Result(e2e=e2e)
+        runners = [plan_runner(c, resolution) for c in _calls(inputs, free_bytes)]
+        result = Result()
+        if e2e:
+            result.e2e, reason = time_calls(
+                runners,
+                mode,
+                iters,
+                warmup,
+                lambda out: check_output(out, inputs.reference, err_ratio),
+            )
+            if reason is not None:
+                return Result(reason)
         if segments:
             launches = {}
             with hooks.set_kernel_bench_callable() as recorded:
@@ -242,10 +263,74 @@ def measure(
                     run()
             for stage, launch in recorded:
                 launches.setdefault(stage, []).append(launch)
+            wanted = launches if segments is True else segments
+            missing = sorted(set(wanted) - set(launches))
+            if missing:
+                return Result(f"no {', '.join(missing)} launch recorded")
             result.stages = {
-                stage: time_calls(fns, mode, iters, warmup)[0]
-                for stage, fns in launches.items()
+                stage: time_calls(launches[stage], mode, iters, warmup)[0]
+                for stage in wanted
             }
         return result
     except Exception as error:  # noqa: BLE001 - a failing candidate, with its reason
-        return Result(f"{type(error).__name__}: {str(error)[:500]}")
+        return _failure(error)
+
+
+def interleaved(
+    inputs,
+    resolutions,
+    mode,
+    rounds=4,
+    iters=50,
+    warmup=3,
+    err_ratio=ERR_RATIO,
+    free_bytes=None,
+) -> list:
+    """A `Result` per plan of `resolutions`, timed end to end in turn: `rounds` rounds
+    of `iters` runs each, every round in the reverse order of the one before, so drift
+    and order affect them alike; each plan's samples of every round together. The
+    first round warms up `warmup` runs, the others one pass over the copies."""
+    results = [None] * len(resolutions)
+    runners, samples = {}, {}
+    try:
+        calls = _calls(inputs, free_bytes)
+    except Exception as error:  # noqa: BLE001 - every plan fails alike
+        return [_failure(error)] * len(resolutions)
+    for i, resolution in enumerate(resolutions):
+        try:
+            reason = _verified(inputs, resolution, err_ratio)
+            if reason is None:
+                runners[i] = [plan_runner(c, resolution) for c in calls]
+        except Exception as error:  # noqa: BLE001 - this plan fails, with its reason
+            results[i] = _failure(error)
+            continue
+        if reason is not None:
+            results[i] = Result(reason)
+            continue
+        samples[i] = []
+
+    def check(out):
+        return check_output(out, inputs.reference, err_ratio)
+
+    order = list(runners)
+    for round_ in range(rounds):
+        for i in order if round_ % 2 == 0 else order[::-1]:
+            if results[i] is not None:
+                continue
+            try:
+                taken, reason = _samples(
+                    runners[i], mode, iters, warmup if round_ == 0 else 0, check
+                )
+            except Exception as error:  # noqa: BLE001 - this plan fails
+                results[i] = _failure(error)
+                continue
+            if reason is not None:
+                results[i] = Result(reason)
+            samples[i] += taken
+    for i in order:
+        if results[i] is None:
+            try:
+                results[i] = Result(e2e=stats(samples[i], mode))
+            except Exception as error:  # noqa: BLE001 - this plan fails
+                results[i] = _failure(error)
+    return results

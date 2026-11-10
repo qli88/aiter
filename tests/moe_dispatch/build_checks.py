@@ -77,31 +77,9 @@ def fingerprint(problem, resolution, effective=False):
 
 
 def plan_candidates(problem, plan):
-    """`{segment name: candidate}` the tunable segments of `plan` run, or the name of
-    the first segment running none."""
-    from aiter.moev2.dispatch.resolver import tunable
-    from aiter.moev2.segments.base import Params
+    from aiter.moev2.tuning.candidates import plan_candidates as candidates
 
-    found = {}
-    for c in plan.segments:
-        s = c.segment
-        if not tunable(s):
-            continue
-        full = Params(plan.params, **c.params)
-        kernel = s.effective_kernel(problem, full)
-        match = next(
-            (
-                cand
-                for cand in s.param_space(problem)
-                if s.effective_kernel(problem, cand) == kernel
-                and all(full.get(f) == v for f, v in cand.items() if f != "kernel")
-            ),
-            None,
-        )
-        if match is None:
-            return s.name
-        found[s.name] = match
-    return found
+    return candidates(problem, plan)
 
 
 def _resolve_row(problem, path, row):

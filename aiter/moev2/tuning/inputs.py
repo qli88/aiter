@@ -266,17 +266,33 @@ _CALL_QUANT = {
 }
 
 
+def unsupported(problem) -> str | None:
+    """Why `build` declines `problem` before building anything (no device needed),
+    else None; `build` may still decline a call that keys elsewhere."""
+    m = problem.shape.m
+    if get_padded_M(m) != m:
+        return (
+            f"M={m} is not a dispatch bucket: a call with {m} tokens looks up "
+            f"M={get_padded_M(m)}"
+        )
+    try:
+        if problem.shared is not None:
+            _fhmoe_format(problem)
+        else:
+            _format(problem)
+    except Unsupported as error:
+        return str(error)
+    return None
+
+
 def build(problem, seed=0, device="cuda") -> Inputs:
     """The call and reference for `problem`; raises `Unsupported` (no builder for its
     format, or the call would key elsewhere)."""
     from ..reference.torch_moe import torch_moe_stage1, torch_moe_stage2
 
-    m = problem.shape.m
-    if get_padded_M(m) != m:
-        raise Unsupported(
-            f"M={m} is not a dispatch bucket: a call with {m} tokens looks up "
-            f"M={get_padded_M(m)}"
-        )
+    reason = unsupported(problem)
+    if reason is not None:
+        raise Unsupported(reason)
     if problem.shared is not None:
         return _build_fhmoe(problem, seed, device)
     fmt = _format(problem)

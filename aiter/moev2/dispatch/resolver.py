@@ -12,6 +12,7 @@ Log lines are collected, not emitted, so a declined resolution prints nothing; t
 emits them (`Resolution.emit`) once per problem, where the legacy cache would have logged.
 """
 
+import csv
 import logging
 import math
 from dataclasses import dataclass
@@ -31,10 +32,11 @@ from ..segments.defaults import (
 from ..segments.mxfp4 import mx_token
 from ..segments.sort import AUX_SORT_OPUS
 from ..segments.whole_graph import FusedMoeImplResolutionError, resolve_fused_moe_impl
-from . import kernel_names, overrides, profile, ranking, tuned
+from . import kernel_names, overrides, profile, ranking, tuned, tuned_plans
 from .buf import CALL_INPUT
 from .ops import Op, chain
 from .plan import MoePlan, SegmentChoice
+from .tuned_plans import STRUCTURE_SEPARATOR
 
 INFO = logging.INFO
 WARNING = logging.WARNING
@@ -119,7 +121,11 @@ def feasible_plans(problem, segments):
 
 
 def _plan_name(structure):
-    return " | ".join(s.name for s in structure)
+    return STRUCTURE_SEPARATOR.join(_names(structure))
+
+
+def _names(structure) -> tuple:
+    return tuple(s.name for s in structure)
 
 
 def _structure_value(name, value):
@@ -446,13 +452,46 @@ def resolve(problem, segments) -> Resolution:
     if rejected:
         note("rejected: " + "; ".join(f"{k} ({v})" for k, v in rejected.items()))
 
+    file_logs = []
+
     def declined(reason):
         note(f"declined: {reason}; the legacy code runs this call")
-        return Resolution(None, declined=reason, explain=tuple(explain or ()))
+        return Resolution(
+            None, logs=tuple(file_logs), declined=reason, explain=tuple(explain or ())
+        )
 
     if not plans:
         return declined("no feasible plan")
     keys = problem.log_keys()
+    try:
+        chosen = () if overrides.bypass_tuned() else tuned_plans.lookup(problem)
+    except (OSError, ValueError, KeyError, csv.Error) as error:
+        chosen = ()
+        file_logs.append(
+            (WARNING, f"[fused_moe] moev2 tuned plan file not read: {error}")
+        )
+    for names, candidates in chosen:
+        structure = next((s for s in plans if _names(s) == names), None)
+        built = (
+            build(problem, structure, candidates)
+            if structure is not None
+            else Resolution(None, declined="the structure is not feasible here")
+        )
+        if built.plan is not None:
+            note(f"tuned plan file: selected {built.plan.describe()}")
+            message = f"[fused_moe] moev2 tuned plan {_plan_name(structure)} for {keys}"
+            return Resolution(
+                built.plan,
+                built.metadata,
+                (*file_logs, (INFO, message)),
+                explain=tuple(explain or ()),
+            )
+        name = STRUCTURE_SEPARATOR.join(names)
+        message = f"[fused_moe] moev2 tuned plan {name} for {keys} not used"
+        file_logs.append((WARNING, f"{message}: {built.declined}"))
+    for _, message in file_logs:
+        note(message)
+    logs = list(file_logs)
     cfg = tuned.lookup(problem)
     if cfg is None:
         note(f"tuned lookup: miss (tier {problem.shape.m})")
@@ -463,7 +502,6 @@ def resolve(problem, segments) -> Resolution:
             f"kernelName2={cfg.get('kernelName2')!r}"
         )
         matched = None
-    logs = []
     if (
         cfg is not None
         and _plain_1stage_row(cfg)

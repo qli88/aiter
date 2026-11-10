@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A tuning task, as a worker of `tuning.pool` runs it: `run(Task)` -> `measure.Result`.
+"""A tuning task, as a worker of `tuning.pool` runs it: `run(Task)` -> `measure.Result`,
+`run(Rivals)` -> a `measure.Result` per plan.
 
 A task names one problem, the registered path serving it, and the plan to measure: a
 structure (its segment names, one of `resolver.feasible_plans`) and the candidate of
@@ -29,7 +30,22 @@ class Task:
     mode: str | None = None  # "graph" or "eager"; None: `measure.deploy_mode`
     iters: int = 50
     warmup: int = 3
-    segments: bool = False
+    segments: bool | tuple = False  # stage launches timed alone: all, or these names
+    seed: int = 0
+    e2e: bool = True  # time the whole plan
+
+
+@dataclass(frozen=True)
+class Rivals:
+    """Plans of one problem timed in turn (`measure.interleaved`)."""
+
+    problem: object
+    path: str
+    plans: tuple  # ((structure, candidates), ...) as in `Task`
+    mode: str | None = None
+    rounds: int = 4
+    iters: int = 50
+    warmup: int = 3
     seed: int = 0
 
 
@@ -45,17 +61,23 @@ def _inputs(problem, seed):
     return _cached[key]
 
 
-def resolution(task):
-    """The plan `task` measures (a `Resolution`, possibly declined)."""
-    segments = paths.registered()[task.path].segments
-    if task.structure is None:
-        return resolver.resolve(task.problem, segments)
-    plans, _ = resolver.feasible_plans(task.problem, segments)
-    names = tuple(task.structure)
-    structure = next((s for s in plans if tuple(x.name for x in s) == names), None)
+def plan_of(problem, path, structure=None, candidates=None):
+    """The plan to measure (a `Resolution`, possibly declined): `structure` (segment
+    names) built with `candidates`, or what dispatch resolves when None."""
+    segments = paths.registered()[path].segments
     if structure is None:
+        return resolver.resolve(problem, segments)
+    plans, _ = resolver.feasible_plans(problem, segments)
+    names = tuple(structure)
+    found = next((s for s in plans if tuple(x.name for x in s) == names), None)
+    if found is None:
         return resolver.Resolution(None, declined=f"no feasible structure {names}")
-    return resolver.build(task.problem, structure, dict(task.candidates))
+    return resolver.build(problem, found, dict(candidates))
+
+
+def resolution(task):
+    """The plan `task` measures."""
+    return plan_of(task.problem, task.path, task.structure, task.candidates)
 
 
 def _device_usable() -> bool:
@@ -67,24 +89,42 @@ def _device_usable() -> bool:
         return False
 
 
-def run(task) -> measure.Result:
+def run(task):
     try:
         inputs = _inputs(task.problem, task.seed)
-        plan = resolution(task)
+        if isinstance(task, Rivals):
+            plans = [plan_of(task.problem, task.path, *p) for p in task.plans]
+        else:
+            plan = resolution(task)
     except tuning_inputs.Unsupported as error:
-        return measure.Result(f"unsupported: {error}")
+        result = measure.Result(f"unsupported: {error}")
+        return [result] * len(task.plans) if isinstance(task, Rivals) else result
     except Exception as error:  # noqa: BLE001 - reported as the task's failure
         _cached.clear()
-        result = measure.Result(f"{type(error).__name__}: {str(error)[:500]}")
+        failed = measure.Result(f"{type(error).__name__}: {str(error)[:500]}")
+        results = [failed] * len(task.plans) if isinstance(task, Rivals) else [failed]
     else:
-        result = measure.measure(
-            inputs,
-            plan,
-            task.mode or measure.deploy_mode(task.problem),
-            task.iters,
-            task.warmup,
-            task.segments,
-        )
-    if not result.ok and not _device_usable():
-        raise Restart(measure.Result(f"{result.reason} (device unusable)"))
-    return result
+        mode = task.mode or measure.deploy_mode(task.problem)
+        if isinstance(task, Rivals):
+            results = measure.interleaved(
+                inputs, plans, mode, task.rounds, task.iters, task.warmup
+            )
+        else:
+            results = [
+                measure.measure(
+                    inputs,
+                    plan,
+                    mode,
+                    task.iters,
+                    task.warmup,
+                    task.segments,
+                    e2e=task.e2e,
+                )
+            ]
+    if not all(r.ok for r in results) and not _device_usable():
+        results = [
+            r if r.ok else measure.Result(f"{r.reason} (device unusable)")
+            for r in results
+        ]
+        raise Restart(results if isinstance(task, Rivals) else results[0])
+    return results if isinstance(task, Rivals) else results[0]

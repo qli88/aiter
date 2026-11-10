@@ -37,9 +37,20 @@ def moev2_selection():
     return names or "default"
 
 
+AITER_MOEV2_TUNED_PLANS = "AITER_MOEV2_TUNED_PLANS"
+
+
+@functools.cache
+def tuned_plans_file() -> str:
+    """`AITER_MOEV2_TUNED_PLANS`: the v2 tuner's plan file v2 dispatch reads first
+    (`dispatch.tuned_plans`); unset or empty: none."""
+    return os.environ.get(AITER_MOEV2_TUNED_PLANS, "").strip()
+
+
 def reload():
     """Forget cached values so the next accessor call re-reads the environment."""
     moev2_selection.cache_clear()
+    tuned_plans_file.cache_clear()
     from . import paths
 
     paths.reload()
