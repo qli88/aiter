@@ -16,7 +16,10 @@ reading the tuned tables, and only while `AITER_MOEV2_TUNED_PLANS` names the fil
 `comm_lookup` gives `CommFusedTemplate` a TP key's comm_fused row. Lookup is by exact
 key: no activation-agnostic or smaller-tier fallback. A file without the parallel
 columns (written before them) reads as local keys only; a file with columns this one
-does not have (the tuner's log file) is not read. A process reads the file once;
+does not have (the tuner's log file) is not read. Rows converted from a legacy tuned
+table (`convert`, `mode` "legacy") also hold its times (`INFO_COLUMNS`), which are not
+read; `mode` is not read either, so a converted row in this file is built as any
+row is. A process reads the file once;
 `digest()`, the sha256 of what it read, is part of the engine's plan agreement.
 """
 
@@ -35,6 +38,8 @@ KEY_COLUMNS = LOCAL_KEY_COLUMNS + PARALLEL_COLUMNS
 COMM_FUSED_PATH = "comm_fused"
 RUNNER = "comm_fused.stage2_rs"
 COLUMNS = KEY_COLUMNS + ("path", "structure", "candidates", "e2e_us", "mode")
+# A converted legacy row's times (`convert`), read by nothing.
+INFO_COLUMNS = ("us1", "us2", "us")
 STRUCTURE_SEPARATOR = " | "
 
 
@@ -84,7 +89,7 @@ def _winners(path):
     if isinstance(data, OSError):
         raise OSError(data.errno, data.strerror, data.filename)
     reader = csv.DictReader(io.StringIO(data.decode(), newline=""))
-    other = [c for c in reader.fieldnames or () if c not in COLUMNS]
+    other = [c for c in reader.fieldnames or () if c not in COLUMNS + INFO_COLUMNS]
     if other:
         raise ValueError(
             f"{path} has columns a v2 plan file does not ({', '.join(other)})"

@@ -45,12 +45,8 @@ import time
 
 import torch
 
-from aiter import ActivationType, QuantType
-from aiter.ops.flydsl.moe_common import GateMode
-
-from .. import api, paths
 from ..dispatch import tuned_plans
-from ..segments.flydsl_fhmoe import _is_dsv4_i384_fhmoe_contract
+from ..dispatch.convert import paths_taking, problem_of
 from . import collective, comm_search
 from . import task as tuning_task
 from .candidates import Filters
@@ -58,20 +54,6 @@ from .group import Group
 from .pool import Pool
 from .search import Settings, tune
 
-KEY_FIELDS = (
-    "token",
-    "model_dim",
-    "inter_dim",
-    "expert",
-    "topk",
-    "act_type",
-    "dtype",
-    "q_dtype_a",
-    "q_dtype_w",
-    "q_type",
-    "use_g1u1",
-    "doweight_stage1",
-)
 LOG_COLUMNS = tuned_plans.KEY_COLUMNS + (
     "path",
     "structure",
@@ -84,63 +66,6 @@ LOG_COLUMNS = tuned_plans.KEY_COLUMNS + (
     "reason",
     "notes",
 )
-
-
-def _dtype(text):
-    return getattr(torch, str(text).strip().replace("torch.", ""))
-
-
-def _enum(cls, text):
-    return getattr(cls, str(text).strip().split(".")[-1])
-
-
-def problem_of(row, arch, cu_num, fhmoe_table=None):
-    """The `MoeProblem` of an input row (a dict of strings); `fhmoe_table`: the row is
-    an FHMoE key, of that table where dispatch reads it."""
-    missing = [f for f in KEY_FIELDS if f not in row]
-    if missing:
-        raise ValueError(f"row without {missing}")
-    dtype = _dtype(row["dtype"])
-    q_dtype_a = _dtype(row["q_dtype_a"])
-    activation = _enum(ActivationType, row["act_type"])
-    args = (
-        int(row["token"]),
-        int(row["model_dim"]),
-        int(row["inter_dim"]),
-        int(row["expert"]),
-        int(row["topk"]),
-        dtype,
-        q_dtype_a,
-        _dtype(row["q_dtype_w"]),
-        _enum(QuantType, row["q_type"]),
-        bool(int(row["use_g1u1"])),
-        activation,
-        bool(int(row["doweight_stage1"])),
-        int(row.get("hidden_pad") or 0),
-        int(row.get("intermediate_pad") or 0),
-    )
-    kwargs = {"input_dtype": dtype}
-    if fhmoe_table is not None:
-        if row.get("gate_mode"):
-            gate_mode = _enum(GateMode, row["gate_mode"])
-        else:
-            fp8 = q_dtype_a in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-            gate_mode = GateMode.INTERLEAVE if fp8 else GateMode.SEPARATED
-        shape, pads = args[1:5], args[12:14]
-        doweight, q_dtype_w = args[11], args[7]
-        dedicated = _is_dsv4_i384_fhmoe_contract(
-            *shape,
-            *pads,
-            gate_mode,
-            doweight,
-            routed_mxfp4=q_dtype_w == torch.float4_e2m1fn_x2,
-        )
-        kwargs.update(
-            gate_mode=gate_mode, config_file=fhmoe_table if dedicated else None
-        )
-    return api.problem_from_key(
-        args, kwargs, arch, cu_num, fhmoe=fhmoe_table is not None
-    )
 
 
 def read_keys(files, arch, cu_num, fhmoe_table=None, log=print):
@@ -161,17 +86,6 @@ def read_keys(files, arch, cu_num, fhmoe_table=None, log=print):
     if other:
         log(f"skipped {other} rows of another gfx or CU count")
     return keys
-
-
-def paths_taking(problem, only=None):
-    return [
-        p.name
-        for p in paths.registered().values()
-        if p.segments
-        and p.takes is not None
-        and (not only or p.name in only)
-        and p.takes(problem)
-    ]
 
 
 def _log_row(keys, path, outcome) -> dict:

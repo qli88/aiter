@@ -17,7 +17,7 @@ from collections import defaultdict
 import pytest
 
 from aiter import ActivationType, QuantType, dtypes
-from aiter.moev2.dispatch import resolver
+from aiter.moev2.dispatch import convert, resolver
 from aiter.moev2.problem import MoeProblem, ParallelSpec, ScaleSpec, TailSpec
 from aiter.moev2.segments.base import Params
 from aiter.moev2.tuning import candidates as tc
@@ -1189,7 +1189,7 @@ def test_the_cli_writes_winners_logs_every_structure_and_resumes(tmp_path, monke
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
     keys = tmp_path / "keys.csv"
     keys.write_text(
-        ",".join(cli.KEY_FIELDS) + "\n"
+        ",".join(convert.KEY_FIELDS) + "\n"
         "64,4096,1024,32,4,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,"
         "torch.float8_e4m3fn,QuantType.per_Token,1,0\n"
     )
@@ -1438,19 +1438,37 @@ def test_the_cli_reads_keys_as_the_legacy_tuner_writes_them(tmp_path):
     values = ("64", "7168", "384", "385", "7", "ActivationType.Silu")
     values += ("torch.bfloat16", "torch.float8_e4m3fn", "torch.float4_e2m1fn_x2")
     values += ("QuantType.per_1x32", "1", "0")
-    row = dict(zip(cli.KEY_FIELDS, values))
+    row = dict(zip(convert.KEY_FIELDS, values))
     dsv4 = cli.problem_of(row, "gfx950", 256, fhmoe_table="t.csv")
     assert dsv4.gate_mode.value == "interleave"
     assert dsv4.shared is not None and dsv4.extras["tuned_table"] == "t.csv"
     assert cli.paths_taking(dsv4) == ["fhmoe"]
+    fp8_table = tmp_path / "fhmoe.csv"
+    fp8_table.write_text(
+        "model_dim,inter_dim,expert,topk,shared_expert_id,act_type,dtype,q_dtype_a,"
+        "q_dtype_w,q_type,use_g1u1,doweight_stage1,hidden_pad,intermediate_pad,"
+        "gate_mode\n"
+        "6144,256,257,9,256,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,"
+        "torch.float8_e4m3fn,QuantType.per_1x32,1,0,0,0,GateMode.INTERLEAVE\n"
+    )
     mxfp8 = dict(row, q_dtype_w="torch.float8_e4m3fn")
-    main_table = cli.problem_of(mxfp8, "gfx950", 256, fhmoe_table="t.csv")
+    main_table = cli.problem_of(mxfp8, "gfx950", 256, fhmoe_table=str(fp8_table))
     assert main_table.shared is not None and "tuned_table" not in main_table.extras
     assert cli.paths_taking(main_table) == ["fhmoe"]
+    declared = dict(mxfp8, model_dim="6144", inter_dim="256", expert="257", topk="9")
+    dedicated = cli.problem_of(declared, "gfx950", 256, fhmoe_table=str(fp8_table))
+    assert dedicated.extras["tuned_table"] == str(fp8_table)
+    with pytest.raises(ValueError, match="partially matches"):
+        cli.problem_of(
+            dict(declared, gate_mode="GateMode.SEPARATED"),
+            "gfx950",
+            256,
+            fhmoe_table=str(fp8_table),
+        )
 
     blank = tmp_path / "blank.csv"
     blank.write_text(
-        "gfx,cu_num," + ",".join(cli.KEY_FIELDS) + "\n"
+        "gfx,cu_num," + ",".join(convert.KEY_FIELDS) + "\n"
         ",,64,4096,1024,32,4,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,"
         "torch.float8_e4m3fn,QuantType.per_Token,1,0\n"
     )

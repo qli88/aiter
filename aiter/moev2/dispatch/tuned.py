@@ -207,6 +207,12 @@ def lookup_keys(problem):
     return keys, keys_disabled
 
 
+def exact_key(problem):
+    """The key of `problem`'s exact row, the first `lookup` tries."""
+    keys = problem.log_keys()
+    return keys[:7] + (str(problem.activation.activation),) + keys[8:]
+
+
 def lookup(problem, tables=None):
     """The tuned row for `problem` (the legacy `_lookup_cfg`), or None.
 
@@ -216,11 +222,11 @@ def lookup(problem, tables=None):
     c2s = table_for(problem) if tables is None else tables
     if not c2s:
         return None
-    keys, keys_disabled = lookup_keys(problem)
+    _, keys_disabled = lookup_keys(problem)
     dedicated = problem.extras.get("tuned_table") is not None
     token = problem.shape.m
     primary, fallback = c2s
-    lookup_keys_ = keys[:7] + (str(problem.activation.activation),) + keys[8:]
+    lookup_keys_ = exact_key(problem)
     result = primary.get(lookup_keys_, None)
     if result is None and not dedicated:
         result = fallback.get(keys_disabled, None)
