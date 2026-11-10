@@ -32,7 +32,7 @@ from ..segments.defaults import (
 from ..segments.mxfp4 import mx_token
 from ..segments.sort import AUX_SORT_OPUS
 from ..segments.whole_graph import FusedMoeImplResolutionError, resolve_fused_moe_impl
-from . import kernel_names, overrides, profile, ranking, tuned, tuned_plans
+from . import kernel_names, overrides, ranking, tuned, tuned_plans
 from .buf import CALL_INPUT
 from .ops import Op, chain
 from .plan import MoePlan, SegmentChoice
@@ -562,9 +562,6 @@ def resolve(problem, segments) -> Resolution:
         note(f"selected {plan.describe()}")
         metadata = MOEMetadata(None, None, block_m, ksplit, full_impl=full_impl)
         return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))
-    for _row in profile.exact(problem):
-        pass  # no profile files are read yet
-
     if problem.extras.get("tuned_table") is not None and (
         cfg is None or bypass_tuned_config
     ):

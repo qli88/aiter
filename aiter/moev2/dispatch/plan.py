@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from ..segments.base import Params, Segment
 from .buf import Buf
 
-SOURCES = ("override", "tuned", "profile", "online", "default")
+SOURCES = ("override", "tuned", "online", "default")
 
 
 @dataclass(frozen=True)

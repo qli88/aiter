@@ -188,8 +188,9 @@ class PlanSource:
 
     `resolve(bucket, graph_capture)`: the `BucketPlan` of a bucket, or raise
     NotImplementedError with the reason. `digests()`: names and digests of the data the
-    plans come from (tuned tables), part of the agreement check. `check_weights(w)`:
-    raise ValueError if `w` is not in the layout the plans were resolved for.
+    plans come from (tuned tables, the v2 plan file), part of the agreement check.
+    `check_weights(w)`: raise ValueError if `w` is not in the layout the plans were
+    resolved for.
     `weight_layout()`: that layout. `serves_parallel`: whether its plans implement a
     `ParallelSpec` (their segments communicate); a source that does not runs only
     engines without one.
@@ -920,9 +921,12 @@ class LocalTemplate(PlanSource):
             self._run(x, ids, topk_weights, self.weights, {}, {}, None)
 
     def digests(self) -> dict:
-        from .dispatch import tuned
+        from .dispatch import tuned, tuned_plans
 
-        return {"tuned_table": file_digest(tuned.default_table_file())}
+        return {
+            "tuned_table": file_digest(tuned.default_table_file()),
+            "v2_plan_file": tuned_plans.digest(),
+        }
 
     def check_weights(self, weights: MoeWeights) -> None:
         theirs = _weights_signature(weights)

@@ -1261,6 +1261,62 @@ def test_the_cli_writes_winners_logs_every_structure_and_resumes(tmp_path, monke
         cli.main([str(keys), "-o", str(other), "--devices", "0"])
 
 
+def test_the_plan_file_digest_is_of_what_the_process_read(tmp_path, monkeypatch):
+    import csv
+    import hashlib
+
+    from aiter.moev2 import envs
+    from aiter.moev2.dispatch import tuned, tuned_plans
+    from aiter.moev2.tuning import cli, search
+
+    def named(path):
+        if path is None:
+            monkeypatch.delenv(envs.AITER_MOEV2_TUNED_PLANS, raising=False)
+        else:
+            monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(path))
+        tuned.clear_cache()
+
+    def sha(data):
+        return hashlib.sha256(data).hexdigest()
+
+    named(None)
+    assert tuned_plans.digest() is None
+    problem = _ptok()
+    winner = search.tune(problem, "a8w8_ptok", _FakeMeasure())[0]
+    plan_file = tmp_path / "plans.csv"
+    with open(plan_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, tuned_plans.COLUMNS)
+        writer.writeheader()
+        writer.writerow(
+            cli._plan_row(tuned_plans.key_values(problem), "a8w8_ptok", winner)
+        )
+    first = plan_file.read_bytes()
+    named(plan_file)
+    rows = tuned_plans.lookup(problem)
+    assert rows == ((winner.structure, winner.candidates),)
+    plan_file.write_text(",".join(tuned_plans.COLUMNS) + "\n")
+    # The engine digests after resolving: the digest is of the read the rows came from.
+    assert tuned_plans.digest() == sha(first)
+    assert tuned_plans.lookup(problem) == rows
+    tuned.clear_cache()
+    assert tuned_plans.digest() == sha(plan_file.read_bytes())
+    assert tuned_plans.lookup(problem) == ()
+    plan_file.write_bytes(b"\xff\xfe")
+    tuned.clear_cache()
+    assert tuned_plans.digest() == sha(b"\xff\xfe")
+    with pytest.raises(ValueError):
+        tuned_plans.lookup(problem)
+    named(tmp_path / "missing.csv")
+    assert tuned_plans.digest() == "missing"
+    (tmp_path / "missing.csv").write_bytes(first)
+    assert tuned_plans.digest() == "missing"
+    with pytest.raises(FileNotFoundError):
+        tuned_plans.lookup(problem)
+    tuned.clear_cache()
+    assert tuned_plans.digest() == sha(first)
+    named(None)
+
+
 def test_the_plan_file_round_trips_and_resolve_reads_it_only_when_named(
     tmp_path, monkeypatch
 ):

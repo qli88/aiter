@@ -16,10 +16,13 @@ reading the tuned tables, and only while `AITER_MOEV2_TUNED_PLANS` names the fil
 `comm_lookup` gives `CommFusedTemplate` a TP key's comm_fused row. Lookup is by exact
 key: no activation-agnostic or smaller-tier fallback. A file without the parallel
 columns (written before them) reads as local keys only; a file with columns this one
-does not have (the tuner's log file) is not read.
+does not have (the tuner's log file) is not read. A process reads the file once;
+`digest()`, the sha256 of what it read, is part of the engine's plan agreement.
 """
 
 import csv
+import hashlib
+import io
 import json
 
 from .. import envs
@@ -64,24 +67,47 @@ def structure_names(text) -> tuple:
 
 
 @cached
+def _content(path) -> tuple:
+    """`(sha256, bytes)` of the file, or `("missing", the OSError)`."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as exc:
+        return "missing", exc
+    return hashlib.sha256(data).hexdigest(), data
+
+
+@cached
 def _winners(path):
     winners = {}
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        other = [c for c in reader.fieldnames or () if c not in COLUMNS]
-        if other:
-            raise ValueError(
-                f"{path} has columns a v2 plan file does not ({', '.join(other)})"
-            )
-        for row in reader:
-            key = tuple(row.get(c) or "" for c in KEY_COLUMNS)
-            if row["path"] in winners.setdefault(key, {}):
-                raise ValueError(f"{path}: two rows for {key} on {row['path']}")
-            winners[key][row["path"]] = (
-                structure_names(row["structure"]),
-                decode_candidates(row["candidates"]) if row["candidates"] else {},
-            )
+    data = _content(path)[1]
+    if isinstance(data, OSError):
+        raise OSError(data.errno, data.strerror, data.filename)
+    reader = csv.DictReader(io.StringIO(data.decode(), newline=""))
+    other = [c for c in reader.fieldnames or () if c not in COLUMNS]
+    if other:
+        raise ValueError(
+            f"{path} has columns a v2 plan file does not ({', '.join(other)})"
+        )
+    for row in reader:
+        key = tuple(row.get(c) or "" for c in KEY_COLUMNS)
+        if row["path"] in winners.setdefault(key, {}):
+            raise ValueError(f"{path}: two rows for {key} on {row['path']}")
+        winners[key][row["path"]] = (
+            structure_names(row["structure"]),
+            decode_candidates(row["candidates"]) if row["candidates"] else {},
+        )
     return winners
+
+
+def digest():
+    """The sha256 of the file `AITER_MOEV2_TUNED_PLANS` names, as this process read it
+    (its rows come from that read), "missing" when that read failed, None with no file
+    named. A failed read is kept as a read is, until `tuned.clear_cache()`."""
+    path = envs.tuned_plans_file()
+    if not path:
+        return None
+    return _content(path)[0]
 
 
 def lookup(problem) -> tuple:

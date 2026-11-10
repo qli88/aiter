@@ -203,8 +203,9 @@ class CommFusedTemplate(LocalTemplate):
     would not fit the flat-VA stride. The runner set is then built over the resulting
     configs (the Window MXFP8 fallback applied to the rows' as to the table's), or is
     the table's own when they are the table's.
-    Buckets without a row are as above. Each rank reads the file on its own; `prepare`
-    fails on every rank unless all read the same rows.
+    Buckets without a row are as above. Each rank reads the file on its own; the
+    engine's `prepare` fails on every rank unless all read the same file (its digest
+    is in the agreement), and the segments' `prepare` unless all use the same rows.
     """
 
     tp_size: int = 1
