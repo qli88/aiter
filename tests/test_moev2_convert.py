@@ -61,6 +61,12 @@ _ROWS = {
         "243.2977,cktile_a8w4_bm64,164.2256,opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_"
         "rbn3072,407.5233,0,0,0,0"
     ),
+    "flydsl_layout_plain_stage1": (
+        "gfx950,256,1024,7168,256,257,9,ActivationType.Silu,torch.bfloat16,"
+        "torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,64,0,"
+        "97.2441,flydsl_moe1_afp4_wfp4_bf16_t64x64x256_w4,103.6032,"
+        "flydsl_moe2_layout_afp4_wfp4_bf16_t64x256x256_reduce_sbm64,200.8473,0,0,0,0"
+    ),
     "asm_1stage_flat_xbf16": (
         "gfx950,256,1,8192,256,512,10,ActivationType.Silu,torch.bfloat16,"
         "torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,"
@@ -183,6 +189,101 @@ def test_cells_read_a_row_as_dispatch_does():
         "xbf16": 0,
         "flat": 0,
     }
+
+
+_PLAIN = "flydsl_moe1_afp4_wfp4_bf16_t64x64x256_w4"
+_LAYOUT_FP4 = "flydsl_moe2_layout_afp4_wfp4_bf16_t64x256x256_reduce_sbm64"
+_LAYOUT_FP8 = "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x256_atomic_nt_sbm32"
+
+
+def test_a_plain_layout_stage1_name_is_held_as_its_twin():
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    assert convert.v2_kernel1(_PLAIN, _LAYOUT_FP4) == f"{_PLAIN}_fp4"
+    plain8 = "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w3_gui"
+    assert convert.v2_kernel1(plain8, _LAYOUT_FP8) == f"{plain8}_fp8"
+    twin = get_flydsl_kernel_params(f"{_PLAIN}_fp4")
+    assert twin == {**get_flydsl_kernel_params(_PLAIN), "out_dtype": "fp4"}
+    token_major = "flydsl_moe2_afp4_wfp4_bf16_t64x256x256_reduce"
+    for kernel1, kernel2 in (
+        (f"{_PLAIN}_fp4", _LAYOUT_FP4),
+        (f"{_PLAIN}_fp8", _LAYOUT_FP4),
+        (_PLAIN, token_major),
+        (_PLAIN, ""),
+        ("flydsl_moe1_afp4_wfp4_bf16_t64x64x256_bogus", _LAYOUT_FP4),
+        ("opus_moe1_afp8_wfp4_bf16_t32x384_pair_kw7_m3", _LAYOUT_FP8),
+        ("moe_ck2stages_gemm1_x", _LAYOUT_FP4),
+        ("", _LAYOUT_FP4),
+    ):
+        assert convert.v2_kernel1(kernel1, kernel2) == kernel1, kernel1
+    row = {"kernelName1": _PLAIN, "kernelName2": _LAYOUT_FP4, "block_m": 64}
+    assert convert.cells(row)["kernelName1"] == f"{_PLAIN}_fp4"
+    where = "the row"
+    assert tuned_table.legacy_cells(row, where)["kernelName1"] == f"{_PLAIN}_fp4"
+
+
+def test_a_plain_layout_stage1_plan_row_runs_as_its_twin(tmp_path, monkeypatch):
+    _, table = _table(tmp_path, _MAIN_HEADER, [_ROWS["flydsl_layout_plain_stage1"]])
+    (out,), skipped = convert.convert_table(table, "gfx950", 256)
+    assert skipped == []
+    candidates = json.loads(out["candidates"])
+    assert candidates["flydsl.gemm1_layout"]["kernel"] == f"{_PLAIN}_fp4"
+    assert candidates["flydsl_layout.gemm2"]["kernel"] == _LAYOUT_FP4
+    (key,) = table[0]
+    problem = convert.problem_of(
+        dict(zip(tuned.index_columns(False), key)), "gfx950", 256
+    )
+    segments = paths.registered()[out["path"]].segments
+    twin = _outcome_reading(_plan_file(tmp_path, [out]), problem, segments, monkeypatch)
+    plain_candidates = json.dumps(candidates).replace(f"{_PLAIN}_fp4", _PLAIN)
+    plain_row = {**out, "candidates": plain_candidates}
+    plain = _outcome_reading(
+        _plan_file(tmp_path, [plain_row]), problem, segments, monkeypatch
+    )
+    assert twin[0] == plain[0] == "tuned"
+    assert f"{_PLAIN}_fp4" in twin[1]
+    assert tuple(t.replace(f"{_PLAIN}_fp4", _PLAIN) for t in twin) == plain
+
+
+def test_the_differential_maps_legacy_s_plain_stage1_name():
+    from moe_dispatch import differential
+
+    renamed = _LAYOUT_FP4.replace("_afp4_", "_afp8_", 1)
+    assert differential.legacy_stage1_as_v2(_PLAIN, _LAYOUT_FP4) == f"{_PLAIN}_fp4"
+    assert differential.legacy_stage1_as_v2(_PLAIN, renamed) == f"{_PLAIN}_fp4"
+    plain8 = "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w3_gui"
+    assert differential.legacy_stage1_as_v2(plain8, _LAYOUT_FP8) == f"{plain8}_fp8"
+    stage2 = {"fn": "fused_moe._flydsl_v2_stage2_wrapper"}
+    record = {
+        "block_m": 64,
+        "stage1": {"fn": "f", "kw": {"kernelName": _PLAIN, "out_dtype": "fp4"}},
+        "stage2": {**stage2, "kw": {"kernelName": _LAYOUT_FP4}},
+    }
+    mapped = differential.as_v2_record(record)
+    assert mapped["stage1"]["kw"] == {
+        "kernelName": f"{_PLAIN}_fp4",
+        "out_dtype": "fp4",
+    }
+    assert {k: v for k, v in mapped.items() if k != "stage1"} == {
+        k: v for k, v in record.items() if k != "stage1"
+    }
+    assert record["stage1"]["kw"]["kernelName"] == _PLAIN
+    for unchanged in (
+        {"error": "x"},
+        {**record, "stage2": None},
+        {**record, "stage2": {**stage2, "kw": {"kernelName": "opus_moe2_x"}}},
+    ):
+        assert differential.as_v2_record(unchanged) == unchanged
+    line = (
+        f"[fused_moe] using 2stage (kernelName1='{_PLAIN}', "
+        f"kernelName2='{_LAYOUT_FP4}') for (key) "
+    )
+    one_stage = "[fused_moe] using 1stage (kernelName1='k', kernelName2='Null') for k "
+    assert differential._as_v2_logs([(20, line), (20, one_stage), (30, "other")]) == [
+        (20, line.replace(f"'{_PLAIN}'", f"'{_PLAIN}_fp4'")),
+        (20, one_stage.replace("'Null'", "''")),
+        (30, "other"),
+    ]
 
 
 def _check_main_row(line, arch, cu_num, tmp_path, monkeypatch):

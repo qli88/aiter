@@ -63,9 +63,59 @@ _ONE_STAGE_KERNEL2 = re.compile(
 )
 
 
+def legacy_stage1_as_v2(kernel_name1, kernel_name2) -> str:
+    """The stage 1 name v2 runs where legacy runs `kernel_name1` before the GEMM2
+    `kernel_name2` it launches: `convert.v2_kernel1` of the tuned names (an fp8 GEMM2
+    input renames an fp4 layout GEMM2 after an fp4 stage 1, `stage2_kernel`)."""
+    from aiter.moev2.dispatch.convert import v2_kernel1
+
+    if kernel_name1.startswith("flydsl_moe1_afp4_"):
+        kernel_name2 = kernel_name2.replace(
+            "flydsl_moe2_layout_afp8_", "flydsl_moe2_layout_afp4_", 1
+        )
+    return v2_kernel1(kernel_name1, kernel_name2)
+
+
+# A 2-stage row's names as both log them.
+_TWO_STAGE_KERNELS = re.compile(
+    r"(using 2stage \(kernelName1=')([^']*)(', kernelName2=')([^']*)('\))"
+)
+
+
+def _two_stage_as_v2(match):
+    head, kernel1, middle, kernel2, tail = match.groups()
+    return head + legacy_stage1_as_v2(kernel1, kernel2) + middle + kernel2 + tail
+
+
 def _as_v2_logs(logs):
-    """Legacy's log lines `logs` with a 1-stage row's kernelName2 as v2 logs it."""
-    return [(level, _ONE_STAGE_KERNEL2.sub(r"\1'')", line)) for level, line in logs]
+    """Legacy's log lines `logs` with a 1-stage row's kernelName2 and a 2-stage
+    row's kernelName1 (`legacy_stage1_as_v2`) as v2 logs them."""
+    return [
+        (
+            level,
+            _TWO_STAGE_KERNELS.sub(
+                _two_stage_as_v2, _ONE_STAGE_KERNEL2.sub(r"\1'')", line)
+            ),
+        )
+        for level, line in logs
+    ]
+
+
+def as_v2_record(record):
+    """Legacy's dispatch record with its stage 1 name as v2 runs it
+    (`legacy_stage1_as_v2`)."""
+    stage1, stage2 = record.get("stage1"), record.get("stage2")
+    if not (isinstance(stage1, dict) and isinstance(stage2, dict)):
+        return record
+    kernel1 = stage1.get("kw", {}).get("kernelName")
+    kernel2 = stage2.get("kw", {}).get("kernelName")
+    if not (isinstance(kernel1, str) and isinstance(kernel2, str)):
+        return record
+    renamed = legacy_stage1_as_v2(kernel1, kernel2)
+    if renamed == kernel1:
+        return record
+    kw = {**stage1["kw"], "kernelName": renamed}
+    return {**record, "stage1": {**stage1, "kw": kw}}
 
 
 def _legacy_logs(key):
@@ -146,7 +196,7 @@ def legacy_fhmoe(key):
     with captured_logs() as logs:
         try:
             metadata = fm.get_2stage_cfgs.__wrapped__(*key.args, **key.call_kwargs())
-            got = record.normalize(_use_fhmoe_wrappers(metadata))
+            got = as_v2_record(record.normalize(_use_fhmoe_wrappers(metadata)))
         except Exception as exc:  # noqa: BLE001
             got = record.error_record(exc)
     return got, _as_v2_logs(logs)
@@ -318,7 +368,7 @@ def compare(arch, check_logs=True, live=False):
                     continue
                 claimed[label] = path.name
                 got = plan if isinstance(plan, dict) else record.normalize(plan)
-                expected = snapshot.resolve_same_as_base(golden, label)
+                expected = as_v2_record(snapshot.resolve_same_as_base(golden, label))
                 if got != expected:
                     problems.append(
                         f"{label} [{path.name}]\n"
@@ -509,6 +559,18 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
             continue
         pairs = [(i, x, y) for i, (x, y) in enumerate(zip(a.args, b.args))]
         pairs += [(k, a.keywords[k], b.keywords[k]) for k in a.keywords]
+        if name == "stage1" and isinstance(a.keywords.get("kernelName"), str):
+            kernel2 = dict(legacy).get("stage2")
+            kernel2 = getattr(kernel2, "keywords", {}).get("kernelName")
+            if isinstance(kernel2, str):
+                pairs = [
+                    (
+                        (k, legacy_stage1_as_v2(x, kernel2), y)
+                        if k == "kernelName"
+                        else (k, x, y)
+                    )
+                    for k, x, y in pairs
+                ]
         if name == "stage1" and _own_stage1_buffer(a):
             pairs = [pair for pair in pairs if pair[0] != 6]
         if name == "stage1" and (a.keywords.get("split_k") or 1) > 1:

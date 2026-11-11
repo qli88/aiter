@@ -7,7 +7,8 @@ shuffled weights, no bias, no expert mask: `problem_of`), keyed as dispatch look
 call up. The structure is the one `match_row` puts the row on there; the candidates
 hold the cells dispatch reads, which `resolver.candidate_row` gives back (`cells`):
 each tunable segment's kernel (stage 1's kernelName1, stage 2's kernelName2, a 1-stage
-segment's kernelName1) with the row's block_m, ksplit, nt, xbf16 and flat. A 1-stage
+segment's kernelName1; a plain FlyDSL stage 1 before a layout GEMM2 as the twin it runs
+as, `v2_kernel1`) with the row's block_m, ksplit, nt, xbf16 and flat. A 1-stage
 row's kernelName2 (empty, "Null" or a blank cell) is not kept: dispatch picks and
 discards alike for the three, and logs it as empty. `e2e_us` is the row's `us`; `us1`,
 `us2` and `us` (`INFO_COLUMNS`) are kept as the table reads them (numbers as Python
@@ -168,14 +169,37 @@ def _text(value) -> str:
     return "" if _blank(value) else str(value)
 
 
+def v2_kernel1(kernel_name1, kernel_name2) -> str:
+    """The name v2 holds for a legacy row's stage 1 `kernel_name1`: a plain FlyDSL
+    stage 1 before a layout GEMM2 (`flydsl_moe2_layout_*`) runs as its `_fp4` /
+    `_fp8` twin, the GEMM2's input dtype (`FlydslGemm1Layout.build`), so it is held
+    as the twin when the registry has one with the same params; any other name as
+    is."""
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+    from ..segments.flydsl import _get_flydsl_moe_kernels
+
+    gemm2 = parse_flydsl_v2_gemm2_kernel(kernel_name2)
+    if gemm2 is None:
+        return kernel_name1
+    registry = _get_flydsl_moe_kernels()
+    plain = registry.get_flydsl_kernel_params(kernel_name1)
+    twin = f"{kernel_name1}_{gemm2['a_dtype']}"
+    params = registry.get_flydsl_kernel_params(twin)
+    if plain is None or params != {**plain, "out_dtype": gemm2["a_dtype"]}:
+        return kernel_name1
+    return twin
+
+
 def cells(row) -> dict:
-    """The cells of legacy tuned `row` dispatch reads, as it reads them, in
-    `resolver.candidate_row`'s form."""
+    """The cells of legacy tuned `row` dispatch reads, as it reads them (stage 1's
+    name as v2 holds it, `v2_kernel1`), in `resolver.candidate_row`'s form."""
     nt, run_1stage, xbf16, flat = resolver._row_values(row)
     one_stage = bool(run_1stage)
+    kernel_name2 = "" if one_stage else _text(row.get("kernelName2"))
     return {
-        "kernelName1": _text(row.get("kernelName1")),
-        "kernelName2": "" if one_stage else _text(row.get("kernelName2")),
+        "kernelName1": v2_kernel1(_text(row.get("kernelName1")), kernel_name2),
+        "kernelName2": kernel_name2,
         "block_m": int(row.get("block_m", BLOCK_SIZE_M)),
         "ksplit": int(row.get("ksplit", 0)),
         "nt": int(bool(nt)),
