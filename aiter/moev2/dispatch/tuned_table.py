@@ -23,8 +23,11 @@ A table holds, per key, the legacy row's cells (`resolver.candidate_row`'s form,
 plan-file row of mode "legacy" or a legacy table's row), which `resolver.resolve` runs
 as the legacy row with its fallbacks (`lookup`: exact key, then the activation-agnostic
 row, then smaller token tiers; a dedicated table exact only), and the tuner's rows
-(any other mode), by exact key, which `resolver.resolve` builds first. Comm_fused rows
-are the tuner's (`comm_lookup`).
+(any other mode), by exact key, which `resolver.resolve` builds first. A comm_fused
+row (`comm_lookup`, by exact key with the collective's columns) is the tuner's, or a
+legacy row's runner with the cells of the a8w4 plan it runs with (`CommCells`: a
+plan-file row of mode "legacy", or a legacy table's `comm_fused_configs` entry, checked
+as legacy's winner table checks it).
 
 v2 does not read legacy's `AITER_CONFIG_FMOE` or `AITER_CONFIG_FHMOE`: while one is set
 the legacy entry points take their calls back (`paths.route_to_v2`); reading the table
@@ -35,6 +38,7 @@ import csv
 import functools
 import hashlib
 import io
+import json
 import math
 import pathlib
 from dataclasses import dataclass, field
@@ -115,10 +119,21 @@ class Table:
     fallback: dict = field(default_factory=dict)
     # key (`tuned_plans.KEY_COLUMNS` values) -> {path: (structure names, candidates)}
     tuner: dict = field(default_factory=dict)
+    # key with the collective's columns -> the legacy comm_fused row's `CommCells`
+    comm: dict = field(default_factory=dict)
 
     def all_keys(self) -> set:
         blank = ("",) * (len(tuned_plans.KEY_COLUMNS) - _LOCAL)
-        return {k + blank for k in self.cells} | set(self.tuner)
+        return {k + blank for k in self.cells} | set(self.tuner) | set(self.comm)
+
+
+@dataclass(frozen=True)
+class CommCells:
+    """A legacy comm_fused row: its runner (`Params`: the family and the config's
+    params, flat) and the cells of the a8w4 plan it runs with."""
+
+    runner: object
+    cells: dict
 
 
 @dataclass(frozen=True)
@@ -217,6 +232,117 @@ def legacy_cells(row, where) -> dict:
     return row_cells
 
 
+_COMM_MODES = ("ar", "rs")
+_COMM_ENTRY_FIELDS = frozenset(
+    {"family", "params", "tp", "add_shared", "gpu_model", "us"}
+)
+
+
+def _whole(value, what) -> int:
+    if isinstance(value, bool) or not float(value).is_integer():
+        raise ValueError(f"{what} {value!r} is not a whole number")
+    return int(float(value))
+
+
+def has_comm_configs(row) -> bool:
+    """Whether legacy `row` has a `comm_fused_configs` value (`_comm_configs`)."""
+    raw = row.get("comm_fused_configs")
+    return not _blank(raw) and str(raw).strip() not in ("", "nan", "0")
+
+
+def _check_runner(row, comm, tp, add_shared, entry) -> None:
+    """Raise where legacy's winner table raises for the runner `entry` (`family`,
+    `params`) of mode `comm` on legacy `row` (its key columns and `block_m`)."""
+    from aiter.ops.flydsl.comm_fused_moe_host import ShapeKey, _config
+
+    shape = ShapeKey(
+        str(row["gfx"]),
+        _whole(row["model_dim"], "model_dim"),
+        _whole(row["inter_dim"], "inter_dim"),
+        _whole(row["expert"], "expert"),
+        _whole(row["topk"], "topk"),
+        tp,
+        add_shared=add_shared,
+        comm=comm,
+    )
+    token = _whole(row["token"], "token")
+    config = _config(entry, shape.kernel_shape(), token, comm)
+    block_m = _whole(row["block_m"], "block_m")
+    if config.sort_block_m != block_m:
+        raise ValueError(
+            f"comm_fused sort_block_m={config.sort_block_m} does not match "
+            f"CSV block_m={block_m}"
+        )
+
+
+def legacy_comm_entries(row, where) -> list:
+    """`[(tp, comm, add_shared, gpu_model, runner Params, us)]` of the
+    `comm_fused_configs` of legacy tuned `row` (its key columns included; `where`: the
+    file and key, for the error), checked as legacy's winner table checks them
+    (`_winner_table`); raises where it raises."""
+    from ..segments.base import Params
+
+    if not has_comm_configs(row):
+        return []
+    try:
+        configs = json.loads(row["comm_fused_configs"])
+        if not isinstance(configs, dict):
+            raise TypeError("comm_fused_configs must be a JSON object")
+        unknown = sorted(set(configs) - set(_COMM_MODES))
+        if unknown:
+            raise ValueError(f"unsupported comm_fused modes: {unknown}")
+        entries = []
+        for comm, entry in configs.items():
+            if not isinstance(entry, dict):
+                raise TypeError(f"comm_fused_configs[{comm!r}] must be a JSON object")
+            unknown = sorted(set(entry) - _COMM_ENTRY_FIELDS)
+            if unknown:
+                raise ValueError(
+                    f"unsupported comm_fused_configs[{comm!r}] fields: {unknown}"
+                )
+            tp = _whole(entry["tp"], f"comm_fused_configs.{comm}.tp")
+            add_shared = entry.get("add_shared")
+            if not isinstance(add_shared, bool):
+                raise TypeError(
+                    f"comm_fused_configs[{comm!r}].add_shared must be boolean"
+                )
+            gpu_model = entry.get("gpu_model")
+            if not isinstance(gpu_model, str) or not gpu_model.strip():
+                raise ValueError(
+                    f"comm_fused_configs[{comm!r}].gpu_model must be a non-empty string"
+                )
+            _check_runner(row, comm, tp, add_shared, entry)
+            runner = Params(family=entry["family"], **entry["params"])
+            entries.append(
+                (
+                    tp,
+                    comm,
+                    add_shared,
+                    gpu_model.strip().lower(),
+                    runner,
+                    entry.get("us"),
+                )
+            )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{where}: {error}") from error
+    return entries
+
+
+def comm_row_text(row) -> str:
+    """A comm_fused row (`comm_lookup`'s) as text, equal for equal rows."""
+    if isinstance(row, CommCells):
+        return json.dumps(
+            {"runner": dict(row.runner), "cells": row.cells}, sort_keys=True
+        )
+    names, candidates = row
+    return json.dumps(
+        {
+            "structure": list(names),
+            "candidates": tuned_plans.encode_candidates(candidates),
+        }
+    )
+
+
 @cached
 def _segments(path) -> dict:
     from .. import paths
@@ -227,17 +353,33 @@ def _segments(path) -> dict:
     return {s.name: s for s in registered[path].segments}
 
 
-def _plan_cells(row) -> dict:
+def _plan_cells(path, structure, candidates) -> dict:
     from .resolver import candidate_row
 
-    segments = _segments(row["path"])
-    names = tuned_plans.structure_names(row["structure"])
+    segments = _segments(path)
+    names = tuned_plans.structure_names(structure)
     unknown = [n for n in names if n not in segments]
     if unknown:
-        raise ValueError(f"segments {unknown} are not on path {row['path']}")
-    return candidate_row(
-        [segments[n] for n in names], tuned_plans.decode_candidates(row["candidates"])
-    )
+        raise ValueError(f"segments {unknown} are not on path {path}")
+    return candidate_row([segments[n] for n in names], candidates)
+
+
+def _check_plan_runner(key, runner, cells) -> None:
+    """Raise for a legacy comm_fused plan row (22-column `key`) whose collective
+    columns or `runner` legacy's winner table would reject."""
+    named = dict(zip(tuned_plans.KEY_COLUMNS, key))
+    if named["add_shared"] not in ("True", "False"):
+        raise TypeError(f"add_shared {named['add_shared']!r} is not True or False")
+    if (
+        not named["gpu_model"].strip()
+        or named["gpu_model"] != named["gpu_model"].lower()
+    ):
+        raise ValueError(f"gpu_model {named['gpu_model']!r} is not a lowercase name")
+    params = dict(runner)
+    entry = {"family": params.pop("family", None), "params": params}
+    tp = _whole(named["tp"], "tp")
+    add_shared = named["add_shared"] == "True"
+    _check_runner({**named, **cells}, named["comm"], tp, add_shared, entry)
 
 
 def _plan_table(text, name) -> Table:
@@ -258,9 +400,27 @@ def _plan_table(text, name) -> Table:
                     ),
                 )
                 continue
-            if any(key[_LOCAL:]):
-                raise ValueError("a legacy row with collective columns")
-            row_cells = _plan_cells(row)
+            candidates = tuned_plans.decode_candidates(row["candidates"])
+            comm_fused = row["path"] == tuned_plans.COMM_FUSED_PATH
+            if any(key[_LOCAL:]) and not all(key[_LOCAL:]):
+                raise ValueError("a legacy row with some collective columns blank")
+            if comm_fused != any(key[_LOCAL:]):
+                raise ValueError(
+                    "a legacy comm_fused row without collective columns"
+                    if comm_fused
+                    else "a legacy row with collective columns"
+                )
+            if comm_fused:
+                runner = candidates.pop(tuned_plans.RUNNER, None)
+                if runner is None:
+                    raise ValueError("a legacy comm_fused row without a runner")
+                cells = _plan_cells(
+                    tuned_plans.COMM_FUSED_LOCAL_PATH, row["structure"], candidates
+                )
+                _check_plan_runner(key, runner, cells)
+                table.comm[key] = CommCells(runner, cells)
+                continue
+            row_cells = _plan_cells(row["path"], row["structure"], candidates)
         except (TypeError, ValueError, KeyError) as error:
             raise ValueError(f"{name}: the row of {key} on {row['path']}: {error}")
         held = table.cells.setdefault(key[:_LOCAL], row_cells)
@@ -273,14 +433,35 @@ def _plan_table(text, name) -> Table:
     return table
 
 
+def _rows_with_comm_configs(name) -> int:
+    with open(name, newline="") as f:
+        return sum(has_comm_configs(row) for row in csv.DictReader(f))
+
+
 def _legacy_table(name, header) -> Table:
     dedicated = set(tuned.DEDICATED_INDEX_COLUMNS) <= set(header)
     columns = tuned.index_columns(dedicated)
     primary, fallback = tuned.read_table(name, columns, dedicated)
-    table = Table()
+    table, held = Table(), 0
     for key, row in primary.items():
         text = legacy_key(columns, key)
-        table.cells[text] = legacy_cells(row, f"{name}: the row of {key}")
+        where = f"{name}: the row of {key}"
+        table.cells[text] = legacy_cells(row, where)
+        if dedicated and has_comm_configs(row):
+            raise ValueError(
+                f"{where}: comm_fused_configs in an FHMoE table, which legacy does not "
+                "read"
+            )
+        held += has_comm_configs(row)
+        entries = legacy_comm_entries({**dict(zip(columns, key)), **row}, where)
+        for tp, comm, add_shared, gpu_model, runner, _ in entries:
+            collective = (str(tp), comm, str(add_shared), gpu_model)
+            table.comm[text + collective] = CommCells(runner, table.cells[text])
+    if held != _rows_with_comm_configs(name):
+        raise ValueError(
+            f"{name}: comm_fused_configs on rows the reader drops (a flydsl_fallback "
+            "row, or the second of two rows of a key), which legacy's winner table reads"
+        )
     for key, row in fallback.items():
         text = legacy_key(columns, key)
         table.fallback[text] = legacy_cells(row, f"{name}: the row of {key}")
@@ -302,6 +483,7 @@ def _combine(tables, names) -> Table:
         combined.cells.update(table.cells)
         for key, by_path in table.tuner.items():
             combined.tuner[key] = dict(by_path)
+        combined.comm.update(table.comm)
         for key, row_cells in table.fallback.items():
             combined.fallback.setdefault(key, row_cells)
     return combined
@@ -431,12 +613,15 @@ def lookup(problem) -> Found:
 
 
 def comm_lookup(local, tp, comm, add_shared, gpu_model):
-    """`(structure names, {segment name: Params})` of the TP call's comm_fused row
-    (its runner under `tuned_plans.RUNNER`; none: the ordinary call won) in the first
-    table that has one, or None."""
+    """The TP call's comm_fused row in the first table that has one, or None: a tuner
+    row's `(structure names, {segment name: Params})` (its runner under
+    `tuned_plans.RUNNER`; none: the ordinary call won), or a legacy row's
+    `CommCells`."""
     key = tuned_plans.comm_key_values(local, tp, comm, add_shared, gpu_model)
     for table in _active():
         row = table.tuner.get(key, {}).get(tuned_plans.COMM_FUSED_PATH)
+        if row is None:
+            row = table.comm.get(key)
         if row is not None:
             return row
     return None
@@ -455,9 +640,15 @@ def comm_tokens(local, tp, comm, add_shared, gpu_model) -> tuple:
             {
                 int(k[token])
                 for table in _active()
-                for k, by_path in table.tuner.items()
-                if tuned_plans.COMM_FUSED_PATH in by_path
-                and tuned_plans.any_token(k) == target
+                for k in [
+                    *(
+                        k
+                        for k, p in table.tuner.items()
+                        if tuned_plans.COMM_FUSED_PATH in p
+                    ),
+                    *table.comm,
+                ]
+                if tuned_plans.any_token(k) == target
             }
         )
     )
@@ -481,10 +672,6 @@ def digest() -> str:
     files, mode = envs.tuned_table()
     _check_variables(files)
     h = hashlib.sha256(f"{mode}\n".encode())
-    # comm_fused_moe_host reads comm_fused_configs from legacy's main table in every
-    # mode, and the converted files do not hold that column (until 5.5d).
-    for path in shipped_sources()[0]:
-        h.update(f"{_sha256(path)}\n".encode())
     if mode != "replace":
         h.update(_shipped()[1].encode())
     for name in files:

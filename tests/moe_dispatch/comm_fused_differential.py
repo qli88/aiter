@@ -12,7 +12,8 @@ would not run either), launch the same kernels on bitwise-equal inputs (the stag
 compared as the ordinary launch the runner replaces), use the runner of the same bucket,
 return the same output up to the noise between the two legacy runs, and log the same
 dispatch lines. The engine cases run `CommFusedTemplate` through `MoeEngine` against
-the legacy runtime. Errors must match.
+the legacy runtime (on a runner set of their own, with legacy's configs: v2 reads
+them from the converted comm_fused rows). Errors must match.
 
 The shipped comm-fused rows are tuned on MI355X; `get_gpu_model` is patched to
 "mi355x" in these processes so an MI350X runs them too (same gfx950 kernels).
@@ -34,7 +35,8 @@ WORLD = 8
 # ("shared", "for_rows", "producer"), "stream" (a separate stage 2 stream), "graph"
 # (captured, then replayed), "engine" (`CommFusedTemplate`), "tuned" (the engine with
 # a plan file giving the call's bucket a runner other than the shipped one, the plan
-# dispatch resolves; it must match legacy within the same noise). Options: "route",
+# dispatch resolves, the other buckets the shipped rows; it must match legacy within
+# the same noise). Options: "route",
 # "sizes" (ragged reduce-scatter), "bound" (AITER_BF16_FP8_MOE_BOUND; default 0, as
 # the production test runs).
 CASES = {
@@ -353,17 +355,21 @@ def _engine_fn(session, comm, tokens, moe_args, run_kw, tuned=False):
     if not engine.supports(rows):
         raise AssertionError(f"the engine does not serve {rows} tokens")
     runners = engine._stateful[0].runners
+    shipped = session.runners[comm].configs
+    if runners is session.runners[comm]:
+        raise AssertionError("the engine shares legacy's runner set")
     if tuned:
         config = runners.configs[rows]
-        if (
-            runners is session.runners[comm]
-            or config.grid_cap != TUNED_RUNNER["grid_cap"]
-        ):
+        if config.grid_cap != TUNED_RUNNER["grid_cap"]:
             raise AssertionError(f"the engine does not run the file's runner: {config}")
-        if session.runners[comm].configs[rows] == config:
+        if shipped[rows] == config:
             raise AssertionError("the file's runner is the shipped one")
-    elif runners is not session.runners[comm]:
-        raise AssertionError("the engine made a runner set of its own")
+        if {m: c for m, c in runners.configs.items() if m != rows} != {
+            m: c for m, c in shipped.items() if m != rows
+        }:
+            raise AssertionError("the engine's other runners are not legacy's")
+    elif runners.configs != shipped:
+        raise AssertionError("the engine's runners are not legacy's")
 
     def forward():
         return engine.forward(

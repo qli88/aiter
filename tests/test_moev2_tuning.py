@@ -1319,7 +1319,7 @@ def test_the_table_digest_is_of_what_the_process_read(tmp_path, monkeypatch):
         legacy.write_text("comm_fused_configs\n")
         m.setattr(tuned_table, "shipped_sources", lambda: ([legacy], None))
         tuned.clear_cache()
-        assert tuned_table.digest() != replaced  # but comm_fused reads legacy's table
+        assert tuned_table.digest() == replaced  # nor legacy's
     plan_file.write_bytes(b"\xff\xfe")
     _use_tables(monkeypatch, [plan_file])
     with pytest.raises(ValueError):

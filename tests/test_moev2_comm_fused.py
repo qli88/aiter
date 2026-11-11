@@ -351,6 +351,22 @@ def _runtime_call(runtime, moe_args, **run_kw):
     return call
 
 
+_CELLS = {"kernelName1": "the comm_fused row's"}
+
+
+def _comm_rows_match(monkeypatch, cells=_CELLS):
+    """v2's comm_fused row at each claimed bucket: `cells` (None: no row with the
+    runtime's runner); the `(bucket, padded rows)` asked about."""
+    asked = []
+
+    def runtime_cells(runners, bucket, op):
+        asked.append((bucket, op["topk_ids"].shape[0]))
+        return cells
+
+    monkeypatch.setattr(comm_fused, "_runtime_cells", runtime_cells)
+    return asked
+
+
 def test_claims_test_the_a8w4_claim_at_the_padded_count(monkeypatch):
     seen = []
 
@@ -359,6 +375,7 @@ def test_claims_test_the_a8w4_claim_at_the_padded_count(monkeypatch):
         return True
 
     monkeypatch.setattr(comm_fused.a8w4, "claims", a8w4_claims)
+    asked = _comm_rows_match(monkeypatch)
     runtime = CommFusedMoeRuntime(runners=_runners([]))
     assert comm_fused.claims(_runtime_call(runtime, _moe_args(3)))
     assert seen == [(4, TOPK)]
@@ -376,6 +393,87 @@ def test_claims_test_the_a8w4_claim_at_the_padded_count(monkeypatch):
         assert not comm_fused.claims(_runtime_call(runtime, _moe_args(4, **extra)))
     assert comm_fused.claims(_runtime_call(runtime, _moe_args(4, block_size_M=-1)))
     assert len(seen) == 3
+    assert asked == [(4, 4), (128, 128), (4, 4)]
+
+
+def test_claims_need_a_comm_fused_row_with_the_runtime_s_runner(monkeypatch):
+    monkeypatch.setattr(comm_fused.a8w4, "claims", lambda op: True)
+    asked = _comm_rows_match(monkeypatch, cells=None)
+    runtime = CommFusedMoeRuntime(runners=_runners([]))
+    assert not comm_fused.claims(_runtime_call(runtime, _moe_args(3)))
+    assert asked == [(4, 4)]
+    monkeypatch.setattr(comm_fused.a8w4, "claims", lambda op: False)
+    assert not comm_fused.claims(_runtime_call(runtime, _moe_args(3)))
+    assert asked == [(4, 4)]  # the a8w4 claim first
+
+
+def test_a_call_without_its_comm_fused_row_runs_on_legacy(monkeypatch):
+    monkeypatch.setattr(comm_fused.a8w4, "claims", lambda op: True)
+    fake = _FakeLocal()
+    monkeypatch.setattr(comm_fused.a8w4, "LOCAL", fake)
+    _comm_rows_match(monkeypatch, cells=None)
+    kw = {"shared_partial": _shared(4)}
+    _, expected = _legacy(monkeypatch, _runners([]), _moe_args(3), **kw)
+    with moev2_mode("comm_fused"):
+        _, out = _legacy(monkeypatch, _runners([]), _moe_args(3), **kw)
+    assert torch.equal(out, expected) and fake.ran == []
+
+
+def test_the_hook_hands_calls_back_while_legacys_variables_are_set(monkeypatch, caplog):
+    import logging
+
+    from aiter.moev2 import envs, paths
+
+    def reread():
+        envs.tuned_table.cache_clear()
+        envs.legacy_tuned_tables.cache_clear()
+
+    monkeypatch.setattr(comm_fused.a8w4, "claims", lambda op: True)
+    asked = _comm_rows_match(monkeypatch)
+    monkeypatch.setattr(paths, "active", lambda: (comm_fused.PATH,))
+    monkeypatch.setattr(paths, "_warned_legacy_tables", False)
+    monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE, raising=False)
+    monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, raising=False)
+    call = _runtime_call(CommFusedMoeRuntime(runners=_runners([])), _moe_args(3))
+    try:
+        monkeypatch.setenv("AITER_CONFIG_FMOE", "/t.csv")
+        reread()
+        with caplog.at_level(logging.WARNING, logger="aiter"):
+            assert paths.route_to_v2(call, "comm_fused") is None
+        assert "AITER_CONFIG_FMOE set" in caplog.text and asked == []
+        monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, "/v2.csv")
+        monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
+        reread()
+        with pytest.raises(ValueError, match="are both set"):
+            paths.route_to_v2(call, "comm_fused")
+        for name in ("AITER_CONFIG_FMOE", envs.AITER_MOEV2_TUNED_TABLE):
+            monkeypatch.delenv(name)
+        monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE_MODE)
+        reread()
+        assert paths.route_to_v2(call, "comm_fused") is comm_fused.PATH
+        assert asked == [(4, 4)]
+    finally:
+        monkeypatch.undo()
+        reread()
+
+
+def test_a_runner_set_without_a_shape_is_not_claimed(monkeypatch):
+    monkeypatch.setattr(comm_fused.a8w4, "claims", lambda op: True)
+    monkeypatch.setattr(
+        comm_fused, "_local_problem", lambda op: pytest.fail("not looked up")
+    )
+    runtime = CommFusedMoeRuntime(runners=_runners([]))
+    assert not hasattr(runtime.runners, "shape")
+    assert not comm_fused.claims(_runtime_call(runtime, _moe_args(3)))
+
+
+def test_run_declines_a_call_without_its_comm_fused_row(monkeypatch):
+    _comm_rows_match(monkeypatch, cells=None)
+    log = []
+    call = _runtime_call(CommFusedMoeRuntime(runners=_runners(log)), _moe_args(3))
+    call["shared_partial"] = _shared(4)
+    assert comm_fused.run(call) is comm_fused.paths.DECLINED
+    assert not [entry for entry in log if entry[0] in ("runner", "reuse_wait")]
 
 
 def test_not_impl_args_are_the_signature_difference():
@@ -400,13 +498,14 @@ class _FakeLocal:
 
     def __init__(self, resolves=True):
         self.resolves = resolves
-        self.ran = []
+        self.ran, self.resolved = [], []
 
-    def resolve_call(self, op):
+    def resolve_call(self, op, cells=None):
+        self.resolved.append(cells)
         return object() if self.resolves else None
 
-    def run(self, op, stage2=None):
-        self.ran.append((tuple(op["topk_ids"].shape), str(stage2)))
+    def run(self, op, stage2=None, cells=None):
+        self.ran.append((tuple(op["topk_ids"].shape), str(stage2), cells))
         launch = stage2.segment.stage2_launch(_Call(op))
         return launch(
             ordinary_stage2=_ordinary_stage2,
@@ -420,6 +519,7 @@ def test_the_hook_routes_claimed_calls_to_v2(monkeypatch):
     fake = _FakeLocal()
     monkeypatch.setattr(comm_fused.a8w4, "LOCAL", fake)
     monkeypatch.setattr(comm_fused, "_ADOPTED", {})
+    _comm_rows_match(monkeypatch)
     log = []
     runtime = CommFusedMoeRuntime(runners=_runners(log))
 
@@ -431,8 +531,10 @@ def test_the_hook_routes_claimed_calls_to_v2(monkeypatch):
         out = runtime.run(shared_partial=_shared(4), **_moe_args(3))
         runtime.run(shared_partial=_shared(4), **_moe_args(4))
     assert out.shape == (3, MODEL_DIM)
-    assert [shape for shape, _ in fake.ran] == [(4, TOPK), (4, TOPK)]
+    assert [shape for shape, *_ in fake.ran] == [(4, TOPK), (4, TOPK)]
     assert fake.ran[0][1].startswith("comm_fused.stage2_rs(runner=_Config(m=4,")
+    assert [cells for *_, cells in fake.ran] == [_CELLS] * 2
+    assert fake.resolved == [_CELLS] * 2
     assert [entry[0] for entry in log] == ["shared", "runner"] * 2
     assert len(comm_fused._ADOPTED) == 1  # one segment per runner set
 
@@ -440,6 +542,7 @@ def test_the_hook_routes_claimed_calls_to_v2(monkeypatch):
 def test_a_declined_call_runs_on_legacy_before_any_barrier(monkeypatch):
     monkeypatch.setattr(comm_fused.a8w4, "claims", lambda op: True)
     monkeypatch.setattr(comm_fused.a8w4, "LOCAL", _FakeLocal(resolves=False))
+    _comm_rows_match(monkeypatch)
     runner_kw = {"bucket": 64, "direct": True}
     kw = {"shared_partial": _shared(16)}
     _, expected = _legacy(monkeypatch, _runners([], **runner_kw), _moe_args(64), **kw)
@@ -476,6 +579,17 @@ def test_with_stage2_replaces_the_stage_2_only():
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _Geometry:
+    tp: int
+    model_dim: int
+    inter_dim: int
+    experts: int
+    topk: int
+    comm: str
+    add_shared: bool
+
+
 def test_segment_lifecycle(monkeypatch):
     from aiter.ops.flydsl import comm_fused_moe_host as host
 
@@ -485,7 +599,8 @@ def test_segment_lifecycle(monkeypatch):
     adopted.prepare(None)  # allocated by its creator
 
     monkeypatch.setattr(host, "runner_arena_bytes", lambda c: 4096 * len(c))
-    shape = SimpleNamespace(
+    monkeypatch.setattr(stage2_rs, "_RUNNERS", {})
+    shape = _Geometry(
         tp=2, model_dim=8, inter_dim=4, experts=8, topk=2, comm="ar", add_shared=True
     )
     created = stage2_rs.CommFusedStage2(configs, shape=shape)
@@ -500,22 +615,12 @@ def test_segment_lifecycle(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     monkeypatch.setattr(
         host,
-        "create_flydsl_comm_fused_runners",
-        lambda **kw: made.append(kw) or SimpleNamespace(configs=configs),
+        "_LazyRunners",
+        lambda *args: made.append(args) or SimpleNamespace(configs=configs),
     )
     created.prepare(ctx)
     assert gathered == [(None, 1)]  # the ranks' plan file rows: none
-    assert made == [
-        {
-            "tp_group": ctx.comm,
-            "model_dim": 8,
-            "inter_dim": 4,
-            "experts": 8,
-            "topk": 2,
-            "comm": "ar",
-            "add_shared": True,
-        }
-    ]
+    assert made == [(ctx.comm, shape, configs)]
     assert created.workspace_bytes() == MemoryNeed()
     torch_group = engine_mod.EngineContext(object(), 0, 2, None, None)
     with pytest.raises(ValueError, match="GroupCoordinator"):
@@ -530,20 +635,30 @@ def test_segment_lifecycle(monkeypatch):
 
 def _template(monkeypatch, configs, side_inputs=("shared_partial",)):
     from aiter import QuantType, dtypes
+    from aiter.moev2.dispatch import tuned_table
 
     resolved = []
 
     class _Local:
-        def resolve_call(self, op):
+        def resolve_call(self, op, cells=None):
             m = op["topk_ids"].shape[0]
+            assert cells == {"row": m}
             resolved.append(m)
             return SimpleNamespace(metadata={"m": m}, plan=_local_plan())
 
     monkeypatch.setattr(comm_fused.a8w4, "LOCAL", _Local())
     segment = stage2_rs.CommFusedStage2.adopt(_Runners(configs, []))
+    made = []
     monkeypatch.setattr(
-        stage2_rs.CommFusedStage2, "for_shape", classmethod(lambda cls, s: segment)
+        stage2_rs,
+        "CommFusedStage2",
+        lambda configs, **kw: made.append((configs, kw)) or segment,
     )
+    rows = {m: tuned_table.CommCells(Params(m=m), {"row": m}) for m in configs}
+    monkeypatch.setattr(
+        comm_fused.CommFusedTemplate, "_file_rows", lambda self, shape: rows
+    )
+    monkeypatch.setattr(stage2_rs, "runner_config", lambda p, s, m: configs[p["m"]])
     monkeypatch.setattr(
         "aiter.ops.flydsl.comm_fused_moe_host.comm_fused_shape", lambda **kw: None
     )
@@ -576,7 +691,7 @@ def test_template_plans_name_each_runner_bucket(monkeypatch):
         "; 32769-131071 tokens: not served (no comm_fused runner)"
     )
     assert top.supports(32768) and not top.supports(32769)
-    assert resolved == [1, 32768]
+    assert resolved == [1, 2, 32768, 1, 32768]  # each row's cells, then the plans
 
 
 def test_template_plans_split_the_top_tier_at_each_runner(monkeypatch):
@@ -614,8 +729,10 @@ def test_engine_supports_reports_unserved_counts(monkeypatch):
 def test_padded_and_tuned_runs_decline_before_the_reuse_wait(monkeypatch):
     waits = []
     monkeypatch.setattr(comm_fused.api, "op_call", lambda padded: {})
-    monkeypatch.setattr(comm_fused.a8w4.LOCAL, "resolve_call", lambda op: None)
+    monkeypatch.setattr(
+        comm_fused.a8w4.LOCAL, "resolve_call", lambda op, cells=None: None
+    )
     monkeypatch.setattr(stage2_rs, "wait_for_reuse", waits.append)
-    assert comm_fused.run_padded(None, {}, "fused") is comm_fused.paths.DECLINED
+    assert comm_fused.run_padded(None, {}, "fused", {}) is comm_fused.paths.DECLINED
     assert comm_fused.run_tuned(None, {}, "fused", None) is comm_fused.paths.DECLINED
     assert waits == []

@@ -25,7 +25,7 @@ from ..dispatch.ops import Op
 from .base import Cap, MemoryNeed, Segment
 from .mxfp4 import mxfp4, mxfp8
 
-_TUNED_RUNNERS = {}  # (id(group), shape, sorted configs) -> _LazyRunners
+_RUNNERS = {}  # (id(group), shape, sorted configs) -> _LazyRunners
 
 
 def bucket_for(configs, tokens: int) -> int:
@@ -337,17 +337,13 @@ class CommFusedStage2(Segment):
     """A runner set as a stateful segment: one per TP group and geometry.
 
     `adopt(runners)` wraps the set a `CommFusedMoeRuntime` was built with (already
-    allocated: nothing to prepare). `for_shape(shape)` creates it at `prepare(ctx)`
-    through `create_flydsl_comm_fused_runners` on the engine's `GroupCoordinator`,
-    sharing that function's cache (one arena per group, geometry and MXFP8 fallback).
-    `configs`: the runner config per token bucket. `tuned`: `configs` come from tuned
-    rows, not from the shape's winner table (legacy's `comm_fused_configs`): `prepare`
-    builds a runner set over them (`_LazyRunners`, cached like the winner table's, per
-    group, geometry and configs).
-    `rows`: what the tuned table gave the segment (None: nothing); `prepare` raises
-    on every rank unless every rank has the same, as each reads the table on its
-    own. The runners have no health,
-    reset or free in legacy, so neither has the segment.
+    allocated: nothing to prepare). Otherwise `prepare(ctx)` builds the set over
+    `configs` (the runner config per token bucket, from the tuned table's comm_fused
+    rows) on the engine's `GroupCoordinator` (`_LazyRunners`, cached per group,
+    geometry and configs; not shared with legacy's `create_flydsl_comm_fused_runners`).
+    `rows`: what the tuned table gave the segment; `prepare` raises on every rank
+    unless every rank has the same, as each reads the table on its own. The runners
+    have no health, reset or free in legacy, so neither has the segment.
     """
 
     name = "comm_fused.stage2_rs"
@@ -369,23 +365,15 @@ class CommFusedStage2(Segment):
     reach = "tuned"
     stateful = True
 
-    def __init__(self, configs, runners=None, shape=None, tuned=False, rows=None):
+    def __init__(self, configs, runners=None, shape=None, rows=None):
         self.configs = dict(configs)
         self.runners = runners
         self.shape = shape
-        self.tuned = tuned
         self.rows = rows
 
     @classmethod
     def adopt(cls, runners) -> "CommFusedStage2":
         return cls(runners.configs, runners=runners)
-
-    @classmethod
-    def for_shape(cls, shape) -> "CommFusedStage2":
-        from aiter.ops.flydsl.comm_fused_moe_host import comm_fused_configs
-
-        configs, _ = comm_fused_configs(shape)
-        return cls(configs, shape=shape)
 
     def workspace_bytes(self) -> MemoryNeed:
         if self.runners is not None:
@@ -407,28 +395,13 @@ class CommFusedStage2(Segment):
                 f"the runner set is for TP{self.shape.tp}; the group has "
                 f"{ctx.world_size} ranks"
             )
-        from aiter.ops.flydsl.comm_fused_moe_host import (
-            _LazyRunners,
-            create_flydsl_comm_fused_runners,
-        )
+        from aiter.ops.flydsl.comm_fused_moe_host import _LazyRunners
 
         _same_rows_on_every_rank(comm, ctx.world_size, self.rows)
-        s = self.shape
-        if self.tuned:
-            key = (id(comm), s, tuple(sorted(self.configs.items())))
-            if key not in _TUNED_RUNNERS:
-                _TUNED_RUNNERS[key] = _LazyRunners(comm, s, self.configs)
-            self.runners = _TUNED_RUNNERS[key]
-            return
-        self.runners = create_flydsl_comm_fused_runners(
-            tp_group=comm,
-            model_dim=s.model_dim,
-            inter_dim=s.inter_dim,
-            experts=s.experts,
-            topk=s.topk,
-            comm=s.comm,
-            add_shared=s.add_shared,
-        )
+        key = (id(comm), self.shape, tuple(sorted(self.configs.items())))
+        if key not in _RUNNERS:
+            _RUNNERS[key] = _LazyRunners(comm, self.shape, self.configs)
+        self.runners = _RUNNERS[key]
 
     def stage2_launch(self, c):
         return functools.partial(launch, c["comm_fused"])

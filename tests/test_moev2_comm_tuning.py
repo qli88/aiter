@@ -939,7 +939,8 @@ def test_the_plan_file_keeps_tp_rows_apart_from_local_ones(tmp_path, monkeypatch
     names, candidates = tuned_table.comm_lookup(_problem(128).local, *key)
     assert tuned_plans.RUNNER not in candidates
     assert tuned_table.comm_lookup(problem.local, 8, "ar", True, "mi350x") is None
-    assert tuned_table.comm_lookup(problem.local, 8, "rs", True, "mi355x") is None
+    shipped = tuned_table.comm_lookup(problem.local, 8, "rs", True, "mi355x")
+    assert isinstance(shipped, tuned_table.CommCells)
     assert tuned_table.lookup(problem.local).tuner == ()
     assert tuned_table.comm_tokens(_problem(1).local, *key) == (64, 128, 256)
     old = tmp_path / "old.csv"
@@ -957,6 +958,8 @@ def test_the_plan_file_keeps_tp_rows_apart_from_local_ones(tmp_path, monkeypatch
         (fused[0].structure, fused[0].candidates),
     )
     assert tuned_table.comm_lookup(problem.local, *key) is None
+    # A user's local row leaves the shipped comm_fused row of its key as it is.
+    assert tuned_table.comm_lookup(problem.local, 8, "rs", True, "mi355x") == shipped
     monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE, raising=False)
     monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, raising=False)
     tuned.clear_cache()
@@ -979,8 +982,7 @@ def _template(monkeypatch, comm):
         entry = json.loads(row["comm_fused_configs"]).get(comm)
         if entry is not None:
             shipped[m] = host._config(entry, shape.kernel_shape(), m, comm)
-    monkeypatch.setattr(host, "comm_fused_configs", lambda shape: (shipped, False))
-    monkeypatch.setattr(host, "get_gpu_model", lambda: "mi350x")
+    monkeypatch.setattr(host, "get_gpu_model", lambda: "mi355x")
     monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")  # as comm_fused runs
     weights = engine_mod.MoeWeights(
         torch.empty(384, 768, 3584, dtype=dtypes.fp4x2, device="meta"),
@@ -1013,24 +1015,30 @@ def _host_shape(comm):
     )
 
 
+def _tuned_rs(m):
+    return _problem(m, "rs", "mi355x")
+
+
 def test_the_template_serves_the_plan_files_rows(tmp_path, monkeypatch, caplog):
     from aiter.moev2 import envs
-    from aiter.moev2.dispatch import tuned, tuned_plans
+    from aiter.moev2.dispatch import tuned, tuned_plans, tuned_table
     from aiter.moev2.segments import comm_fused as stage2_rs
     from aiter.moev2.tuning import comm_search
 
     plain, shipped = _template(monkeypatch, "rs")
-    assert plain._stage2().configs == shipped and not plain._stage2().tuned
+    assert plain._stage2().configs == shipped and not plain._tuned
+    assert [m for m, _ in plain._stage2().rows] == sorted(shipped)
+    assert set(plain._cells) == set(shipped)
     axes = {"direct": {"grid_cap": (16, 80)}}
-    fused = _tune(_problem(64, "rs"), _GroupFake(1000.0, _direct_us), axes=axes)
-    ordinary = _tune(_problem(128, "rs"), _GroupFake(1.0, _direct_us))
-    unbuilt = _tune(_problem(256, "rs"), _GroupFake(1000.0, _direct_us))
+    fused = _tune(_tuned_rs(64), _GroupFake(1000.0, _direct_us), axes=axes)
+    ordinary = _tune(_tuned_rs(128), _GroupFake(1.0, _direct_us))
+    unbuilt = _tune(_tuned_rs(256), _GroupFake(1000.0, _direct_us))
     unbuilt[0] = dataclasses.replace(unbuilt[0], structure=("sort", "no.such"))
-    broken = _tune(_problem(512, "rs"), _GroupFake(1000.0, _direct_us), axes=axes)
+    broken = _tune(_tuned_rs(512), _GroupFake(1000.0, _direct_us), axes=axes)
     candidates = dict(broken[0].candidates)
     candidates[comm_search.RUNNER] = Params(family="direct", grid_cap=-1)
     broken[0] = dataclasses.replace(broken[0], candidates=candidates)
-    other_block = _tune(_problem(1024, "rs"), _GroupFake(1000.0, _direct_us))
+    other_block = _tune(_tuned_rs(1024), _GroupFake(1000.0, _direct_us))
     candidates = dict(other_block[0].candidates)
     runner = candidates[comm_search.RUNNER]
     shape = _host_shape("rs")
@@ -1038,12 +1046,12 @@ def test_the_template_serves_the_plan_files_rows(tmp_path, monkeypatch, caplog):
     other_sbm = 64 if block_m == 32 else 32
     candidates[comm_search.RUNNER] = Params(dict(runner), sort_block_m=other_sbm)
     other_block[0] = dataclasses.replace(other_block[0], candidates=candidates)
-    rows = _comm_rows(_problem(64, "rs"), fused)
-    rows += _comm_rows(_problem(128, "rs"), ordinary)
-    rows += _comm_rows(_problem(256, "rs"), unbuilt)
-    rows += _comm_rows(_problem(512, "rs"), broken)
-    rows += _comm_rows(_problem(1024, "rs"), other_block)
-    rows += [{**r, "token": "100"} for r in _comm_rows(_problem(64, "rs"), fused)]
+    rows = _comm_rows(_tuned_rs(64), fused)
+    rows += _comm_rows(_tuned_rs(128), ordinary)
+    rows += _comm_rows(_tuned_rs(256), unbuilt)
+    rows += _comm_rows(_tuned_rs(512), broken)
+    rows += _comm_rows(_tuned_rs(1024), other_block)
+    rows += [{**r, "token": "100"} for r in _comm_rows(_tuned_rs(64), fused)]
     plan_file = tmp_path / "plans.csv"
     _write(plan_file, rows)
     monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
@@ -1052,50 +1060,190 @@ def test_the_template_serves_the_plan_files_rows(tmp_path, monkeypatch, caplog):
     template, _ = _template(monkeypatch, "rs")
     with caplog.at_level("WARNING", logger="aiter"):
         segment = template._stage2()
-    assert "comm_fused row for M=256 not used: ValueError: its plan" in caplog.text
-    assert "comm_fused row for M=512 not used" in caplog.text
-    assert f"M=1024 not used: ValueError: the runner's sort_block_m={other_sbm}" in (
+    not_served = "not used, its bucket not served"
+    assert f"comm_fused row for M=256 {not_served}: ValueError: its plan" in (
         caplog.text
     )
+    assert f"comm_fused row for M=512 {not_served}" in caplog.text
+    assert (
+        f"M=1024 {not_served}: ValueError: the runner's sort_block_m={other_sbm}"
+        in caplog.text
+    )
     assert "M=100 not used: calls of 100 tokens key as M=128" in caplog.text
-    assert segment.tuned and set(segment.configs) == set(shipped) - {128}
-    assert [m for m, *_ in segment.rows] == [64, 128, 256, 512, 1024]
-    assert plain._stage2().rows == ()
+    assert set(segment.configs) == set(shipped) - {128, 256, 512, 1024}
+    assert [m for m, _ in segment.rows] == sorted(shipped)
     runner = fused[0].candidates[comm_search.RUNNER]
     assert segment.configs[64].grid_cap == runner["grid_cap"] == 16
-    for m in (256, 512, 1024):
-        assert segment.configs[m] == shipped[m]
     assert set(template._tuned) == {64}
+    assert set(template._cells) == set(shipped) - {64, 128, 256, 512, 1024}
     win = template._tuned[64]
     assert tuple(c.segment.name for c in win.plan.segments) == fused[0].structure
     one = template.resolve(64, False)
     assert one.description.startswith("comm_fused M=64: ") and one.supports(64)
     assert "direct_sbm" in one.description
-    assert template.resolve(128, False).description.startswith("not served")
-    assert not template.resolve(128, False).supports(128)
+    for m in (128, 256, 512, 1024):
+        assert template.resolve(m, False).description.startswith("not served")
+        assert not template.resolve(m, False).supports(m)
     assert tuned_plans.RUNNER == comm_search.RUNNER
+    legacy = tuned_table.comm_lookup(_tuned_rs(4096).local, 8, "rs", True, "mi355x")
+    assert isinstance(legacy, tuned_table.CommCells)
+    assert template._cells[4096] == legacy.cells
+    assert segment.configs[4096] == shipped[4096]
 
 
-def test_rows_naming_the_table_s_runners_keep_its_runner_set(tmp_path, monkeypatch):
+def test_a_tuner_row_with_the_shipped_runner_keeps_its_config(tmp_path, monkeypatch):
     from aiter.moev2 import envs
     from aiter.moev2.dispatch import tuned
     from aiter.moev2.tuning import comm_search
 
-    fused = _tune(_problem(64, "rs"), _GroupFake(1000.0, _direct_us))
+    fused = _tune(_tuned_rs(64), _GroupFake(1000.0, _direct_us))
     assert fused[0].candidates[comm_search.RUNNER] == Params(
         family="direct", sort_block_m=32
     )
     plan_file = tmp_path / "plans.csv"
-    _write(plan_file, _comm_rows(_problem(64, "rs"), fused))
+    _write(plan_file, _comm_rows(_tuned_rs(64), fused))
     monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
     monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
     tuned.clear_cache()
     template, shipped = _template(monkeypatch, "rs")
     segment = template._stage2()
-    assert not segment.tuned and segment.configs == shipped
-    assert set(template._tuned) == {64} and [m for m, *_ in segment.rows] == [64]
+    assert segment.configs == shipped
+    assert set(template._tuned) == {64} and 64 not in template._cells
     win = template._tuned[64]
     assert tuple(c.segment.name for c in win.plan.segments) == fused[0].structure
+
+
+@pytest.mark.parametrize("comm", ["ar", "rs"])
+def test_runtime_calls_run_the_cells_of_the_comm_row_with_their_runner(
+    monkeypatch, comm
+):
+    from types import SimpleNamespace
+
+    from aiter.moev2.dispatch import tuned_table
+    from aiter.moev2.migration import comm_fused
+    from aiter.ops.flydsl import comm_fused_moe_host as host
+
+    template, shipped = _template(monkeypatch, comm)
+    shape = _host_shape(comm)
+    legacy, _ = host.comm_fused_configs(shape)
+    assert legacy == shipped
+    gap = next(c for c in range(min(shipped) + 1, max(shipped)) if c not in shipped)
+    problems = {m: template._local_problem(m) for m in (*shipped, gap)}
+    monkeypatch.setattr(comm_fused, "_local_problem", problems.__getitem__)
+    runners = SimpleNamespace(shape=shape, configs=legacy)
+    for m in shipped:
+        cells = tuned_table.lookup(problems[m]).cells
+        assert cells and comm_fused._runtime_cells(runners, m, m) == cells
+    m, top = min(shipped), max(shipped)
+    cells = comm_fused._runtime_cells(runners, m, m)
+    assert comm_fused._runtime_cells(runners, m, gap) is None
+    assert comm_fused._runtime_cells(runners, gap, gap) is None
+    other = SimpleNamespace(shape=shape, configs={**legacy, m: legacy[top]})
+    assert comm_fused._runtime_cells(other, m, m) is None
+    unnamed = dataclasses.replace(shape, gpu_model=None)
+    no_model = SimpleNamespace(shape=unnamed, configs=legacy)
+    assert comm_fused._runtime_cells(no_model, m, m) == cells
+    monkeypatch.setattr(host, "get_gpu_model", lambda: "mi350x")
+    assert comm_fused._runtime_cells(no_model, m, m) is None
+
+
+def test_runtime_calls_at_a_tuner_comm_row_go_to_legacy(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from aiter.moev2 import envs
+    from aiter.moev2.dispatch import tuned
+    from aiter.moev2.migration import comm_fused
+    from aiter.ops.flydsl import comm_fused_moe_host as host
+
+    fused = _tune(_tuned_rs(64), _GroupFake(1000.0, _direct_us))
+    plan_file = tmp_path / "plans.csv"
+    _write(plan_file, _comm_rows(_tuned_rs(64), fused))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
+    tuned.clear_cache()
+    template, shipped = _template(monkeypatch, "rs")
+    assert template._stage2().configs[64] == shipped[64]  # the same runner
+    problems = {m: template._local_problem(m) for m in (64, 128)}
+    monkeypatch.setattr(comm_fused, "_local_problem", problems.__getitem__)
+    runners = SimpleNamespace(shape=_host_shape("rs"), configs=shipped)
+    assert comm_fused._runtime_cells(runners, 64, 64) is None
+    assert comm_fused._runtime_cells(runners, 128, 128) is not None
+    assert host.comm_fused_configs(_host_shape("rs"))[0] == shipped
+
+
+def test_a_user_s_local_row_leaves_the_comm_bucket_s_plan(tmp_path, monkeypatch):
+    from aiter.moev2 import api, envs
+    from aiter.moev2.dispatch import tuned, tuned_table
+    from aiter.moev2.migration import a8w4
+
+    with open(_TABLE, newline="") as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames
+        by_token = {
+            int(r["token"]): r
+            for r in reader
+            if (r["model_dim"], r["inter_dim"], r["expert"]) == ("7168", "384", "384")
+        }
+    user = {**by_token[4096], "comm_fused_configs": ""}
+    for name in ("kernelName1", "kernelName2"):
+        user[name] = by_token[2048][name]
+    assert user["block_m"] == by_token[2048]["block_m"]
+    path = tmp_path / "user.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, header)
+        writer.writeheader()
+        writer.writerow(user)
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(path))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
+    tuned.clear_cache()
+    template, shipped = _template(monkeypatch, "rs")
+    problem = template._local_problem(4096)
+    assert tuned_table.lookup(problem).cells["kernelName1"] == user["kernelName1"]
+    assert template._stage2().configs == shipped
+    cells = template._cells[4096]
+    assert cells["kernelName1"] == by_token[4096]["kernelName1"]
+    op = api.op_call(template._meta_call(4096))
+    ordinary = a8w4.LOCAL.resolve_call(op).plan.describe()
+    paired = a8w4.LOCAL.resolve_call(op, cells=cells).plan.describe()
+    assert user["kernelName1"] in ordinary and user["kernelName1"] not in paired
+    assert by_token[4096]["kernelName1"] in paired
+    description = template.resolve(4096, False).description
+    assert by_token[4096]["kernelName1"] in description
+    assert user["kernelName1"] not in description
+
+
+def test_a_user_s_comm_row_whose_cells_v2_declines_is_not_served(
+    tmp_path, monkeypatch, caplog
+):
+    from aiter.moev2 import envs
+    from aiter.moev2.dispatch import tuned
+
+    with open(_TABLE, newline="") as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames
+        row = next(
+            r
+            for r in reader
+            if (r["token"], r["model_dim"], r["inter_dim"], r["expert"])
+            == ("4096", "7168", "384", "384")
+        )
+    row["kernelName1"] = "bogus_moe1"
+    path = tmp_path / "user.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, header)
+        writer.writeheader()
+        writer.writerow(row)
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(path))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
+    tuned.clear_cache()
+    template, shipped = _template(monkeypatch, "rs")
+    with caplog.at_level("WARNING", logger="aiter"):
+        segment = template._stage2()
+    assert "row for M=4096 not used, its bucket not served: the a8w4 path" in (
+        caplog.text
+    )
+    assert set(segment.configs) == set(shipped) - {4096}
+    assert template.resolve(4096, False).description.startswith("not served")
 
 
 def test_tuned_window_runners_follow_the_mxfp8_fallback(monkeypatch):
@@ -1125,9 +1273,9 @@ def test_tuned_rows_are_dropped_when_their_runner_set_does_not_fit(
     from aiter.ops.flydsl import comm_fused_moe_host as host
 
     axes = {"direct": {"grid_cap": (16, 80)}}
-    fused = _tune(_problem(64, "rs"), _GroupFake(1000.0, _direct_us), axes=axes)
+    fused = _tune(_tuned_rs(64), _GroupFake(1000.0, _direct_us), axes=axes)
     plan_file = tmp_path / "plans.csv"
-    _write(plan_file, _comm_rows(_problem(64, "rs"), fused))
+    _write(plan_file, _comm_rows(_tuned_rs(64), fused))
     monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
     monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
     tuned.clear_cache()
@@ -1135,9 +1283,36 @@ def test_tuned_rows_are_dropped_when_their_runner_set_does_not_fit(
     monkeypatch.setattr(host, "FLAT_VA_RANK_STRIDE", 1)
     with caplog.at_level("WARNING", logger="aiter"):
         segment = template._stage2()
-    assert "tuned comm_fused rows not used: their runner set needs" in caplog.text
-    assert not segment.tuned and segment.configs == shipped and not template._tuned
-    assert [m for m, *_ in segment.rows] == [64]
+    assert (
+        "tuned comm_fused rows not used, their buckets not served: the runner set"
+        in (caplog.text)
+    )
+    assert set(segment.configs) == set(shipped) - {64} and not template._tuned
+    assert [m for m, _ in segment.rows] == sorted(shipped)
+    assert not template.resolve(64, False).supports(64)
+
+
+def test_shipped_rows_alone_over_the_stride_raise_when_built(monkeypatch):
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from aiter.moev2.segments import comm_fused as stage2_rs
+    from aiter.ops.flydsl import comm_fused_moe_host as host
+
+    template, shipped = _template(monkeypatch, "rs")
+    monkeypatch.setattr(host, "FLAT_VA_RANK_STRIDE", 1)
+    segment = template._stage2()
+    assert segment.configs == shipped
+    monkeypatch.setattr(stage2_rs, "_RUNNERS", {})
+    monkeypatch.setattr(
+        dist,
+        "all_gather_object",
+        lambda out, mine, group: out.__setitem__(slice(None), [mine] * len(out)),
+    )
+    ctx = SimpleNamespace(comm=SimpleNamespace(cpu_group="cpu"), world_size=8)
+    with pytest.raises(ValueError, match="exceeding flat-VA stride 1"):
+        segment.prepare(ctx)
 
 
 def test_a_runner_set_needs_the_same_plan_file_rows_on_every_rank(monkeypatch):
@@ -1162,18 +1337,23 @@ def test_a_runner_set_needs_the_same_plan_file_rows_on_every_rank(monkeypatch):
 
     monkeypatch.setattr(dist, "all_gather_object", gather)
     monkeypatch.setattr(host, "_LazyRunners", Runners)
-    monkeypatch.setattr(stage2_rs, "_TUNED_RUNNERS", {})
+    monkeypatch.setattr(stage2_rs, "_RUNNERS", {})
     comm = SimpleNamespace(cpu_group="cpu", world_size=2)
     ctx = SimpleNamespace(comm=comm, world_size=2)
     shape = dataclasses.replace(_host_shape("rs"), tp=2)
     configs = {64: "config"}
     rows = others["rows"]
-    first = stage2_rs.CommFusedStage2(configs, shape=shape, tuned=True, rows=rows)
+    first = stage2_rs.CommFusedStage2(configs, shape=shape, rows=rows)
     first.prepare(ctx)
-    second = stage2_rs.CommFusedStage2(configs, shape=shape, tuned=True, rows=rows)
+    second = stage2_rs.CommFusedStage2(configs, shape=shape, rows=rows)
     second.prepare(ctx)
     assert first.runners is second.runners and made == [configs]
-    other = stage2_rs.CommFusedStage2(configs, shape=shape, tuned=True, rows=())
+    monkeypatch.setattr(host, "_RUNNER_CACHE", {})
+    differing = stage2_rs.CommFusedStage2({64: "another"}, shape=shape, rows=rows)
+    differing.prepare(ctx)
+    assert differing.runners is not first.runners
+    assert made == [configs, {64: "another"}] and host._RUNNER_CACHE == {}
+    other = stage2_rs.CommFusedStage2(configs, shape=shape, rows=())
     with pytest.raises(
         RuntimeError, match=r"different tuned comm_fused rows \(ranks \[1\]"
     ):

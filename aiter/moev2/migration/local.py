@@ -225,6 +225,10 @@ def execute(c, resolution, q_dtype_a, after_sort=None):
     )
 
 
+def _items(cells):
+    return None if cells is None else tuple(sorted(cells.items()))
+
+
 class LocalDispatch:
     """`fhmoe`: the calls come from `fhmoe_` (the shared expert in the problem, the
     selected block size enforced)."""
@@ -237,8 +241,10 @@ class LocalDispatch:
         self.relookup = tuned.cached(maxsize=2048)(self._relookup)
         self.dispatch = tuned.cached(maxsize=2048)(self._dispatch)
 
-    def _resolve(self, problem, relookup):
-        resolution = resolver.resolve(problem, self.segments)
+    def _resolve(self, problem, relookup, cells=None):
+        resolution = resolver.resolve(
+            problem, self.segments, None if cells is None else dict(cells)
+        )
         resolution.emit()
         return resolution
 
@@ -253,29 +259,31 @@ class LocalDispatch:
             replace(problem, inter=None, shape=shape, extras=extras), True
         )
 
-    def _dispatch(self, args, kwargs_items, arch, cu_num):
+    def _dispatch(self, args, kwargs_items, arch, cu_num, cells=None):
         """`(resolution, problem)` for a key, or None when not taken or declined.
 
-        `problem` is None when no second lookup follows (whole-graph plans).
+        `problem` is None when no second lookup follows (whole-graph plans). `cells`
+        (items): a legacy comm_fused row's, which the key runs instead of its tuned row.
         """
         problem = api.problem_from_key(
             args, dict(kwargs_items), arch, cu_num, self.fhmoe
         )
         if not self.takes(problem):
             return None
-        primary = self.resolve(problem, False)
+        primary = self.resolve(problem, False, cells)
         if primary.plan is None:
             return None
         if primary.metadata.full_impl is not None:
             return primary, None
         return primary, problem
 
-    def run(self, call, q_dtype_a=None, config_file=None, stage2=None):
+    def run(self, call, q_dtype_a=None, config_file=None, stage2=None, cells=None):
         """`q_dtype_a`, `config_file`: as `api.dispatch_key` takes them. `stage2`: a
-        `SegmentChoice` that replaces the plan's stage 2 (`comm_fused.stage2_rs`)."""
+        `SegmentChoice` that replaces the plan's stage 2 (`comm_fused.stage2_rs`).
+        `cells`: a legacy comm_fused row's, run instead of the key's tuned row."""
         c = executor.prologue(call, quant_remap)
         args, kwargs, q_dtype_a = api.dispatch_key(c, q_dtype_a, config_file)
-        dispatched = self._plan_of(c, args, kwargs, q_dtype_a, warn=True)
+        dispatched = self._plan_of(c, args, kwargs, q_dtype_a, True, _items(cells))
         if dispatched is None:
             return paths.DECLINED
         resolution, problem = dispatched
@@ -303,29 +311,31 @@ class LocalDispatch:
 
         return execute(c, resolution, q_dtype_a, after_sort)
 
-    def resolve_call(self, call, q_dtype_a=None, config_file=None):
+    def resolve_call(self, call, q_dtype_a=None, config_file=None, cells=None):
         """The resolution `run(call)` runs, inline-sort fallback included, through the
         same cache (its log lines are emitted once, here or by the first `run` of the
         key; the fallback's warning only by `run`), or None when `run` declines. The
         lookup after sorting, which only checks, is left to `run`."""
         c = executor.prologue(call, quant_remap)
         args, kwargs, q_dtype_a = api.dispatch_key(c, q_dtype_a, config_file)
-        dispatched = self._plan_of(c, args, kwargs, q_dtype_a, warn=False)
+        dispatched = self._plan_of(c, args, kwargs, q_dtype_a, False, _items(cells))
         return None if dispatched is None else dispatched[0]
 
-    def _plan_of(self, c, args, kwargs, q_dtype_a, warn):
+    def _plan_of(self, c, args, kwargs, q_dtype_a, warn, cells=None):
         """`(resolution, problem)` that `run` executes for `c`, or None: it declines."""
         if executor.a16w4_unsupported(c, q_dtype_a) is not None:
             # Legacy raises NotImplementedError before its dispatch.
             return None
         dispatched = self.dispatch(
-            args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num()
+            args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num(), cells
         )
         if dispatched is None:
             return None
         self._check_fhmoe(dispatched[0])
         if c.quant_type == QuantType.per_1x32:
-            fallback = self._inline_sort_fallback(c, args, kwargs, dispatched, warn)
+            fallback = self._inline_sort_fallback(
+                c, args, kwargs, dispatched, warn, cells
+            )
             if fallback is None:
                 return None
             if fallback is not dispatched:
@@ -340,7 +350,7 @@ class LocalDispatch:
         if self.fhmoe and resolution.plan is not None:
             _validate_fhmoe_metadata_consistency(resolution.metadata)
 
-    def _inline_sort_fallback(self, c, args, kwargs, dispatched, warn=True):
+    def _inline_sort_fallback(self, c, args, kwargs, dispatched, warn=True, cells=None):
         """`_fused_moe_impl`: a tuned inline-sort row this call cannot run is discarded,
         and the key resolved again without inline-sort rows. None: that key declines."""
         metadata = dispatched[0].metadata
@@ -370,7 +380,7 @@ class LocalDispatch:
             return dispatched
         kwargs = {**kwargs, "_disable_inline_sort": True}
         fallback = self.dispatch(
-            args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num()
+            args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num(), cells
         )
         if fallback is not None and warn:
             logger.warning(

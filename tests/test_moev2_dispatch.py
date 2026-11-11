@@ -2073,7 +2073,8 @@ def test_a4w4_inline_sort_fallback_resolves_again_without_inline_sort(
 
     dispatched = []
 
-    def dispatch(args, kwargs, arch, cu_num):
+    def dispatch(args, kwargs, arch, cu_num, cells=None):
+        assert cells is None
         dispatched.append(dict(kwargs))
         return fallback
 

@@ -39,7 +39,7 @@ from ..segments.flydsl_fhmoe import (
     _config_has_mxfp8_fhmoe_geometry,
     _is_dsv4_i384_fhmoe_contract,
 )
-from . import resolver, tuned, tuned_plans
+from . import resolver, tuned, tuned_plans, tuned_table
 from .ops import Op
 from .tuned_table import (  # noqa: F401
     CONFIGS,
@@ -242,8 +242,10 @@ def convert_table(table, arch, cu_num, fhmoe_table=None):
     primary rows; `fhmoe_table`: the dedicated table's file name, the table being
     it), for its rows of `arch` and `cu_num` (the others are left out): the
     plan-file rows (dicts over `tuned_plans.COLUMNS + INFO_COLUMNS`), in table
-    order, and `[(key, reason)]` for each row, or each path of a row, that gets
-    none."""
+    order, each row's comm_fused rows (one per `comm_fused_configs` entry: its a8w4
+    row with the runner) after it, and `[(key, reason)]` for each row, each path of a
+    row, or each comm_fused entry, that gets none. Raises for an entry legacy's winner
+    table rejects."""
     primary, _ = table
     columns = tuned.index_columns(fhmoe_table is not None)
     rows, skipped = [], []
@@ -251,40 +253,79 @@ def convert_table(table, arch, cu_num, fhmoe_table=None):
         named = {c: "" if _blank(v) else v for c, v in zip(columns, key)}
         if named["gfx"] != arch or int(named["cu_num"] or -1) != cu_num:
             continue
-        try:
-            problem = problem_of(named, arch, cu_num, fhmoe_table)
-        except (AttributeError, TypeError, ValueError) as error:
-            skipped.append((key, f"the key is not read: {error}"))
-            continue
-        if fhmoe_table is not None and problem.extras.get("tuned_table") is None:
-            skipped.append((key, "an FHMoE key its calls look up in the main table"))
-            continue
-        if tuned.exact_key(problem) != key:
-            skipped.append((key, f"looked up as {tuned.exact_key(problem)}"))
-            continue
-        names = paths_taking(problem)
-        if not names:
-            skipped.append((key, "no path takes the key"))
-            continue
-        for name in names:
-            converted = plan_row(problem, paths.registered()[name].segments, row)
-            if isinstance(converted, str):
-                skipped.append((key, f"{name}: {converted}"))
+        if fhmoe_table is not None and tuned_table.has_comm_configs(row):
+            raise ValueError(
+                f"the row of {key}: comm_fused_configs in an FHMoE table, which legacy "
+                "does not read"
+            )
+        entries = tuned_table.legacy_comm_entries(
+            {**dict(zip(columns, key)), **row}, f"the row of {key}"
+        )
+        problem, local = _convert_row(key, row, named, fhmoe_table, rows, skipped)
+        for tp, comm, add_shared, gpu_model, runner, us in entries:
+            if local is None:
+                skipped.append(
+                    (key, f"comm_fused: no {tuned_plans.COMM_FUSED_LOCAL_PATH} row")
+                )
                 continue
-            structure, candidates = converted
-            out = dict(zip(tuned_plans.KEY_COLUMNS, tuned_plans.key_values(problem)))
+            collective = tuned_plans.comm_key_values(
+                problem, tp, comm, add_shared, gpu_model
+            )
+            out = dict(zip(tuned_plans.KEY_COLUMNS, collective))
             out.update(
-                path=name,
-                structure=tuned_plans.STRUCTURE_SEPARATOR.join(
-                    s.name for s in structure
+                path=tuned_plans.COMM_FUSED_PATH,
+                structure=local[0],
+                candidates=tuned_plans.encode_candidates(
+                    {**local[1], tuned_plans.RUNNER: runner}
                 ),
-                candidates=tuned_plans.encode_candidates(candidates),
-                e2e_us=_text(row.get("us")),
+                e2e_us=_text(us),
                 mode=MODE,
             )
-            out.update({c: _text(row.get(c)) for c in INFO_COLUMNS})
+            out.update(dict.fromkeys(INFO_COLUMNS, ""))
             rows.append(out)
     return rows, skipped
+
+
+def _convert_row(key, row, named, fhmoe_table, rows, skipped):
+    """Append `row`'s plan-file rows (one per path taking its key) to `rows`, or the
+    reasons it has none to `skipped`; `(problem, (structure, candidates) of its a8w4
+    row, or None)`."""
+    arch, cu_num = named["gfx"], int(named["cu_num"])
+    try:
+        problem = problem_of(named, arch, cu_num, fhmoe_table)
+    except (AttributeError, TypeError, ValueError) as error:
+        skipped.append((key, f"the key is not read: {error}"))
+        return None, None
+    if fhmoe_table is not None and problem.extras.get("tuned_table") is None:
+        skipped.append((key, "an FHMoE key its calls look up in the main table"))
+        return problem, None
+    if tuned.exact_key(problem) != key:
+        skipped.append((key, f"looked up as {tuned.exact_key(problem)}"))
+        return problem, None
+    names = paths_taking(problem)
+    if not names:
+        skipped.append((key, "no path takes the key"))
+        return problem, None
+    local = None
+    for name in names:
+        converted = plan_row(problem, paths.registered()[name].segments, row)
+        if isinstance(converted, str):
+            skipped.append((key, f"{name}: {converted}"))
+            continue
+        structure, candidates = converted
+        out = dict(zip(tuned_plans.KEY_COLUMNS, tuned_plans.key_values(problem)))
+        out.update(
+            path=name,
+            structure=tuned_plans.STRUCTURE_SEPARATOR.join(s.name for s in structure),
+            candidates=tuned_plans.encode_candidates(candidates),
+            e2e_us=_text(row.get("us")),
+            mode=MODE,
+        )
+        out.update({c: _text(row.get(c)) for c in INFO_COLUMNS})
+        rows.append(out)
+        if name == tuned_plans.COMM_FUSED_LOCAL_PATH:
+            local = out["structure"], candidates
+    return problem, local
 
 
 def merged_tables(files) -> dict:
@@ -294,7 +335,8 @@ def merged_tables(files) -> dict:
     each `file` with its primary rows of the merge, as `convert_table` takes a table.
     Raises for a key in two rows: where the merge raises (also with the same `_tag`),
     and where `read_table` would keep the first of two rows, which in the legacy merge
-    depends on the order the directory lists the files."""
+    depends on the order the directory lists the files; and for `comm_fused_configs`
+    on a row `read_table` drops."""
     import pandas as pd
 
     frames = [pd.read_csv(f) for f in files]
@@ -320,6 +362,13 @@ def merged_tables(files) -> dict:
     twice = merged[same_tag | first_kept.reindex(merged.index, fill_value=False)]
     if len(twice):
         raise ValueError(f"keys in two rows:\n{twice.to_string(index=False)}")
+    dropped = merged[tag == "flydsl_fallback"]
+    for _, row in dropped.iterrows():
+        if tuned_table.has_comm_configs(dict(row)):
+            raise ValueError(
+                "comm_fused_configs on a flydsl_fallback row, which the reader drops:\n"
+                f"{row.to_frame().T.to_string(index=False)}"
+            )
     with tempfile.TemporaryDirectory() as scratch:
         name = os.path.join(scratch, "merged.csv")
         merged.to_csv(name, index=False)

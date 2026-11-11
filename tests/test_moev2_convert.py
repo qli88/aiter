@@ -8,6 +8,7 @@ base call as the legacy row does, except that a 1-stage row's stage 2 (a blank c
 """
 
 import csv
+import json
 import math
 import pathlib
 import re
@@ -19,6 +20,7 @@ import pytest
 from aiter.moev2 import envs, paths
 from aiter.moev2.dispatch import convert, resolver, tuned, tuned_plans, tuned_table
 from aiter.moev2.engine import _canonical
+from aiter.moev2.segments.base import Params
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
@@ -372,3 +374,234 @@ def test_converted_rows_read_back_as_the_legacy_rows_cells(tmp_path, monkeypatch
         )
         found = tuned_table.lookup(problem)
         assert found == tuned_table.Found(cells=convert.cells(row))
+
+
+# comm_fused_configs: comm_fused rows of the a8w4 row.
+
+_DSV4 = _HERE.parent / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
+
+
+def _dsv4_table(tmp_path, tokens=(1, 4096), edit=None, tag=""):
+    """A legacy table of the shipped rows with comm_fused_configs at `tokens` (`edit`
+    applied to each row's configs; `tag`: their `_tag`)."""
+    with open(_DSV4, newline="") as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames
+        rows = [
+            r
+            for r in reader
+            if r["comm_fused_configs"].strip() and int(r["token"]) in tokens
+        ]
+    for r in rows:
+        r["_tag"] = tag
+        if edit is not None:
+            r["comm_fused_configs"] = edit(json.loads(r["comm_fused_configs"]))
+    path = tmp_path / "fmoe.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, header)
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(path)
+
+
+def _read(path, dedicated=False):
+    return tuned.read_table(path, tuned.index_columns(dedicated), dedicated)
+
+
+def _local(key):
+    return convert.problem_of(dict(zip(tuned.index_columns(False), key)), "gfx950", 256)
+
+
+def test_comm_fused_configs_become_comm_rows_of_the_a8w4_row(tmp_path, monkeypatch):
+    path = _dsv4_table(tmp_path)
+    table = _read(path)
+    rows, skipped = convert.convert_table(table, "gfx950", 256)
+    assert skipped == []
+    assert [(r["token"], r["path"], r["comm"]) for r in rows] == [
+        ("1", "a8w4", ""),
+        ("1", "comm_fused", "ar"),
+        ("4096", "a8w4", ""),
+        ("4096", "comm_fused", "ar"),
+        ("4096", "comm_fused", "rs"),
+    ]
+    local = {r["token"]: r for r in rows if r["path"] == "a8w4"}
+    for (key, legacy), token in zip(table[0].items(), ("1", "4096")):
+        configs = json.loads(legacy["comm_fused_configs"])
+        for row in (r for r in rows if r["path"] == "comm_fused"):
+            if row["token"] != token:
+                continue
+            entry = configs[row["comm"]]
+            runner = Params(entry["params"], family=entry["family"])
+            assert tuned_plans.decode_candidates(row["candidates"]) == {
+                **tuned_plans.decode_candidates(local[token]["candidates"]),
+                tuned_plans.RUNNER: runner,
+            }
+            assert row["structure"] == local[token]["structure"]
+            assert (row["tp"], row["add_shared"], row["gpu_model"]) == (
+                "8",
+                "True",
+                "mi355x",
+            )
+            assert float(row["e2e_us"]) == entry["us"] and row["mode"] == convert.MODE
+            assert all(row[c] == "" for c in convert.INFO_COLUMNS)
+    plan_file = _plan_file(tmp_path, rows)
+    read = {}
+    for name in (plan_file, path):
+        monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(name))
+        monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "replace")
+        tuned.clear_cache()
+        for key, legacy in table[0].items():
+            problem = _local(key)
+            assert tuned_table.lookup(problem) == tuned_table.Found(
+                cells=convert.cells(legacy)
+            )
+            for comm in ("ar", "rs"):
+                row = tuned_table.comm_lookup(problem, 8, comm, True, "mi355x")
+                if comm not in json.loads(legacy["comm_fused_configs"]):
+                    assert row is None
+                    continue
+                assert row.cells == convert.cells(legacy)
+                read.setdefault((key, comm), []).append(row)
+            assert tuned_table.comm_lookup(problem, 8, "ar", True, "mi350x") is None
+            assert tuned_table.comm_lookup(problem, 4, "ar", True, "mi355x") is None
+    assert len(read) == 3 and all(a == b for a, b in read.values())
+
+
+def _set(where, value):
+    def edit(configs):
+        entry = configs["ar"]
+        *path, last = where
+        for part in path:
+            entry = entry[part]
+        entry[last] = value
+        return json.dumps(configs)
+
+    return edit
+
+
+@pytest.mark.parametrize(
+    "edit, match",
+    [
+        (lambda c: "{", "Expecting"),
+        (lambda c: json.dumps([c]), "must be a JSON object"),
+        (lambda c: json.dumps({**c, "ag": c["ar"]}), r"unsupported comm_fused modes"),
+        (_set(("extra",), 1), r"unsupported comm_fused_configs\['ar'\] fields"),
+        (_set(("tp",), 8.5), "is not a whole number"),
+        (_set(("add_shared",), "yes"), "add_shared must be boolean"),
+        (_set(("gpu_model",), " "), "gpu_model must be a non-empty string"),
+        (_set(("params", "sort_block_m"), 128), "does not match CSV block_m=64"),
+        (_set(("family",), "nosuch"), "nosuch"),
+    ],
+)
+def test_comm_fused_configs_legacy_rejects_raise(tmp_path, monkeypatch, edit, match):
+    from types import SimpleNamespace
+
+    from aiter.ops.flydsl import comm_fused_moe_host as host
+
+    path = _dsv4_table(tmp_path, tokens=(4096,), edit=edit)
+    with pytest.raises(ValueError, match=match):
+        convert.convert_table(_read(path), "gfx950", 256)
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, path)
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "replace")
+    tuned.clear_cache()
+    key = next(iter(_read(path)[0]))
+    with pytest.raises(ValueError, match=match):
+        tuned_table.lookup(_local(key))
+    monkeypatch.setattr(
+        host, "AITER_CONFIGS", SimpleNamespace(AITER_CONFIG_FMOE_FILE=path)
+    )
+    host._winner_table.cache_clear()
+    try:
+        with pytest.raises((ValueError, TypeError, KeyError)):
+            host._winner_table()
+    finally:
+        host._winner_table.cache_clear()
+
+
+def test_comm_fused_configs_without_an_a8w4_row_are_skipped(tmp_path):
+    def bogus(configs):
+        return json.dumps(configs)
+
+    path = _dsv4_table(tmp_path, tokens=(4096,), edit=bogus)
+    text = (
+        pathlib.Path(path)
+        .read_text()
+        .replace("opus_moe1_afp8_wfp4_bf16_t64x384_gs_qgb3_aff32_p2_fp8", "bogus_moe1")
+    )
+    pathlib.Path(path).write_text(text)
+    rows, skipped = convert.convert_table(_read(path), "gfx950", 256)
+    assert rows == []
+    reasons = [r for _, r in skipped]
+    assert reasons[0].startswith("a8w4: ")
+    assert reasons[1:] == ["comm_fused: no a8w4 row"] * 2
+
+
+def test_comm_fused_configs_where_legacy_does_not_read_them_raise(
+    tmp_path, monkeypatch
+):
+    untagged = tmp_path / "untagged"
+    untagged.mkdir()
+    key = next(iter(_read(_dsv4_table(untagged, tokens=(4096,)))[0]))
+    path = _dsv4_table(tmp_path, tokens=(4096,), tag="flydsl_fallback")
+    with pytest.raises(ValueError, match="on a flydsl_fallback row"):
+        convert.merged_tables([path])
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, path)
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "replace")
+    tuned.clear_cache()
+    with pytest.raises(ValueError, match="comm_fused_configs on rows the reader drops"):
+        tuned_table.lookup(_local(key))
+
+    fhmoe = tmp_path / "fhmoe.csv"
+    configs = json.dumps(json.dumps({"rs": {"family": "direct"}}))
+    fhmoe.write_text(f"{_FHMOE_HEADER},comm_fused_configs\n{_fhmoe_row()},{configs}\n")
+    with pytest.raises(ValueError, match="comm_fused_configs in an FHMoE table"):
+        convert.convert_table(_read(str(fhmoe), True), "gfx950", 256, str(fhmoe))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(fhmoe))
+    tuned.clear_cache()
+    with pytest.raises(ValueError, match="comm_fused_configs in an FHMoE table"):
+        tuned_table.lookup(_local(key))
+
+
+@pytest.mark.parametrize(
+    "column, edit, match",
+    [
+        ("candidates", ('"sort_block_m": 64', '"sort_block_m": 128'), "CSV block_m=64"),
+        ("candidates", ('"family": "window"', '"family": "nosuch"'), "nosuch"),
+        ("gpu_model", ("mi355x", "MI355X"), "not a lowercase name"),
+        ("add_shared", ("True", "1"), "not True or False"),
+        ("tp", ("8", "8.5"), "not a whole number"),
+        ("gpu_model", ("mi355x", ""), "some collective columns blank"),
+    ],
+)
+def test_a_plan_file_s_comm_rows_legacy_rejects_raise(
+    tmp_path, monkeypatch, column, edit, match
+):
+    table = _read(_dsv4_table(tmp_path, tokens=(4096,)))
+    rows, _ = convert.convert_table(table, "gfx950", 256)
+    row = next(r for r in rows if r["comm"] == "rs")
+    assert edit[0] in row[column]
+    row[column] = row[column].replace(*edit)
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(_plan_file(tmp_path, rows)))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "replace")
+    tuned.clear_cache()
+    with pytest.raises(ValueError, match=match):
+        tuned_table.lookup(_local(next(iter(table[0]))))
+
+
+def test_comm_fused_configs_on_the_second_row_of_a_key_raise(tmp_path, monkeypatch):
+    path = _dsv4_table(tmp_path, tokens=(4096,))
+    lines = pathlib.Path(path).read_text().splitlines()
+    first = next(csv.DictReader(lines))
+    first["comm_fused_configs"] = ""
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, list(first))
+        writer.writeheader()
+        writer.writerow(first)
+        f.write(lines[1] + "\n")
+    key = next(iter(_read(path)[0]))
+    assert not tuned_table.has_comm_configs(_read(path)[0][key])
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, path)
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "replace")
+    tuned.clear_cache()
+    with pytest.raises(ValueError, match="the second of two rows of a key"):
+        tuned_table.lookup(_local(key))

@@ -436,7 +436,9 @@ def _default_params(problem, structure) -> dict:
     return defaults
 
 
-def resolve(problem, segments) -> Resolution:
+def resolve(problem, segments, cells=None) -> Resolution:
+    """`problem`'s plan over `segments`: the tuned table's rows of its key (`cells`,
+    a legacy comm_fused row's: those cells instead), else the default ranking."""
     explain = [] if overrides.explain() else None
 
     def note(line):
@@ -462,7 +464,11 @@ def resolve(problem, segments) -> Resolution:
     if not plans:
         return declined("no feasible plan")
     keys = problem.log_keys()
-    found = tuned_table.lookup(problem)
+    found = (
+        tuned_table.lookup(problem)
+        if cells is None
+        else tuned_table.Found(cells=dict(cells))
+    )
     chosen = () if overrides.bypass_tuned() else found.tuner
     for names, candidates in chosen:
         structure = next((s for s in plans if _names(s) == names), None)

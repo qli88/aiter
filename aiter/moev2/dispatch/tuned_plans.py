@@ -30,6 +30,8 @@ LOCAL_KEY_COLUMNS = INDEX_COLUMNS + DEDICATED_INDEX_COLUMNS
 KEY_COLUMNS = LOCAL_KEY_COLUMNS + PARALLEL_COLUMNS
 COMM_FUSED_PATH = "comm_fused"
 RUNNER = "comm_fused.stage2_rs"
+# The path whose plan a comm_fused row's runner replaces the stage 2 of.
+COMM_FUSED_LOCAL_PATH = "a8w4"
 COLUMNS = KEY_COLUMNS + ("path", "structure", "candidates", "e2e_us", "mode")
 # A converted legacy row's times (`convert`), read by nothing.
 INFO_COLUMNS = ("us1", "us2", "us")
