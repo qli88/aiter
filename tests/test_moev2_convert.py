@@ -11,6 +11,7 @@ import csv
 import math
 import pathlib
 import re
+import subprocess
 import sys
 
 import pytest
@@ -285,6 +286,74 @@ def test_a_row_whose_cells_do_not_come_back_has_none(tmp_path):
     ((key, reason),) = skipped
     assert key[2] == 2
     assert reason.endswith(": the cells do not come back: kernelName2 'stage2' vs ''")
+
+
+def test_the_committed_converted_tables_are_the_shipped_ones():
+    proc = subprocess.run(
+        [sys.executable, str(_HERE / "moe_dispatch" / "convert_tables.py"), "--check"],
+        cwd=_HERE.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout[-6000:] + proc.stderr[-3000:]
+
+
+def test_merged_tables_read_the_files_as_their_merge(tmp_path):
+    full = tmp_path / "full.csv"
+    full.write_text(f"{_MAIN_HEADER}\n{_ROWS['ck_2stage']}\n")
+    header = _MAIN_HEADER.replace("gfx,", "", 1).replace(",xbf16,flat", "")
+    blockscale_bf16 = (
+        _ROWS["asm_1stage_blank_stage2"]
+        .replace("gfx950,", "", 1)
+        .replace("blockscaleFp8", "blockscaleBf16")
+        .replace(",1,0,0,0", ",1,0")
+    )
+    lacking = tmp_path / "lacking.csv"
+    lacking.write_text(f"{header}\n{blockscale_bf16}\n")
+    tables = convert.merged_tables([full, lacking])
+    assert list(tables) == [str(full), str(lacking)]
+    (row,) = tables[str(lacking)][0].values()
+    assert (row["xbf16"], row["flat"]) == (0, 0)
+    assert convert.cells(row)["xbf16"] == 0
+    alone = tuned.read_table(str(lacking), tuned.index_columns(False), False)
+    assert convert.cells(next(iter(alone[0].values())))["xbf16"] == 1
+    ((key, _),) = tables[str(lacking)][0].items()
+    assert key[:2] == ("gfx950", 256)
+    assert not any("merged.csv" in str(k[0]) for k in tuned._LAST_READ)
+
+    twice = tmp_path / "twice.csv"
+    twice.write_text(f"{_MAIN_HEADER}\n{_ROWS['ck_2stage']}\n")
+    with pytest.raises(ValueError, match="keys in two rows"):
+        convert.merged_tables([full, twice])
+
+
+def test_merged_tables_raise_for_keys_the_merge_reads_twice(tmp_path):
+    row = _ROWS["ck_2stage"]
+    no_gfx = tmp_path / "no_gfx.csv"
+    no_gfx.write_text(
+        f"{_MAIN_HEADER.replace('gfx,', '', 1)}\n{row[len('gfx950,'):]}\n"
+    )
+    full = tmp_path / "full.csv"
+    full.write_text(f"{_MAIN_HEADER}\n{row}\n")
+    within = tmp_path / "within.csv"
+    within.write_text(f"{_MAIN_HEADER}\n{row}\n{row}\n")
+    tagged = tmp_path / "tagged.csv"
+    tagged.write_text(f"{_MAIN_HEADER},_tag\n{row},retuned\n")
+    fallback = tmp_path / "fallback.csv"
+    fallback.write_text(f"{_MAIN_HEADER},_tag\n{row},flydsl_fallback\n")
+    for files in ([no_gfx, full], [within], [full, tagged]):
+        with pytest.raises(ValueError, match="keys in two rows"):
+            convert.merged_tables(files)
+    tables = convert.merged_tables([full, fallback])
+    assert (len(tables[str(full)][0]), len(tables[str(fallback)][0])) == (1, 0)
+
+
+def test_the_shipped_sources_are_the_legacy_files():
+    main, fhmoe = convert.shipped_sources()
+    assert main[0] == convert.CONFIGS / "tuned_fmoe.csv" and len(main) > 1
+    assert all(p.parent == convert.CONFIGS / "model_configs" for p in main[1:])
+    assert fhmoe == convert.CONFIGS / "tuned_fhmoe.csv"
 
 
 def test_the_plan_file_reads_converted_rows(tmp_path, monkeypatch):

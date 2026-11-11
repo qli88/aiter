@@ -10,8 +10,9 @@ each tunable segment's kernel (stage 1's kernelName1, stage 2's kernelName2, a 1
 segment's kernelName1) with the row's block_m, ksplit, nt, xbf16 and flat. A 1-stage
 row's kernelName2 (empty, "Null" or a blank cell) is not kept: dispatch picks and
 discards alike for the three, and logs it as empty. `e2e_us` is the row's `us`; `us1`,
-`us2` and `us` (`INFO_COLUMNS`) are kept as read (numbers as Python prints them), and
-nothing reads them.
+`us2` and `us` (`INFO_COLUMNS`) are kept as the table reads them (numbers as Python
+prints them, an int as a float in a column the merge reads as floats), and nothing
+reads them.
 
 A row gets none (`convert_table` gives the reason) when its key is not read, when
 dispatch never looks its key up (an FHMoE row outside the contracts that read the
@@ -22,6 +23,9 @@ the candidates.
 """
 
 import math
+import os
+import pathlib
+import tempfile
 
 import torch
 
@@ -55,6 +59,13 @@ KEY_FIELDS = (
 )
 INFO_COLUMNS = tuned_plans.INFO_COLUMNS
 MODE = "legacy"
+CONFIGS = pathlib.Path(__file__).resolve().parents[2] / "configs"
+# The converted shipped tables, one per legacy file at the same path under it, and
+# `SOURCES` (columns source, sha256: each legacy file, relative to `CONFIGS`, and its
+# sha256).
+CONVERTED = CONFIGS / "moev2"
+SOURCES = "sources.csv"
+_SOURCE_COLUMN = "_moev2_source"
 # Read by Opus stage 2 into the launch metadata (`route_bucket_metadata`).
 ROUTE_COLUMNS = (
     "route_bucket",
@@ -187,13 +198,12 @@ def cells(row) -> dict:
 
 def candidates_of(structure, row_cells) -> dict:
     """`{segment name: Params}` of `structure`'s tunable segments holding `row_cells`
-    (`cells`); raises for a tunable segment that runs neither stage's kernel."""
+    (`cells`): the kernel, `block_m`, and the ksplit, nt, xbf16 and flat that are set;
+    raises for a tunable segment that runs neither stage's kernel."""
     shared = Params(
         block_m=row_cells["block_m"],
-        ksplit=row_cells["ksplit"],
-        nt=bool(row_cells["nt"]),
-        xbf16=bool(row_cells["xbf16"]),
-        flat=row_cells["flat"],
+        **{f: row_cells[f] for f in ("ksplit", "flat") if row_cells[f]},
+        **{f: True for f in ("nt", "xbf16") if row_cells[f]},
     )
     one_stage = len(structure) == 1 or resolver._one_stage(structure) is not None
     gemm1 = None if one_stage else resolver._gemm1(structure)
@@ -286,3 +296,60 @@ def convert_table(table, arch, cu_num, fhmoe_table=None):
             out.update({c: _text(row.get(c)) for c in INFO_COLUMNS})
             rows.append(out)
     return rows, skipped
+
+
+def shipped_sources():
+    """`(main, fhmoe)`: the legacy files the default table merges (`tuned_fmoe.csv`,
+    then the `model_configs/` tables `get_config_file` globs, here sorted) and the
+    FHMoE table."""
+    models = sorted(
+        p
+        for p in (CONFIGS / "model_configs").glob("*tuned_fmoe*.csv")
+        if p.is_file() and "untuned" not in p.name
+    )
+    return [CONFIGS / "tuned_fmoe.csv", *models], CONFIGS / "tuned_fhmoe.csv"
+
+
+def merged_tables(files) -> dict:
+    """`{file: (primary, {})}` of the legacy tuned CSVs `files` merged as the default
+    table is (`update_config_files`: a lacking `gfx` column comes from `cu_num`, any
+    other column a file lacks reads 0 in it; `tuned.read_table` reads the merge back),
+    each `file` with its primary rows of the merge, as `convert_table` takes a table.
+    Raises for a key in two rows: where the merge raises (also with the same `_tag`),
+    and where `read_table` would keep the first of two rows, which in the legacy merge
+    depends on the order the directory lists the files."""
+    import pandas as pd
+
+    frames = [pd.read_csv(f) for f in files]
+    frames = [tuned.ensure_gfx_column(f) if "gfx" not in f else f for f in frames]
+    columns = list(dict.fromkeys(c for frame in frames for c in frame.columns))
+    for frame in frames:
+        for c in columns:
+            if c not in frame.columns:
+                frame[c] = 0
+    merged = pd.concat(
+        [
+            f[columns].assign(**{_SOURCE_COLUMN: str(n)})
+            for n, f in zip(files, frames)
+            if not f.empty
+        ],
+        ignore_index=True,
+    )
+    index = tuned.index_columns(False)
+    tag = merged.get("_tag", pd.Series("", index=merged.index)).fillna("")
+    same_tag = merged[index].assign(_tag=tag).duplicated(keep=False)
+    read = merged[tag != "flydsl_fallback"]
+    first_kept = read.duplicated(subset=index, keep=False)
+    twice = merged[same_tag | first_kept.reindex(merged.index, fill_value=False)]
+    if len(twice):
+        raise ValueError(f"keys in two rows:\n{twice.to_string(index=False)}")
+    with tempfile.TemporaryDirectory() as scratch:
+        name = os.path.join(scratch, "merged.csv")
+        merged.to_csv(name, index=False)
+        primary, _ = tuned.read_table(name, tuned.index_columns(False), False)
+        tuned._LAST_READ.pop((name, False), None)
+    tables = {str(n): ({}, {}) for n in files}
+    for key, row in primary.items():
+        row = dict(row)
+        tables[row.pop(_SOURCE_COLUMN)][0][key] = row
+    return tables

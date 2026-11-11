@@ -1,0 +1,8 @@
+{
+ "model_configs/qwen3_6_35b_a3b_bf16_tuned_fmoe_gfx1201.csv": {
+  "no path takes the key": 14
+ },
+ "model_configs/qwen3_6_35b_a3b_fp8_tuned_fmoe_gfx1201.csv": {
+  "no path takes the key": 22
+ }
+}

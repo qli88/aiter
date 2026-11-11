@@ -1,0 +1,1 @@
+gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,shared_expert_id,hidden_pad,intermediate_pad,gate_mode,tp,comm,add_shared,gpu_model,path,structure,candidates,e2e_us,mode,us1,us2,us
