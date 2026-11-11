@@ -17,7 +17,7 @@ import sys
 import pytest
 
 from aiter.moev2 import envs, paths
-from aiter.moev2.dispatch import convert, resolver, tuned, tuned_plans
+from aiter.moev2.dispatch import convert, resolver, tuned, tuned_plans, tuned_table
 from aiter.moev2.engine import _canonical
 
 _HERE = pathlib.Path(__file__).resolve().parent
@@ -130,15 +130,20 @@ def _outcome(problem, segments):
     )
 
 
-def _cells_table(problem, out):
-    segments = {s.name: s for s in paths.registered()[out["path"]].segments}
-    structure = tuple(
-        segments[n] for n in tuned_plans.structure_names(out["structure"])
-    )
-    cells = resolver.candidate_row(
-        structure, tuned_plans.decode_candidates(out["candidates"])
-    )
-    return {tuned.exact_key(problem): cells}, {}
+def _plan_file(tmp_path, rows):
+    path = tmp_path / "converted.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, tuned_plans.COLUMNS + convert.INFO_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def _outcome_reading(path, problem, segments, monkeypatch):
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(path))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "replace")
+    tuned.clear_cache()
+    return _outcome(problem, segments)
 
 
 def test_cells_read_a_row_as_dispatch_does():
@@ -179,7 +184,7 @@ def test_cells_read_a_row_as_dispatch_does():
 
 
 def _check_main_row(line, arch, cu_num, tmp_path, monkeypatch):
-    _, table = _table(tmp_path, _MAIN_HEADER, [line])
+    legacy_file, table = _table(tmp_path, _MAIN_HEADER, [line])
     rows, skipped = convert.convert_table(table, arch, cu_num)
     assert skipped == []
     (out,) = rows
@@ -194,12 +199,9 @@ def _check_main_row(line, arch, cu_num, tmp_path, monkeypatch):
     assert out["e2e_us"] == out["us"] == line.split(",")[20]
     assert convert.paths_taking(problem) == [out["path"]]
     segments = paths.registered()[out["path"]].segments
-    monkeypatch.setattr(tuned, "_shared_default_table", lambda: table)
-    legacy = _outcome(problem, segments)
-    monkeypatch.setattr(
-        tuned, "_shared_default_table", lambda: _cells_table(problem, out)
-    )
-    assert _outcome(problem, segments) == legacy
+    legacy = _outcome_reading(legacy_file, problem, segments, monkeypatch)
+    plan_file = _plan_file(tmp_path, rows)
+    assert _outcome_reading(plan_file, problem, segments, monkeypatch) == legacy
     assert legacy[0] == "tuned"
 
 
@@ -231,10 +233,10 @@ def test_a_converted_fhmoe_row_resolves_as_its_legacy_row(line, tmp_path, monkey
         dict(zip(tuned.index_columns(True), key)), "gfx950", 256, name
     )
     segments = paths.registered()["fhmoe"].segments
-    monkeypatch.setattr(tuned, "_dedicated_table", lambda f: table)
-    legacy = _outcome(problem, segments)
-    monkeypatch.setattr(tuned, "_dedicated_table", lambda f: _cells_table(problem, out))
-    assert _outcome(problem, segments) == legacy
+    legacy = _outcome_reading(name, problem, segments, monkeypatch)
+    plan_file = _plan_file(tmp_path, rows)
+    assert _outcome_reading(plan_file, problem, segments, monkeypatch) == legacy
+    assert legacy[0] == "tuned"
 
 
 def test_rows_without_a_plan_row_say_why(tmp_path):
@@ -320,7 +322,6 @@ def test_merged_tables_read_the_files_as_their_merge(tmp_path):
     assert convert.cells(next(iter(alone[0].values())))["xbf16"] == 1
     ((key, _),) = tables[str(lacking)][0].items()
     assert key[:2] == ("gfx950", 256)
-    assert not any("merged.csv" in str(k[0]) for k in tuned._LAST_READ)
 
     twice = tmp_path / "twice.csv"
     twice.write_text(f"{_MAIN_HEADER}\n{_ROWS['ck_2stage']}\n")
@@ -356,25 +357,18 @@ def test_the_shipped_sources_are_the_legacy_files():
     assert fhmoe == convert.CONFIGS / "tuned_fhmoe.csv"
 
 
-def test_the_plan_file_reads_converted_rows(tmp_path, monkeypatch):
+def test_converted_rows_read_back_as_the_legacy_rows_cells(tmp_path, monkeypatch):
     _, table = _table(
         tmp_path, _MAIN_HEADER, [_ROWS["ck_2stage"], _ROWS["cktile_opus"]]
     )
     rows, _ = convert.convert_table(table, "gfx950", 256)
-    plan_file = tmp_path / "converted.csv"
-    with open(plan_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, tuned_plans.COLUMNS + convert.INFO_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(plan_file))
+    plan_file = _plan_file(tmp_path, rows)
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "replace")
     tuned.clear_cache()
-    for key, out in zip(table[0], rows):
+    for key, row in table[0].items():
         problem = convert.problem_of(
             dict(zip(tuned.index_columns(False), key)), "gfx950", 256
         )
-        assert tuned_plans.lookup(problem) == (
-            (
-                tuned_plans.structure_names(out["structure"]),
-                tuned_plans.decode_candidates(out["candidates"]),
-            ),
-        )
+        found = tuned_table.lookup(problem)
+        assert found == tuned_table.Found(cells=convert.cells(row))

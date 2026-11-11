@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tuned-table lookup.
+"""The legacy tuned tables' columns and reader, and v2 dispatch's caches.
 
-`read_table` is the CSV reader the legacy `get_2stage_cfgs` also uses, so both see the
-same rows; `lookup` reproduces the legacy `_lookup_cfg` with its fallbacks.
+`read_table` is the CSV reader of the legacy `get_2stage_cfgs`; v2 reads a legacy table
+with it only to convert it (`convert`, and `tuned_table` for a legacy table in
+`AITER_MOEV2_TUNED_TABLE`). v2 dispatch looks its rows up in `tuned_table`.
 
 Every cache in v2 dispatch that depends on tuned tables, environment variables or the
 arch is declared with `@cached`, so `clear_cache()` resets all of them at once; tests call
-it after changing AITER_CONFIG_FMOE or patching the arch, and the CK tuner after it
-rewrites a table.
+it after changing AITER_MOEV2_TUNED_TABLE or patching the arch. The shipped converted
+tables (`tuned_table._shipped`) are read once per process.
 """
 
 import functools
@@ -16,8 +17,6 @@ import functools
 from aiter import logger
 from aiter.jit.utils.chip_info import gfx_from_cu_num
 from aiter.ops.flydsl.mxfp4_kname import _is_mxfp4_kname
-
-from ..shapes import _PADDED_M_TIERS
 
 _CACHES: list = []
 
@@ -37,7 +36,6 @@ def clear_cache():
     """Clear every v2 dispatch cache and re-read the moev2 environment variables."""
     from .. import envs
 
-    _LAST_READ.clear()
     for cache in _CACHES:
         cache.cache_clear()
     envs.reload()
@@ -89,11 +87,6 @@ def ensure_gfx_column(df):
     return df
 
 
-# The tables most recently read per (file, dedicated), shared with the legacy reader so
-# a process reads (and warns about) each table once whichever side loads it first.
-_LAST_READ: dict = {}
-
-
 def read_table(tune_file, _INDEX_COLS, dedicated):
     """Read one tuned CSV into `(primary, fallback)` dicts keyed on `_INDEX_COLS`.
 
@@ -120,9 +113,7 @@ def read_table(tune_file, _INDEX_COLS, dedicated):
     primary = df_primary.set_index(_INDEX_COLS).to_dict("index")
 
     if dedicated:
-        result = (primary, {})
-        _LAST_READ[(tune_file, dedicated)] = result
-        return result
+        return primary, {}
 
     # Fallback dict: disable act_type so any activation can match.
     df_fallback = df.copy()
@@ -149,97 +140,10 @@ def read_table(tune_file, _INDEX_COLS, dedicated):
         df_fallback = df_fallback.loc[~dup_mask]
     fallback = df_fallback.set_index(_INDEX_COLS).to_dict("index")
 
-    result = (primary, fallback)
-    _LAST_READ[(tune_file, dedicated)] = result
-    return result
-
-
-def default_table_file() -> str:
-    from aiter.jit.core import AITER_CONFIGS
-
-    return AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
-
-
-_shared_default_table = None
-
-
-def share_default_table(source):
-    """Read the default table through `source()` instead of from the CSV.
-
-    aiter.fused_moe passes its `cfg_2stages` loader, so tests and tuners that assign or
-    reset that global change what v2 reads too.
-    """
-    global _shared_default_table
-    _shared_default_table = source
-
-
-def _default_table():
-    if _shared_default_table is not None:
-        return _shared_default_table()
-    return _own_default_table()
-
-
-@cached
-def _own_default_table():
-    # Read once per process, like the legacy `cfg_2stages` global.
-    tune_file = default_table_file()
-    return _LAST_READ.get((tune_file, False)) or read_table(
-        tune_file, index_columns(False), False
-    )
-
-
-@cached
-def _dedicated_table(tune_file):
-    return _LAST_READ.get((tune_file, True)) or read_table(
-        tune_file, index_columns(True), True
-    )
-
-
-def table_for(problem):
-    tune_file = problem.extras.get("tuned_table")
-    return _default_table() if tune_file is None else _dedicated_table(tune_file)
-
-
-def lookup_keys(problem):
-    """`(keys, keys_disabled)` the legacy lookup uses; `keys` is also the log key."""
-    keys = problem.log_keys()
-    keys_disabled = keys[:7] + (_ACT_TYPE_DISABLED_KEY,) + keys[8:]
-    return keys, keys_disabled
+    return primary, fallback
 
 
 def exact_key(problem):
-    """The key of `problem`'s exact row, the first `lookup` tries."""
+    """The legacy-typed key of `problem`'s exact row."""
     keys = problem.log_keys()
     return keys[:7] + (str(problem.activation.activation),) + keys[8:]
-
-
-def lookup(problem, tables=None):
-    """The tuned row for `problem` (the legacy `_lookup_cfg`), or None.
-
-    Exact key first, then the activation-agnostic table (default table only), then, for a
-    token count above the smallest tier, the smaller tiers in descending order.
-    """
-    c2s = table_for(problem) if tables is None else tables
-    if not c2s:
-        return None
-    _, keys_disabled = lookup_keys(problem)
-    dedicated = problem.extras.get("tuned_table") is not None
-    token = problem.shape.m
-    primary, fallback = c2s
-    lookup_keys_ = exact_key(problem)
-    result = primary.get(lookup_keys_, None)
-    if result is None and not dedicated:
-        result = fallback.get(keys_disabled, None)
-    # Tier fallback: if current tier not found, try smaller tiers in descending order
-    if result is None and not dedicated and token > _PADDED_M_TIERS[0]:
-        tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
-        for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
-            # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
-            keys_fb = lookup_keys_[:2] + (fallback_tier,) + lookup_keys_[3:]
-            keys_fb_disabled = keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
-            result = primary.get(keys_fb, None)
-            if result is None:
-                result = fallback.get(keys_fb_disabled, None)
-            if result is not None:
-                break
-    return result

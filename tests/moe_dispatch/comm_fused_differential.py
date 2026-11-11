@@ -289,7 +289,7 @@ def _write_row(template, comm, bucket, path):
 
 def _engine_fn(session, comm, tokens, moe_args, run_kw, tuned=False):
     """`MoeEngine.forward` of a `CommFusedTemplate` engine over the TP group; with
-    `tuned`, built while `AITER_MOEV2_TUNED_PLANS` names `_write_plan_file`'s file."""
+    `tuned`, built while `AITER_MOEV2_TUNED_TABLE` names `_write_plan_file`'s file."""
     from aiter.moev2 import engine as eng
     from aiter.moev2 import envs
     from aiter.moev2.dispatch import tuned as tuned_cache
@@ -327,7 +327,10 @@ def _engine_fn(session, comm, tokens, moe_args, run_kw, tuned=False):
     if tuned:
         path = f"/tmp/moev2_cf_differential_plans_{os.getppid()}.csv"
         _write_plan_file(session, template, comm, rows, path)
-        env = {envs.AITER_MOEV2_TUNED_PLANS: path}
+        env = {
+            envs.AITER_MOEV2_TUNED_TABLE: path,
+            envs.AITER_MOEV2_TUNED_TABLE_MODE: "override",
+        }
     with mock.patch.dict(os.environ, env):
         tuned_cache.clear_cache()
         try:

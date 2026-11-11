@@ -12,7 +12,6 @@ the a8w4 path declines goes back to the legacy runtime, before any collective.
 runner set (`prepare` creates it on the engine's `GroupCoordinator`).
 """
 
-import csv
 import functools
 import inspect
 import logging
@@ -22,8 +21,8 @@ import torch
 
 from aiter import ActivationType, QuantType
 
-from .. import api, envs, paths
-from ..dispatch import resolver, tuned_plans
+from .. import api, paths
+from ..dispatch import resolver, tuned_plans, tuned_table
 from ..dispatch.plan import SegmentChoice
 from ..engine import (
     LOCAL_SIDE_INPUTS,
@@ -193,8 +192,8 @@ class CommFusedTemplate(LocalTemplate):
     `CommFusedMoeRuntime.supports` says. `capture()` warms up nothing: a warm-up would
     be a collective with a shared partial the caller owns.
 
-    While `AITER_MOEV2_TUNED_PLANS` names a plan file, its comm_fused rows of
-    this geometry and GPU model (`tuned_plans.comm_lookup`, the key of the call padded
+    The tuned table's comm_fused rows (`AITER_MOEV2_TUNED_TABLE`'s; none ship) of
+    this geometry and GPU model (`tuned_table.comm_lookup`, the key of the call padded
     to the row's token count) override the winner table's runner buckets: a runner row
     gives its bucket that runner (built from the row) with the row's a8w4 plan; an
     ordinary row leaves its bucket unserved. A row is not used (logged) at a token
@@ -203,8 +202,8 @@ class CommFusedTemplate(LocalTemplate):
     would not fit the flat-VA stride. The runner set is then built over the resulting
     configs (the Window MXFP8 fallback applied to the rows' as to the table's), or is
     the table's own when they are the table's.
-    Buckets without a row are as above. Each rank reads the file on its own; the
-    engine's `prepare` fails on every rank unless all read the same file (its digest
+    Buckets without a row are as above. Each rank reads the table on its own; the
+    engine's `prepare` fails on every rank unless all read the same table (its digest
     is in the agreement), and the segments' `prepare` unless all use the same rows.
     """
 
@@ -219,7 +218,7 @@ class CommFusedTemplate(LocalTemplate):
     def __post_init__(self):
         super().__post_init__()
         self._segment = None
-        self._tuned = {}  # runner bucket -> the plan file's a8w4 Resolution
+        self._tuned = {}  # runner bucket -> the tuned row's a8w4 Resolution
 
     def _local_problem(self, bucket):
         """The a8w4 key of a call padded to `bucket` tokens."""
@@ -228,31 +227,25 @@ class CommFusedTemplate(LocalTemplate):
         return api.problem_from_key(args, kwargs)
 
     def _file_rows(self, shape) -> dict:
-        """`{token count: (structure names, candidates)}`: the plan file's
+        """`{token count: (structure names, candidates)}`: the tuned table's
         comm_fused rows of this geometry, each the row of the call padded to it (rows
         at a count calls do not key at are not used, logged)."""
         from aiter.ops.flydsl.comm_fused_moe_host import get_gpu_model
 
-        if not envs.tuned_plans_file():
-            return {}
         key = (self.tp_size, self.comm, self.add_shared, get_gpu_model() or "")
-        try:
-            rows = {}
-            for m in tuned_plans.comm_tokens(self._local_problem(1), *key):
-                problem = self._local_problem(m)
-                if problem.shape.m != m:
-                    logger.warning(
-                        f"[fused_moe] moev2 tuned comm_fused row for M={m} not used: "
-                        f"calls of {m} tokens key as M={problem.shape.m}"
-                    )
-                    continue
-                row = tuned_plans.comm_lookup(problem, *key)
-                if row is not None:
-                    rows[m] = row
-            return rows
-        except (OSError, ValueError, KeyError, csv.Error) as error:
-            logger.warning(f"[fused_moe] moev2 tuned plan file not read: {error}")
-            return {}
+        rows = {}
+        for m in tuned_table.comm_tokens(self._local_problem(1), *key):
+            problem = self._local_problem(m)
+            if problem.shape.m != m:
+                logger.warning(
+                    f"[fused_moe] moev2 tuned comm_fused row for M={m} not used: "
+                    f"calls of {m} tokens key as M={problem.shape.m}"
+                )
+                continue
+            row = tuned_table.comm_lookup(problem, *key)
+            if row is not None:
+                rows[m] = row
+        return rows
 
     def _tuned_resolution(self, m, names, candidates):
         """The row's a8w4 plan for the call padded to `m`; raises ValueError when it
@@ -271,7 +264,7 @@ class CommFusedTemplate(LocalTemplate):
         return built
 
     def _tuned_runner(self, shape, m, names, candidates):
-        """`(runner config, a8w4 Resolution)` of the plan file's runner row at `m`;
+        """`(runner config, a8w4 Resolution)` of the tuned table's runner row at `m`;
         raises with the reason it cannot be used."""
         config = stage2_rs.runner_config(candidates[tuned_plans.RUNNER], shape, m)
         resolution = self._tuned_resolution(m, names, candidates)
@@ -319,7 +312,7 @@ class CommFusedTemplate(LocalTemplate):
         return self._segment
 
     def _tuned_configs(self, shape, rows):
-        """The runner config per bucket with the plan file's `rows` applied (their a8w4
+        """The runner config per bucket with the tuned table's `rows` applied (their a8w4
         plans into `_tuned`), or None when the table's runner set is to be used (the
         same configs: its shared set)."""
         from aiter.ops.flydsl.comm_fused_moe_host import (

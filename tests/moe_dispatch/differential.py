@@ -25,6 +25,7 @@ import contextlib
 import json
 import os
 import pathlib
+import re
 import sys
 from collections import Counter
 
@@ -55,6 +56,18 @@ def captured_logs():
         logger.setLevel(level)
 
 
+# v2 holds a 1-stage row without its kernelName2 (`convert.cells`), which legacy logs as
+# the table reads it: "Null", a blank cell (nan) or empty.
+_ONE_STAGE_KERNEL2 = re.compile(
+    r"(using 1stage(?: xbf16)? \(kernelName1='[^']*', kernelName2=)(?:'Null'|nan|'')\)"
+)
+
+
+def _as_v2_logs(logs):
+    """Legacy's log lines `logs` with a 1-stage row's kernelName2 as v2 logs it."""
+    return [(level, _ONE_STAGE_KERNEL2.sub(r"\1'')", line)) for level, line in logs]
+
+
 def _legacy_logs(key):
     import aiter.fused_moe as fm
 
@@ -63,7 +76,7 @@ def _legacy_logs(key):
             fm.get_2stage_cfgs.__wrapped__(*key.args, **key.call_kwargs())
         except Exception:  # noqa: BLE001, S110
             pass
-    return logs
+    return _as_v2_logs(logs)
 
 
 # The stage-1 functions of the legacy 2-stage branches a ranking region hands back.
@@ -136,7 +149,7 @@ def legacy_fhmoe(key):
             got = record.normalize(_use_fhmoe_wrappers(metadata))
         except Exception as exc:  # noqa: BLE001
             got = record.error_record(exc)
-    return got, logs
+    return got, _as_v2_logs(logs)
 
 
 def compare_fhmoe(path, key, check_logs=True):
@@ -202,7 +215,6 @@ def compare(arch, check_logs=True, live=False):
     `known_declines.py`.
     """
     from aiter.moev2 import paths
-    from aiter.moev2.dispatch import tuned
     from moe_dispatch import arch_sim, known_declines, record, snapshot
 
     if live:
@@ -240,11 +252,10 @@ def compare(arch, check_logs=True, live=False):
 
     with arch_sim.simulated_arch(arch) as (gfx, cu_num):
         keys = snapshot.dispatch_keys(gfx, cu_num)
-        # Load the tuned table once up front so no key's logs include the load warnings.
+        # Load legacy's tuned table once up front so no key's logs include its load warnings.
         with captured_logs():
             if keys:
                 _legacy_logs(keys[0])
-            tuned._default_table()
         for key in keys:
             label = key.label()
             if label in seen:  # a row repeated in the tuned table
@@ -349,11 +360,7 @@ def main(argv=None):
     sys.path.insert(0, str(_HERE.parent))
     from moe_dispatch import snapshot
 
-    snapshot._setup()
-    # After _setup, which drops the dispatch-affecting variables of the caller.
-    for item in args.env:
-        name, _, value = item.partition("=")
-        os.environ[name] = value
+    snapshot._setup(env=args.env)
     from moe_dispatch import arch_sim
 
     failed = False

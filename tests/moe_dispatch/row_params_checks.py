@@ -32,7 +32,7 @@ def check_arch(arch, served, verbose=False):
     """`(counts, ok, lines)` for one simulated arch: `counts` of the choices outside
     `param_space` by "path | segment | reason", `ok` the number inside."""
     from aiter.moev2 import api
-    from aiter.moev2.dispatch import coverage, tuned
+    from aiter.moev2.dispatch import coverage
     from aiter.moev2.dispatch.resolver import resolve
     from moe_dispatch import arch_sim, snapshot
     from moe_dispatch.coverage_checks import _ROW_SECTIONS
@@ -40,7 +40,6 @@ def check_arch(arch, served, verbose=False):
 
     counts, ok, lines, seen = Counter(), 0, [], set()
     with arch_sim.simulated_arch(arch) as (gfx, cu_num), captured_logs():
-        tuned._default_table()
         for key in snapshot.dispatch_keys(gfx, cu_num):
             fhmoe = _ROW_SECTIONS.get(key.section)
             if key.variant != "base" or fhmoe is None or key.label() in seen:

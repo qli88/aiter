@@ -1,36 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The v2 tuner's plan file (`python -m aiter.moev2.tuning`), read only by v2.
+"""The v2 plan file's format, read only by v2 (`tuned_table`).
 
-One CSV row per (key, path) the tuner found a winner for, and nothing else (the other
-structures, their times and why they failed are in the tuner's log file): the key in
-the tuned tables' index columns (the FHMoE columns empty for other keys) and, for a TP
-call tuned with its collective (path `comm_fused`), the collective's
-(`PARALLEL_COLUMNS`: TP size, "ar" or "rs", whether the shared partial is added, the
-GPU model; empty for local keys), the path, the structure (its segment names), each
-tunable segment's candidate (JSON; a comm_fused row's runner under
-`comm_fused.stage2_rs`, none for the ordinary call), `e2e_us` and `mode`.
+One CSV row per (key, path): the key in the tuned tables' index columns (the FHMoE
+columns empty for other keys) and, for a TP call tuned with its collective (path
+`comm_fused`), the collective's (`PARALLEL_COLUMNS`: TP size, "ar" or "rs", whether the
+shared partial is added, the GPU model; empty for local keys), the path, the structure
+(its segment names), each tunable segment's candidate (JSON; a comm_fused row's runner
+under `comm_fused.stage2_rs`, none for the ordinary call), `e2e_us` and `mode`.
 
-`resolver.resolve` builds a key's rows (one per path tuned; `resolver.build`) before
-reading the tuned tables, and only while `AITER_MOEV2_TUNED_PLANS` names the file;
-`comm_lookup` gives `CommFusedTemplate` a TP key's comm_fused row. Lookup is by exact
-key: no activation-agnostic or smaller-tier fallback. A file without the parallel
-columns (written before them) reads as local keys only; a file with columns this one
-does not have (the tuner's log file) is not read. Rows converted from a legacy tuned
-table (`convert`, `mode` "legacy") also hold its times (`INFO_COLUMNS`), which are not
-read; `mode` is not read either, so a converted row in this file is built as any
-row is. A process reads the file once;
-`digest()`, the sha256 of what it read, is part of the engine's plan agreement.
+The v2 tuner (`python -m aiter.moev2.tuning`) writes one row per (key, path) it found
+a winner for (the other structures, their times and why they failed are in its log
+file). A row converted from a legacy tuned table (`convert`, `mode` "legacy") also
+holds its times (`INFO_COLUMNS`), which are not read; `tuned_table` reads such a row as
+the legacy row's cells (`resolver.candidate_row`), any other as a tuner row. A file
+without the parallel columns (written before them) reads as local keys only; a file
+with columns this one does not have (the tuner's log file) is not read.
 """
 
 import csv
-import hashlib
 import io
 import json
 
-from .. import envs
 from ..segments.base import Params
-from .tuned import DEDICATED_INDEX_COLUMNS, INDEX_COLUMNS, cached
+from .tuned import DEDICATED_INDEX_COLUMNS, INDEX_COLUMNS
 
 PARALLEL_COLUMNS = ("tp", "comm", "add_shared", "gpu_model")
 LOCAL_KEY_COLUMNS = INDEX_COLUMNS + DEDICATED_INDEX_COLUMNS
@@ -41,6 +34,7 @@ COLUMNS = KEY_COLUMNS + ("path", "structure", "candidates", "e2e_us", "mode")
 # A converted legacy row's times (`convert`), read by nothing.
 INFO_COLUMNS = ("us1", "us2", "us")
 STRUCTURE_SEPARATOR = " | "
+LEGACY_MODE = "legacy"
 
 
 def key_values(problem) -> tuple:
@@ -71,91 +65,24 @@ def structure_names(text) -> tuple:
     return tuple(text.split(STRUCTURE_SEPARATOR))
 
 
-@cached
-def _content(path) -> tuple:
-    """`(sha256, bytes)` of the file, or `("missing", the OSError)`."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError as exc:
-        return "missing", exc
-    return hashlib.sha256(data).hexdigest(), data
+def is_plan_file(fieldnames) -> bool:
+    """Whether a CSV with header `fieldnames` is a plan file (else a legacy table)."""
+    return {"structure", "candidates"} <= set(fieldnames or ())
 
 
-@cached
-def _winners(path):
-    winners = {}
-    data = _content(path)[1]
-    if isinstance(data, OSError):
-        raise OSError(data.errno, data.strerror, data.filename)
-    reader = csv.DictReader(io.StringIO(data.decode(), newline=""))
+def read_rows(text, name) -> list:
+    """The rows (dicts) of plan file `name` with content `text`, its key columns
+    filled ("" where blank or absent). Raises for columns a plan file does not have."""
+    reader = csv.DictReader(io.StringIO(text, newline=""))
     other = [c for c in reader.fieldnames or () if c not in COLUMNS + INFO_COLUMNS]
     if other:
         raise ValueError(
-            f"{path} has columns a v2 plan file does not ({', '.join(other)})"
+            f"{name} has columns a v2 plan file does not ({', '.join(other)})"
         )
+    rows = []
     for row in reader:
-        key = tuple(row.get(c) or "" for c in KEY_COLUMNS)
-        if row["path"] in winners.setdefault(key, {}):
-            raise ValueError(f"{path}: two rows for {key} on {row['path']}")
-        winners[key][row["path"]] = (
-            structure_names(row["structure"]),
-            decode_candidates(row["candidates"]) if row["candidates"] else {},
-        )
-    return winners
-
-
-def digest():
-    """The sha256 of the file `AITER_MOEV2_TUNED_PLANS` names, as this process read it
-    (its rows come from that read), "missing" when that read failed, None with no file
-    named. A failed read is kept as a read is, until `tuned.clear_cache()`."""
-    path = envs.tuned_plans_file()
-    if not path:
-        return None
-    return _content(path)[0]
-
-
-def lookup(problem) -> tuple:
-    """`(structure names, {segment name: Params})` of each of `problem`'s winners in
-    the file `AITER_MOEV2_TUNED_PLANS` names (one per path tuned), in file order; empty
-    with no file or row, or for a problem with a collective or a tail (the tuner tunes
-    neither). Raises when the file cannot be read."""
-    path = envs.tuned_plans_file()
-    if not path or problem.parallel is not None or problem.tail is not None:
-        return ()
-    winners = _winners(path).get(key_values(problem), {})
-    return tuple(v for p, v in winners.items() if p != COMM_FUSED_PATH)
-
-
-def comm_lookup(local, tp, comm, add_shared, gpu_model):
-    """`(structure names, {segment name: Params})` of the TP call's comm_fused
-    row in the file `AITER_MOEV2_TUNED_PLANS` names (its runner under `RUNNER`; none:
-    the ordinary call won), or None with no file or row."""
-    path = envs.tuned_plans_file()
-    if not path:
-        return None
-    key = comm_key_values(local, tp, comm, add_shared, gpu_model)
-    return _winners(path).get(key, {}).get(COMM_FUSED_PATH)
-
-
-def comm_tokens(local, tp, comm, add_shared, gpu_model) -> tuple:
-    """The token counts of the comm_fused rows of `local`'s key at any token
-    count and activation dtype (which follows the count; the rest of the key as
-    `comm_lookup`'s), ascending: each still to be looked up at its count."""
-    path = envs.tuned_plans_file()
-    if not path:
-        return ()
-    token = KEY_COLUMNS.index("token")
-    target = any_token(comm_key_values(local, tp, comm, add_shared, gpu_model))
-    return tuple(
-        sorted(
-            {
-                int(k[token])
-                for k, by_path in _winners(path).items()
-                if COMM_FUSED_PATH in by_path and any_token(k) == target
-            }
-        )
-    )
+        rows.append(row | {c: row.get(c) or "" for c in KEY_COLUMNS})
+    return rows
 
 
 def any_token(key) -> tuple:

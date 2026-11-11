@@ -917,7 +917,7 @@ def _write(path, rows):
 
 def test_the_plan_file_keeps_tp_rows_apart_from_local_ones(tmp_path, monkeypatch):
     from aiter.moev2 import envs
-    from aiter.moev2.dispatch import tuned, tuned_plans
+    from aiter.moev2.dispatch import tuned, tuned_plans, tuned_table
 
     problem = _problem(64, "rs")
     fused = _tune(problem, _GroupFake(1000.0, _direct_us))
@@ -930,17 +930,18 @@ def test_the_plan_file_keeps_tp_rows_apart_from_local_ones(tmp_path, monkeypatch
     _write(plan_file, rows + other_dtype)
     assert rows[0]["tp"] == "8" and rows[0]["comm"] == "rs"
     assert rows[0]["add_shared"] == "True" and rows[0]["gpu_model"] == "mi350x"
-    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
     tuned.clear_cache()
     key = (8, "rs", True, "mi350x")
-    names, candidates = tuned_plans.comm_lookup(problem.local, *key)
+    names, candidates = tuned_table.comm_lookup(problem.local, *key)
     assert names == fused[0].structure and candidates == fused[0].candidates
-    names, candidates = tuned_plans.comm_lookup(_problem(128).local, *key)
+    names, candidates = tuned_table.comm_lookup(_problem(128).local, *key)
     assert tuned_plans.RUNNER not in candidates
-    assert tuned_plans.comm_lookup(problem.local, 8, "ar", True, "mi350x") is None
-    assert tuned_plans.comm_lookup(problem.local, 8, "rs", True, "mi355x") is None
-    assert tuned_plans.lookup(problem.local) == ()
-    assert tuned_plans.comm_tokens(_problem(1).local, *key) == (64, 128, 256)
+    assert tuned_table.comm_lookup(problem.local, 8, "ar", True, "mi350x") is None
+    assert tuned_table.comm_lookup(problem.local, 8, "rs", True, "mi355x") is None
+    assert tuned_table.lookup(problem.local).tuner == ()
+    assert tuned_table.comm_tokens(_problem(1).local, *key) == (64, 128, 256)
     old = tmp_path / "old.csv"
     local_columns = [
         c for c in tuned_plans.COLUMNS if c not in tuned_plans.PARALLEL_COLUMNS
@@ -949,15 +950,17 @@ def test_the_plan_file_keeps_tp_rows_apart_from_local_ones(tmp_path, monkeypatch
         writer = csv.DictWriter(f, local_columns, extrasaction="ignore")
         writer.writeheader()
         writer.writerows({**r, "path": "a8w4"} for r in rows[:1])
-    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(old))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(old))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
     tuned.clear_cache()
-    assert tuned_plans.lookup(problem.local) == (
+    assert tuned_table.lookup(problem.local).tuner == (
         (fused[0].structure, fused[0].candidates),
     )
-    assert tuned_plans.comm_lookup(problem.local, *key) is None
-    monkeypatch.delenv(envs.AITER_MOEV2_TUNED_PLANS)
+    assert tuned_table.comm_lookup(problem.local, *key) is None
+    monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE, raising=False)
+    monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, raising=False)
     tuned.clear_cache()
-    assert tuned_plans.comm_lookup(problem.local, *key) is None
+    assert tuned_table.comm_lookup(problem.local, *key) is None
 
 
 def _template(monkeypatch, comm):
@@ -1043,7 +1046,8 @@ def test_the_template_serves_the_plan_files_rows(tmp_path, monkeypatch, caplog):
     rows += [{**r, "token": "100"} for r in _comm_rows(_problem(64, "rs"), fused)]
     plan_file = tmp_path / "plans.csv"
     _write(plan_file, rows)
-    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
     tuned.clear_cache()
     template, _ = _template(monkeypatch, "rs")
     with caplog.at_level("WARNING", logger="aiter"):
@@ -1083,7 +1087,8 @@ def test_rows_naming_the_table_s_runners_keep_its_runner_set(tmp_path, monkeypat
     )
     plan_file = tmp_path / "plans.csv"
     _write(plan_file, _comm_rows(_problem(64, "rs"), fused))
-    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
     tuned.clear_cache()
     template, shipped = _template(monkeypatch, "rs")
     segment = template._stage2()
@@ -1123,7 +1128,8 @@ def test_tuned_rows_are_dropped_when_their_runner_set_does_not_fit(
     fused = _tune(_problem(64, "rs"), _GroupFake(1000.0, _direct_us), axes=axes)
     plan_file = tmp_path / "plans.csv"
     _write(plan_file, _comm_rows(_problem(64, "rs"), fused))
-    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(plan_file))
+    monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
     tuned.clear_cache()
     template, shipped = _template(monkeypatch, "rs")
     monkeypatch.setattr(host, "FLAT_VA_RANK_STRIDE", 1)
@@ -1169,9 +1175,9 @@ def test_a_runner_set_needs_the_same_plan_file_rows_on_every_rank(monkeypatch):
     assert first.runners is second.runners and made == [configs]
     other = stage2_rs.CommFusedStage2(configs, shape=shape, tuned=True, rows=())
     with pytest.raises(
-        RuntimeError, match=r"different v2 plan file rows \(ranks \[1\]"
+        RuntimeError, match=r"different tuned comm_fused rows \(ranks \[1\]"
     ):
         other.prepare(ctx)
     plain = stage2_rs.CommFusedStage2(configs, shape=shape)
-    with pytest.raises(RuntimeError, match="AITER_MOEV2_TUNED_PLANS differs"):
+    with pytest.raises(RuntimeError, match="AITER_MOEV2_TUNED_TABLE differs"):
         plain.prepare(ctx)  # rank 1 read a file, this rank none

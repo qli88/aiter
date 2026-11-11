@@ -581,35 +581,37 @@ def test_local_template_resolves_as_the_path_dispatches(gfx950):
     assert "0x" not in plan.identity  # no object addresses: the same on every rank
 
 
-def test_the_local_template_agrees_on_the_v2_plan_file(gfx950, tmp_path, monkeypatch):
-    import hashlib
-
+def test_the_local_template_agrees_on_the_tuned_table(gfx950, tmp_path, monkeypatch):
     from aiter.moev2 import envs
-    from aiter.moev2.dispatch import tuned
+    from aiter.moev2.dispatch import tuned, tuned_plans
 
     template = LocalTemplate(_meta_weights(), topk=2)
 
     def digests(name, text=None):
         if name is None:
-            monkeypatch.delenv(envs.AITER_MOEV2_TUNED_PLANS, raising=False)
+            monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE, raising=False)
+            monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, raising=False)
         else:
             (tmp_path / name).write_text(text)
-            monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(tmp_path / name))
+            monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE, str(tmp_path / name))
+            monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, "override")
         tuned.clear_cache()
         return template.digests()
 
+    empty = ",".join(tuned_plans.COLUMNS) + "\n"
+    other = ",".join(tuned_plans.COLUMNS + tuned_plans.INFO_COLUMNS) + "\n"
     unset = digests(None)
-    assert unset["v2_plan_file"] is None and "tuned_table" in unset
-    a = digests("a.csv", "token,path\n")
-    assert a["v2_plan_file"] == hashlib.sha256(b"token,path\n").hexdigest()
+    assert set(unset) == {"tuned_table"}
+    a = digests("a.csv", empty)
+    assert a != unset
     template.resolve(1, graph_capture=False)
-    (tmp_path / "a.csv").write_text("token,path\n1,x\n")
+    (tmp_path / "a.csv").write_text(other)
     assert template.digests() == a  # of the read the plans came from
-    assert digests("same.csv", "token,path\n") == a  # the content, not the path
-    b = digests("b.csv", "token,path\n1,x\n")
+    assert digests("same.csv", empty) == a  # the content, not the path
+    b = digests("b.csv", other)
     record = {"aiter": "v", "buckets": [], "memory": [0, 0], "memory_budget": None}
     for theirs in (b, unset):
-        with pytest.raises(PlanDisagreement, match="v2_plan_file differ"):
+        with pytest.raises(PlanDisagreement, match="tuned_table differ"):
             engine._check_agreement(
                 [{**record, "digests": a}, {**record, "digests": theirs}]
             )

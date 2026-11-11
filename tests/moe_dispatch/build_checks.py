@@ -84,14 +84,14 @@ def plan_candidates(problem, plan):
 
 def _resolve_row(problem, path, row):
     """`resolve` with tuned `row` as the key's row."""
-    from aiter.moev2.dispatch import resolver, tuned
+    from aiter.moev2.dispatch import resolver, tuned_table
 
-    lookup = tuned.lookup
-    tuned.lookup = lambda _: dict(row)
+    lookup = tuned_table.lookup
+    tuned_table.lookup = lambda _: tuned_table.Found(cells=dict(row))
     try:
         return resolver.resolve(problem, path.segments)
     finally:
-        tuned.lookup = lookup
+        tuned_table.lookup = lookup
 
 
 def _check_combinations(problem, path, counts):
@@ -139,14 +139,13 @@ def _check_combinations(problem, path, counts):
 def check_arch(arch, served, verbose=False):
     """`(counts, problems, lines)` for one simulated arch."""
     from aiter.moev2 import api
-    from aiter.moev2.dispatch import resolver, tuned
+    from aiter.moev2.dispatch import resolver, tuned_table
     from moe_dispatch import arch_sim, snapshot
     from moe_dispatch.coverage_checks import _ROW_SECTIONS
     from moe_dispatch.differential import captured_logs
 
     counts, problems, lines, seen = Counter(), 0, [], set()
     with arch_sim.simulated_arch(arch) as (gfx, cu_num), captured_logs():
-        tuned._default_table()
         for key in snapshot.dispatch_keys(gfx, cu_num):
             fhmoe = _ROW_SECTIONS.get(key.section)
             if key.variant != "base" or fhmoe is None or key.label() in seen:
@@ -159,7 +158,7 @@ def check_arch(arch, served, verbose=False):
             if fhmoe:
                 problem = api.fhmoe_problem(problem)
             paths = [path for path in served if path.takes(problem)]
-            if paths and tuned.lookup(problem) is not None:
+            if paths and tuned_table.lookup(problem).cells is not None:
                 counts["served keys with a tuned row"] += 1
             for path in paths:
                 errors = _check_combinations(problem, path, counts)

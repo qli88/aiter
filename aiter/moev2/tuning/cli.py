@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """`python -m aiter.moev2.tuning`: tune keys with the two-level search, into the v2
 plan file (`dispatch.tuned_plans`), which v2 dispatch reads while
-`AITER_MOEV2_TUNED_PLANS` names it.
+`AITER_MOEV2_TUNED_TABLE` names it (`dispatch.tuned_table`).
 
 Keys come from CSVs in the legacy tuner's input format (`untuned_fmoe.csv` columns:
 token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w,
@@ -333,7 +333,7 @@ def main(argv=None):
     parser.add_argument("-o", "--output", required=True, help="the v2 plan file")
     parser.add_argument("--log-file", help="default: OUTPUT with the suffix .log.csv")
     parser.add_argument("--fhmoe", action="store_true", help="the keys are FHMoE's")
-    parser.add_argument("--fhmoe-table", help="default: AITER_CONFIG_FHMOE_FILE")
+    parser.add_argument("--fhmoe-table", help="default: the shipped tuned_fhmoe.csv")
     parser.add_argument("--paths", nargs="*", help="only these paths")
     parser.add_argument("--devices", help="HIP device ids, comma-separated")
     parser.add_argument("--timeout", type=float, default=600.0, help="per task, s")

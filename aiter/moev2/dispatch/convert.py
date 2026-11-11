@@ -24,7 +24,6 @@ the candidates.
 
 import math
 import os
-import pathlib
 import tempfile
 
 import torch
@@ -42,6 +41,13 @@ from ..segments.flydsl_fhmoe import (
 )
 from . import resolver, tuned, tuned_plans
 from .ops import Op
+from .tuned_table import (  # noqa: F401
+    CONFIGS,
+    CONVERTED,
+    ROUTE_COLUMNS,
+    SOURCES,
+    shipped_sources,
+)
 
 KEY_FIELDS = (
     "token",
@@ -58,25 +64,8 @@ KEY_FIELDS = (
     "doweight_stage1",
 )
 INFO_COLUMNS = tuned_plans.INFO_COLUMNS
-MODE = "legacy"
-CONFIGS = pathlib.Path(__file__).resolve().parents[2] / "configs"
-# The converted shipped tables, one per legacy file at the same path under it, and
-# `SOURCES` (columns source, sha256: each legacy file, relative to `CONFIGS`, and its
-# sha256).
-CONVERTED = CONFIGS / "moev2"
-SOURCES = "sources.csv"
+MODE = tuned_plans.LEGACY_MODE
 _SOURCE_COLUMN = "_moev2_source"
-# Read by Opus stage 2 into the launch metadata (`route_bucket_metadata`).
-ROUTE_COLUMNS = (
-    "route_bucket",
-    "route_bucket_name",
-    "expected_sorted_blocks",
-    "expected_route_blocks",
-    "min_sorted_blocks",
-    "min_route_blocks",
-    "max_sorted_blocks",
-    "max_route_blocks",
-)
 
 
 def _dtype(text):
@@ -298,18 +287,6 @@ def convert_table(table, arch, cu_num, fhmoe_table=None):
     return rows, skipped
 
 
-def shipped_sources():
-    """`(main, fhmoe)`: the legacy files the default table merges (`tuned_fmoe.csv`,
-    then the `model_configs/` tables `get_config_file` globs, here sorted) and the
-    FHMoE table."""
-    models = sorted(
-        p
-        for p in (CONFIGS / "model_configs").glob("*tuned_fmoe*.csv")
-        if p.is_file() and "untuned" not in p.name
-    )
-    return [CONFIGS / "tuned_fmoe.csv", *models], CONFIGS / "tuned_fhmoe.csv"
-
-
 def merged_tables(files) -> dict:
     """`{file: (primary, {})}` of the legacy tuned CSVs `files` merged as the default
     table is (`update_config_files`: a lacking `gfx` column comes from `cu_num`, any
@@ -347,7 +324,6 @@ def merged_tables(files) -> dict:
         name = os.path.join(scratch, "merged.csv")
         merged.to_csv(name, index=False)
         primary, _ = tuned.read_table(name, tuned.index_columns(False), False)
-        tuned._LAST_READ.pop((name, False), None)
     tables = {str(n): ({}, {}) for n in files}
     for key, row in primary.items():
         row = dict(row)

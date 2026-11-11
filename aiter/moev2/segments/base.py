@@ -164,8 +164,8 @@ class Segment:
       too, and are not checked (a retune that drops its last row leaves it reachable).
       "tuned": in no ranking entry, so run only through tuned rows, as in legacy; some
       shipped tuned row runs it. "hibernating": in no ranking entry and run by no
-      shipped row, only by a table passed with AITER_CONFIG_FMOE or by a test; it needs
-      a GPU test (tests/moe_dispatch/hibernating.py).
+      shipped row, only by a table passed with AITER_MOEV2_TUNED_TABLE or by a test; it
+      needs a GPU test (tests/moe_dispatch/hibernating.py).
 
     Plan parameters (declared for the tuner and the engine):
 

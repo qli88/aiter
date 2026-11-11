@@ -2624,18 +2624,6 @@ def get_2stage_cfgs(
     )
 
 
-def _default_cfg_2stages():
-    global cfg_2stages
-    if cfg_2stages is None:
-        cfg_2stages = moev2_tuned.read_table(
-            AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
-            moev2_tuned.index_columns(False),
-            False,
-        )
-    return cfg_2stages
-
-
-moev2_tuned.share_default_table(_default_cfg_2stages)
 _get_2stage_cfgs_cache_clear = get_2stage_cfgs.cache_clear
 
 

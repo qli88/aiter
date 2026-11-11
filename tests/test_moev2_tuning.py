@@ -950,14 +950,11 @@ def test_the_search_times_near_ties_of_one_structure_again():
 def test_the_search_runs_the_current_plan_besides_the_finalists(monkeypatch):
     import re
 
-    from aiter.moev2 import envs
-    from aiter.moev2.dispatch import tuned
     from aiter.moev2.tuning import search
     from aiter.moev2.tuning.measure import Result, Timing
 
-    monkeypatch.delenv(envs.AITER_MOEV2_TUNED_PLANS, raising=False)
     monkeypatch.delenv("AITER_BYPASS_TUNE_CONFIG", raising=False)
-    tuned.clear_cache()
+    _use_tables(monkeypatch)
     # A key with a shipped tuned row on a two-stage CK plan.
     args = (1, 5120, 1536, 40, 8, dtypes.bf16, dtypes.fp8, dtypes.fp8)
     args += (QuantType.per_Token, True, ActivationType.Silu, False, 0, 0)
@@ -1261,26 +1258,31 @@ def test_the_cli_writes_winners_logs_every_structure_and_resumes(tmp_path, monke
         cli.main([str(keys), "-o", str(other), "--devices", "0"])
 
 
-def test_the_plan_file_digest_is_of_what_the_process_read(tmp_path, monkeypatch):
-    import csv
-    import hashlib
+def _use_tables(monkeypatch, files=None, mode="override"):
+    import os
 
     from aiter.moev2 import envs
-    from aiter.moev2.dispatch import tuned, tuned_plans
+    from aiter.moev2.dispatch import tuned
+
+    if files is None:
+        monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE, raising=False)
+        monkeypatch.delenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, raising=False)
+    else:
+        monkeypatch.setenv(
+            envs.AITER_MOEV2_TUNED_TABLE, os.pathsep.join(map(str, files))
+        )
+        monkeypatch.setenv(envs.AITER_MOEV2_TUNED_TABLE_MODE, mode)
+    tuned.clear_cache()
+
+
+def test_the_table_digest_is_of_what_the_process_read(tmp_path, monkeypatch):
+    import csv
+
+    from aiter.moev2.dispatch import tuned, tuned_plans, tuned_table
     from aiter.moev2.tuning import cli, search
 
-    def named(path):
-        if path is None:
-            monkeypatch.delenv(envs.AITER_MOEV2_TUNED_PLANS, raising=False)
-        else:
-            monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(path))
-        tuned.clear_cache()
-
-    def sha(data):
-        return hashlib.sha256(data).hexdigest()
-
-    named(None)
-    assert tuned_plans.digest() is None
+    _use_tables(monkeypatch)
+    shipped = tuned_table.digest()
     problem = _ptok()
     winner = search.tune(problem, "a8w8_ptok", _FakeMeasure())[0]
     plan_file = tmp_path / "plans.csv"
@@ -1291,30 +1293,45 @@ def test_the_plan_file_digest_is_of_what_the_process_read(tmp_path, monkeypatch)
             cli._plan_row(tuned_plans.key_values(problem), "a8w8_ptok", winner)
         )
     first = plan_file.read_bytes()
-    named(plan_file)
-    rows = tuned_plans.lookup(problem)
+    _use_tables(monkeypatch, [plan_file])
+    rows = tuned_table.lookup(problem).tuner
     assert rows == ((winner.structure, winner.candidates),)
     plan_file.write_text(",".join(tuned_plans.COLUMNS) + "\n")
     # The engine digests after resolving: the digest is of the read the rows came from.
-    assert tuned_plans.digest() == sha(first)
-    assert tuned_plans.lookup(problem) == rows
+    named = tuned_table.digest()
+    assert named != shipped
+    assert tuned_table.lookup(problem).tuner == rows
     tuned.clear_cache()
-    assert tuned_plans.digest() == sha(plan_file.read_bytes())
-    assert tuned_plans.lookup(problem) == ()
+    assert tuned_table.digest() not in (named, shipped)
+    assert tuned_table.lookup(problem).tuner == ()
+    (tmp_path / "same.csv").write_bytes(first)
+    _use_tables(monkeypatch, [tmp_path / "same.csv"])
+    assert tuned_table.digest() == named  # the content, not the path
+    _use_tables(monkeypatch, [tmp_path / "same.csv"], mode="extend")
+    assert tuned_table.digest() != named
+    _use_tables(monkeypatch, [tmp_path / "same.csv"], mode="replace")
+    replaced = tuned_table.digest()
+    with monkeypatch.context() as m:
+        m.setattr(tuned_table, "_shipped", lambda: (None, "other"))
+        tuned.clear_cache()
+        assert tuned_table.digest() == replaced  # replace reads no shipped table
+        legacy = tmp_path / "legacy_tuned_fmoe.csv"
+        legacy.write_text("comm_fused_configs\n")
+        m.setattr(tuned_table, "shipped_sources", lambda: ([legacy], None))
+        tuned.clear_cache()
+        assert tuned_table.digest() != replaced  # but comm_fused reads legacy's table
     plan_file.write_bytes(b"\xff\xfe")
-    tuned.clear_cache()
-    assert tuned_plans.digest() == sha(b"\xff\xfe")
+    _use_tables(monkeypatch, [plan_file])
     with pytest.raises(ValueError):
-        tuned_plans.lookup(problem)
-    named(tmp_path / "missing.csv")
-    assert tuned_plans.digest() == "missing"
-    (tmp_path / "missing.csv").write_bytes(first)
-    assert tuned_plans.digest() == "missing"
+        tuned_table.digest()
+    with pytest.raises(ValueError):
+        tuned_table.lookup(problem)
+    _use_tables(monkeypatch, [tmp_path / "missing.csv"])
     with pytest.raises(FileNotFoundError):
-        tuned_plans.lookup(problem)
-    tuned.clear_cache()
-    assert tuned_plans.digest() == sha(first)
-    named(None)
+        tuned_table.digest()
+    with pytest.raises(FileNotFoundError):
+        tuned_table.lookup(problem)
+    _use_tables(monkeypatch)
 
 
 def test_the_plan_file_round_trips_and_resolve_reads_it_only_when_named(
@@ -1323,8 +1340,7 @@ def test_the_plan_file_round_trips_and_resolve_reads_it_only_when_named(
     import csv
     import logging
 
-    from aiter.moev2 import envs
-    from aiter.moev2.dispatch import tuned, tuned_plans
+    from aiter.moev2.dispatch import tuned_plans, tuned_table
     from aiter.moev2.tuning import cli, search
 
     problem = _ptok()
@@ -1347,21 +1363,18 @@ def test_the_plan_file_round_trips_and_resolve_reads_it_only_when_named(
     expected = resolver.build(problem, structure, winner.candidates).plan
 
     def resolved(path=None):
-        if path is None:
-            monkeypatch.delenv(envs.AITER_MOEV2_TUNED_PLANS, raising=False)
-        else:
-            monkeypatch.setenv(envs.AITER_MOEV2_TUNED_PLANS, str(path))
-        tuned.clear_cache()
+        _use_tables(monkeypatch, None if path is None else [path])
         return resolver.resolve(problem, segments)
 
     plain = resolved()
+    assert tuned_table.lookup(problem) == tuned_table.Found()  # no shipped row
     named = resolved(plan_file)
     assert named.plan == expected
     name = " | ".join(winner.structure)
     message = f"[fused_moe] moev2 tuned plan {name} for {problem.log_keys()}"
     assert named.logs == ((logging.INFO, message),)
-    assert tuned_plans.lookup(problem) == ((winner.structure, winner.candidates),)
-    assert tuned_plans.lookup(_ptok(m=128)) == ()
+    assert tuned_table.lookup(problem).tuner == ((winner.structure, winner.candidates),)
+    assert tuned_table.lookup(_ptok(m=128)).tuner == ()
     monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
     assert resolved(plan_file).plan == resolved().plan
     monkeypatch.delenv("AITER_BYPASS_TUNE_CONFIG")
@@ -1386,25 +1399,20 @@ def test_the_plan_file_round_trips_and_resolve_reads_it_only_when_named(
 
     ep = ParallelSpec("ep", 2, "a2a", "flydsl", 64, 16)
     tail = TailSpec("add_rmsnorm_quant", "rms", 1e-6, ScaleSpec(dtypes.bf16))
-    assert tuned_plans.lookup(problem)
-    assert tuned_plans.lookup(dataclasses.replace(problem, parallel=ep)) == ()
-    assert tuned_plans.lookup(dataclasses.replace(problem, tail=tail)) == ()
-    twice = rewritten([rows[0], rows[0]])
-    assert twice.plan == plain.plan
-    assert "file not read: " in twice.logs[0][1] and "two rows" in twice.logs[0][1]
+    rewritten(rows)
+    assert tuned_table.lookup(problem).tuner
+    assert tuned_table.lookup(dataclasses.replace(problem, parallel=ep)).tuner == ()
+    assert tuned_table.lookup(dataclasses.replace(problem, tail=tail)).tuner == ()
     with pytest.raises(ValueError, match="two rows for"):
-        tuned_plans.lookup(problem)
+        rewritten([rows[0], rows[0]])
     with open(plan_file, "w", newline="") as f:
         writer = csv.DictWriter(f, cli.LOG_COLUMNS)
         writer.writeheader()
         writer.writerows(cli._log_row(keys, "a8w8_ptok", o) for o in outcomes)
-    tuned.clear_cache()
-    log_read = resolver.resolve(problem, segments)
-    assert log_read.plan == plain.plan
-    assert "file not read: " in log_read.logs[0][1]
-    assert "columns a v2 plan file does not (rank, cov" in log_read.logs[0][1]
-    missing = resolved(tmp_path / "missing.csv")
-    assert missing.plan == plain.plan and missing.logs[0][0] == logging.WARNING
+    with pytest.raises(ValueError, match="columns a v2 plan file does not .rank, cov"):
+        resolved(plan_file)
+    with pytest.raises(FileNotFoundError):
+        resolved(tmp_path / "missing.csv")
     resolved()
 
 

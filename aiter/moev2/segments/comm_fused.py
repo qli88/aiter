@@ -326,9 +326,9 @@ def _same_rows_on_every_rank(comm, world_size, rows) -> None:
     differ = [rank for rank, r in enumerate(every) if r != every[0]]
     if differ:
         raise RuntimeError(
-            "comm_fused: the ranks read different v2 plan file rows (ranks "
-            f"{differ} differ from rank 0): AITER_MOEV2_TUNED_PLANS differs between "
-            "them, or the file changed while they read it (a process keeps its "
+            "comm_fused: the ranks read different tuned comm_fused rows (ranks "
+            f"{differ} differ from rank 0): AITER_MOEV2_TUNED_TABLE differs between "
+            "them, or a file changed while they read it (a process keeps its "
             "first read)"
         )
 
@@ -340,12 +340,13 @@ class CommFusedStage2(Segment):
     allocated: nothing to prepare). `for_shape(shape)` creates it at `prepare(ctx)`
     through `create_flydsl_comm_fused_runners` on the engine's `GroupCoordinator`,
     sharing that function's cache (one arena per group, geometry and MXFP8 fallback).
-    `configs`: the runner config per token bucket. `tuned`: `configs` are not the
-    shape's winner table's (the v2 plan file's): `prepare` builds a runner set over
-    them (`_LazyRunners`, cached like the table's, per group, geometry and configs).
-    `rows`: what the v2 plan file gave the segment (None: nothing); `prepare` raises
-    on every rank unless every rank has the same, as each reads the file (or not)
-    on its own. The runners have no health,
+    `configs`: the runner config per token bucket. `tuned`: `configs` come from tuned
+    rows, not from the shape's winner table (legacy's `comm_fused_configs`): `prepare`
+    builds a runner set over them (`_LazyRunners`, cached like the winner table's, per
+    group, geometry and configs).
+    `rows`: what the tuned table gave the segment (None: nothing); `prepare` raises
+    on every rank unless every rank has the same, as each reads the table on its
+    own. The runners have no health,
     reset or free in legacy, so neither has the segment.
     """
 

@@ -11,7 +11,9 @@ A row of a gfx and CU count no simulated arch has is an error. `--check` fails w
 converted file or `sources.csv` differs from the committed one, a committed file is not
 produced, or the rows given no plan-file row differ from `golden/convert_skipped.json`
 (counts per legacy file and reason; the `flydsl_fallback` rows, which the read drops
-and dispatch never sees, are not counted); `--update` rewrites them all.
+and dispatch never sees, are not counted), or the snapshot's frozen converted inputs
+(`snapshot.FROZEN_CONVERTED`, what v2 dispatch reads in the CPU harness) differ from a
+conversion of its frozen legacy inputs; `--update` rewrites them all.
 
     python tests/moe_dispatch/convert_tables.py --check [-v]
     python tests/moe_dispatch/convert_tables.py --update
@@ -24,6 +26,7 @@ import io
 import json
 import pathlib
 import sys
+import tempfile
 from collections import Counter
 
 _HERE = pathlib.Path(__file__).resolve().parent
@@ -38,17 +41,17 @@ def _csv(columns, rows) -> str:
     return out.getvalue()
 
 
-def convert_all():
-    """`(files, skipped)`: `{path under CONVERTED: text}` of every converted file and
-    `sources.csv`, and `{legacy file: [(key, reason)]}`."""
+def convert(main, fhmoe, base):
+    """`(files, skipped)`: `{path under base: text}` of the converted tables of the
+    legacy files `main` (read as their merge) and `fhmoe` (paths under `base`), and
+    `{legacy file: [(key, reason)]}`."""
     from aiter.moev2.dispatch import convert, tuned, tuned_plans
     from moe_dispatch import arch_sim
 
-    main, fhmoe = convert.shipped_sources()
     tables = {
         pathlib.Path(n): (t, None) for n, t in convert.merged_tables(main).items()
     }
-    tables[fhmoe] = (
+    tables[pathlib.Path(fhmoe)] = (
         tuned.read_table(str(fhmoe), tuned.index_columns(True), True),
         fhmoe,
     )
@@ -72,16 +75,68 @@ def convert_all():
                 converted[(source, (gfx, cu_num))] = rows
                 skipped[source] += missed
     columns = tuned_plans.COLUMNS + convert.INFO_COLUMNS
-    files, sources = {}, []
+    files = {}
     for source in tables:
-        name = source.relative_to(convert.CONFIGS).as_posix()
+        name = source.relative_to(base).as_posix()
         rows = [r for combo in order[source] for r in converted[(source, combo)]]
         files[name] = _csv(columns, rows)
-        sha = hashlib.sha256(source.read_bytes()).hexdigest()
-        sources.append({"source": name, "sha256": sha})
-    files[convert.SOURCES] = _csv(("source", "sha256"), sources)
-    named = {s.relative_to(convert.CONFIGS).as_posix(): v for s, v in skipped.items()}
+    named = {s.relative_to(base).as_posix(): v for s, v in skipped.items()}
     return files, named
+
+
+def convert_all():
+    """`(files, skipped)` of the shipped tables (`convert`), with `sources.csv`."""
+    from aiter.moev2.dispatch import convert as v2_convert
+
+    main, fhmoe = v2_convert.shipped_sources()
+    files, skipped = convert(main, fhmoe, v2_convert.CONFIGS)
+    sources = [
+        {"source": name, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+        for name, source in (
+            (p.relative_to(v2_convert.CONFIGS).as_posix(), p) for p in (*main, fhmoe)
+        )
+    ]
+    files[v2_convert.SOURCES] = _csv(("source", "sha256"), sources)
+    return files, skipped
+
+
+def convert_frozen(inputs) -> dict:
+    """`{name: text}`: the converted copies (`snapshot.FROZEN_CONVERTED` names) of the
+    snapshot's frozen legacy tables, which are in the directory `inputs`."""
+    from moe_dispatch import snapshot
+
+    main = inputs / snapshot.FROZEN_TABLES["fmoe"]
+    fhmoe = inputs / snapshot.FROZEN_TABLES["fhmoe"]
+    files, _ = convert([main], fhmoe, inputs)
+    return {
+        snapshot.FROZEN_CONVERTED[k]: files[snapshot.FROZEN_TABLES[k]]
+        for k in snapshot.FROZEN_TABLES
+    }
+
+
+def _frozen_problems(update) -> list:
+    """Converts the snapshot's frozen inputs; rewrites their converted copies with
+    `update`, else the problems with them."""
+    from moe_dispatch import snapshot
+
+    with tempfile.TemporaryDirectory() as scratch:
+        inputs = pathlib.Path(scratch)
+        for name in snapshot.FROZEN_TABLES.values():
+            (inputs / name).write_bytes(snapshot.read_input(name))
+        texts = convert_frozen(inputs)
+    if update:
+        for name, text in texts.items():
+            snapshot.write_input(name, text.encode())
+        return []
+    problems = []
+    for name, text in texts.items():
+        try:
+            frozen = snapshot.read_input(name).decode()
+        except FileNotFoundError:
+            frozen = None
+        if frozen != text:
+            problems.append(f"differs from the frozen inputs' conversion: {name}")
+    return problems
 
 
 def main(argv=None):
@@ -123,7 +178,8 @@ def main(argv=None):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
         SKIPPED.write_text(json.dumps(counts, indent=1) + "\n")
-        print(f"wrote {convert.CONVERTED} and {SKIPPED}")
+        _frozen_problems(update=True)
+        print(f"wrote {convert.CONVERTED}, {SKIPPED} and the frozen converted inputs")
         return 0
     committed = {
         p.relative_to(convert.CONVERTED).as_posix(): p.read_text()
@@ -139,14 +195,15 @@ def main(argv=None):
     expected = json.loads(SKIPPED.read_text()) if SKIPPED.exists() else {}
     if counts != expected:
         problems.append(f"the rows given no plan-file row differ from {SKIPPED.name}")
+    problems += _frozen_problems(update=False)
     for problem in problems:
         print(problem)
     print(f"{len(problems)} problems")
     if problems:
         print(
             "if the change is intended, run python tests/moe_dispatch/convert_tables.py "
-            "--update and commit aiter/configs/moev2/ and "
-            f"{SKIPPED.relative_to(_HERE.parents[1])}"
+            "--update and commit aiter/configs/moev2/, "
+            f"{SKIPPED.relative_to(_HERE.parents[1])} and the frozen converted inputs"
         )
     return 1 if problems else 0
 

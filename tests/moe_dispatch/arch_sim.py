@@ -4,7 +4,7 @@
 
 `prepare_process()` must run before torch or aiter is imported: it hides the GPUs and
 removes environment variables that change dispatch, so results depend only on the code
-and the shipped tuned tables.
+and the tuned tables (the shipped ones, or those it is given).
 
 `simulated_arch(name)` then patches, for the duration of the block:
 - the chip-info functions (`get_gfx`, `get_gfx_runtime`, `get_cu_num`) in every loaded
@@ -45,11 +45,15 @@ _EXTRA_SCRUB_ENV = {"GPU_ARCHS", "GPTOSS_SWIGLU_MXFP4_BF16_BOUND"}
 _CHIP_FUNCS = ("get_gfx", "get_gfx_runtime", "get_cu_num")
 
 
-def prepare_process(tuned_tables=None):
+def prepare_process(legacy_tables=None, v2_tables=None, env=()):
     """Hide GPUs and drop dispatch-affecting env vars. Call before importing torch.
 
-    `tuned_tables` maps `AITER_CONFIG_*` names to CSV paths to use instead of the
-    shipped tables (the snapshot freezes its inputs this way).
+    `legacy_tables` (`{"fmoe": path, "fhmoe": path}`, either optional) gives legacy
+    dispatch these CSVs instead of the shipped tables (`use_legacy_tables`, which
+    imports aiter), and `v2_tables` (paths) v2 dispatch these instead of its shipped
+    tables (`AITER_MOEV2_TUNED_TABLE`, mode replace): the snapshot freezes its inputs
+    this way. `env` (`NAME=VALUE` items) is set after the variables are dropped and
+    before aiter is imported.
     """
     if "torch" in sys.modules:
         raise RuntimeError("prepare_process() must run before torch is imported")
@@ -62,8 +66,34 @@ def prepare_process(tuned_tables=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["ROCR_VISIBLE_DEVICES"] = "-1"
     os.environ["AITER_LOG_LEVEL"] = "ERROR"
-    for name, path in (tuned_tables or {}).items():
-        os.environ[name] = str(path)
+    for item in env:
+        name, _, value = item.partition("=")
+        os.environ[name] = value
+    if v2_tables is not None:
+        os.environ["AITER_MOEV2_TUNED_TABLE"] = os.pathsep.join(map(str, v2_tables))
+        os.environ["AITER_MOEV2_TUNED_TABLE_MODE"] = "replace"
+    if legacy_tables:
+        use_legacy_tables(legacy_tables)
+
+
+_LEGACY_TABLE_FILES = {
+    "fmoe": "AITER_CONFIG_FMOE_FILE",
+    "fhmoe": "AITER_CONFIG_FHMOE_FILE",
+}
+
+
+def use_legacy_tables(tables):
+    """Make legacy dispatch in this process read `tables` (`{"fmoe": path, "fhmoe":
+    path}`), as with AITER_CONFIG_FMOE and AITER_CONFIG_FHMOE naming them, without
+    setting those (while they are set, v2 hands its calls back to legacy)."""
+    from aiter.jit import core
+
+    for name, path in tables.items():
+        setattr(
+            core.AITER_CONFIG,
+            _LEGACY_TABLE_FILES[name],
+            property(lambda self, path=str(path): path),
+        )
 
 
 def _probe_fmoe_fp8_blockscale_g1u1_has_kernel(

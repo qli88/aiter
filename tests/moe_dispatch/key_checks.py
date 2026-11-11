@@ -6,14 +6,14 @@ For every `get_2stage_cfgs` key of the snapshot, on every simulated arch:
 
 - `MoeProblem`: the key builds a problem; `legacy_key()` maps it back to a key that
   builds an equal problem with the same hash and that legacy dispatches identically;
-- `tuned.lookup` returns the very row object the legacy lookup returns from legacy's
-  tables (or both None), and an equal row from v2's own read of the table.
+- v2's tuned table (`tuned_table.lookup`, the frozen inputs' conversion) gives the cells
+  (`convert.cells`) of the row the legacy lookup returns from the frozen inputs, or no
+  row where legacy has none, for every key a path takes (fallbacks included).
 
     python tests/moe_dispatch/key_checks.py --check [--arch gfx950]
 """
 
 import argparse
-import math
 import pathlib
 import sys
 
@@ -32,18 +32,6 @@ class _Recording(dict):
         return value
 
 
-def _same_row(a, b):
-    def plain(row):
-        if row is None:
-            return None
-        return {
-            k: None if isinstance(v, float) and math.isnan(v) else v
-            for k, v in row.items()
-        }
-
-    return plain(a) == plain(b)
-
-
 def _legacy_record(fm, record, args, kwargs):
     try:
         return record.normalize(fm.get_2stage_cfgs.__wrapped__(*args, **kwargs))
@@ -54,13 +42,13 @@ def _legacy_record(fm, record, args, kwargs):
 def check_arch(arch):
     import aiter.fused_moe as fm
     from aiter.moev2 import api
-    from aiter.moev2.dispatch import tuned
+    from aiter.moev2.dispatch import convert, tuned_table
     from aiter.moev2.problem import MoeProblem
     from moe_dispatch import arch_sim, record, snapshot
     from moe_dispatch.differential import captured_logs
 
     problems = []
-    counts = {"keys": 0, "rows": 0}
+    counts = {"keys": 0, "rows": 0, "untaken": 0}
     with arch_sim.simulated_arch(arch) as (gfx, cu_num), captured_logs():
         keys = snapshot.dispatch_keys(gfx, cu_num)
         if keys:
@@ -103,23 +91,17 @@ def check_arch(arch):
                 _legacy_record(fm, record, args, kwargs)
                 if not _HITS:
                     continue  # legacy rejected the key before looking it up
+                if not convert.paths_taking(problem):
+                    counts["untaken"] += 1
+                    continue
                 legacy_row = _HITS[-1]
-                tables = (
-                    fm.cfg_2stages
-                    if config_file is None
-                    else fm.cfg_2stages_by_file[config_file]
-                )
-                row = tuned.lookup(problem, tables=tuple(dict(t) for t in tables))
-                if row is not legacy_row:
+                want = None if legacy_row is None else convert.cells(legacy_row)
+                cells = tuned_table.lookup(problem).cells
+                if cells != want:
                     problems.append(
-                        f"{label}: tuned row differs\n  legacy: {legacy_row}\n  v2:     {row}"
+                        f"{label}: tuned row differs\n  legacy: {want}\n  v2:     {cells}"
                     )
-                # v2's own read of the default table (used without aiter.fused_moe).
-                if config_file is None and not _same_row(
-                    tuned.lookup(problem, tables=tuned._own_default_table()), legacy_row
-                ):
-                    problems.append(f"{label}: v2's own table gives a different row")
-                counts["rows"] += row is not None
+                counts["rows"] += cells is not None
         finally:
             fm.cfg_2stages = default_tables
     return counts, problems
@@ -141,7 +123,8 @@ def main(argv=None):
     for arch in args.arch or list(arch_sim.ARCHS):
         counts, problems = check_arch(arch)
         print(
-            f"{arch}: {counts['keys']} keys, {counts['rows']} tuned rows, {len(problems)} problems"
+            f"{arch}: {counts['keys']} keys, {counts['rows']} tuned rows, "
+            f"{counts['untaken']} keys no path takes, {len(problems)} problems"
         )
         for line in problems[:40]:
             print("  " + line)

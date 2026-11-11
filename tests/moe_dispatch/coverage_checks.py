@@ -43,7 +43,7 @@ def check_arch(arch, served, verbose=False):
     """`(errors, report lines, used)` for one simulated arch; `used`: the names of the
     segments in the plan of some tuned row that runs."""
     from aiter.moev2 import api
-    from aiter.moev2.dispatch import coverage, tuned
+    from aiter.moev2.dispatch import coverage, tuned_table
     from moe_dispatch import arch_sim, known_declines, snapshot
     from moe_dispatch.differential import captured_logs
 
@@ -54,7 +54,6 @@ def check_arch(arch, served, verbose=False):
     rows, bad_rows = Counter(), Counter()
     seen = set()
     with arch_sim.simulated_arch(arch) as (gfx, cu_num), captured_logs():
-        tuned._default_table()
         for key in snapshot.dispatch_keys(gfx, cu_num):
             if key.label() in seen:  # a row repeated in the tuned table
                 continue
@@ -98,7 +97,11 @@ def check_arch(arch, served, verbose=False):
                         f"{label} [{path.name}]: gap where legacy runs the key "
                         f"({resolution.declined})"
                     )
-                if is_row and not taken and tuned.lookup(problem) is not None:
+                if (
+                    is_row
+                    and not taken
+                    and tuned_table.lookup(problem).cells is not None
+                ):
                     rows["no path"] += 1
     for name in sorted(matrix):
         counts = matrix[name]

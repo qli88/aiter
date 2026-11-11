@@ -22,7 +22,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import paths
-from ..dispatch import overrides, tuned
+from ..dispatch import overrides, tuned, tuned_table
 from ..segments.flydsl import (
     _flydsl_route_output_nbytes,
     _stage2_runtime_uses_route_reduce,
@@ -31,8 +31,6 @@ from ..segments.flydsl_fhmoe import (
     FlydslFhmoeGemm1,
     FlydslFhmoeGemm1Quant,
     FlydslFhmoeGemm2,
-    _config_has_mxfp8_fhmoe_contract,
-    _config_has_mxfp8_fhmoe_geometry,
     _is_dsv4_i384_fhmoe_contract,
     _is_dsv4_i384_metadata,
     _is_fhmoe_metadata_compatible,
@@ -104,9 +102,37 @@ LOCAL = local.LocalDispatch(SEGMENTS, takes, fhmoe=True)
 
 
 def _fhmoe_config_file() -> str:
-    from aiter.jit.core import AITER_CONFIGS
+    return tuned_table.FHMOE_TABLE
 
-    return AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+
+def _declares_mxfp8(model_dim, inter_dim, experts, topk, **contract) -> bool:
+    """Whether the tuned table has an fp8-weight FHMoE key of this geometry, and with
+    `contract` (dtype, hidden_pad, intermediate_pad, gate_mode, doweight_stage1) of the
+    MXFP8/FP8 contract with those values: the legacy `_config_has_mxfp8_fhmoe_geometry`
+    and `_config_has_mxfp8_fhmoe_contract` on the table."""
+    want = {
+        "model_dim": str(model_dim),
+        "inter_dim": str(inter_dim),
+        "expert": str(experts),
+        "topk": str(topk),
+        "shared_expert_id": str(experts - 1),
+        "q_dtype_w": str(dtypes.fp8),
+    }
+    if contract:
+        want |= {
+            "act_type": str(ActivationType.Silu),
+            "dtype": str(contract["dtype"]),
+            "q_dtype_a": str(dtypes.fp8),
+            "q_type": str(QuantType.per_1x32),
+            "use_g1u1": str(True),
+            "doweight_stage1": str(bool(contract["doweight_stage1"])),
+            "hidden_pad": str(int(contract["hidden_pad"])),
+            "intermediate_pad": str(int(contract["intermediate_pad"])),
+            "gate_mode": str(contract["gate_mode"]),
+        }
+    return any(
+        all(key[c] == v for c, v in want.items()) for key in tuned_table.fhmoe_keys()
+    )
 
 
 def _probe_metadata(
@@ -303,9 +329,9 @@ def _resolve_mxfp8_fhmoe_config_file(max_tokens: int, **request) -> str | None:
     """`aiter.fhmoe._resolve_mxfp8_fhmoe_config_file`, resolved by this path."""
     config_file = _fhmoe_config_file()
     geometry = {k: request[k] for k in ("model_dim", "inter_dim", "experts", "topk")}
-    if not _config_has_mxfp8_fhmoe_geometry(config_file, **geometry):
+    if not _declares_mxfp8(**geometry):
         return None
-    if not _config_has_mxfp8_fhmoe_contract(config_file, **request):
+    if not _declares_mxfp8(**request):
         raise ValueError(
             "MXFP8/FP8 FHMoE request partially matches a dedicated CSV "
             "contract but differs in dtype, padding, gate mode, or "

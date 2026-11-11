@@ -434,10 +434,19 @@ def test_overrides_read_the_environment_at_call_time(monkeypatch):
     assert overrides.nt_override() == -1 and not overrides.online_tune()
 
 
+def _patch_lookup(monkeypatch, lookup):
+    """Make the tuned table give `lookup(problem)` as a problem's row (None: none)."""
+    from aiter.moev2.dispatch import tuned_table
+
+    monkeypatch.setattr(
+        tuned_table, "lookup", lambda p: tuned_table.Found(cells=lookup(p))
+    )
+
+
 def _resolve_with_row(monkeypatch, row):
     from aiter.moev2.migration import a8w8_pt
 
-    monkeypatch.setattr(tuned, "lookup", lambda problem: row)
+    _patch_lookup(monkeypatch, lambda problem: row)
     return resolver.resolve(_problem(), a8w8_pt.SEGMENTS)
 
 
@@ -482,7 +491,7 @@ def test_explain_lists_problem_structures_and_choice(monkeypatch, caplog):
     from aiter.moev2.migration import a8w8_pt
 
     monkeypatch.setenv("AITER_MOE_EXPLAIN", "1")
-    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    _patch_lookup(monkeypatch, lambda problem: None)
     res = resolver.resolve(_problem(), a8w8_pt.SEGMENTS)
     text = "\n".join(res.explain)
     assert "problem: gfx950 M=64" in text and "feasible structures (3)" in text
@@ -498,7 +507,7 @@ def test_explain_lists_problem_structures_and_choice(monkeypatch, caplog):
 def test_default_resolution_logs_like_legacy(monkeypatch):
     from aiter.moev2.migration import a8w8_pt
 
-    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    _patch_lookup(monkeypatch, lambda problem: None)
     res = resolver.resolve(_problem(), a8w8_pt.SEGMENTS)
     (_, first), (_, second) = res.logs
     assert first.startswith("run_1stage = False, xbf16 = False, ksplit = 0 q_type = ")
@@ -741,7 +750,7 @@ def _mxfp8_problem(activation=ActivationType.Silu, token=64, **kwargs):
 def _a16w4_resolve(monkeypatch, problem, row=None):
     from aiter.moev2.migration import a16w4
 
-    monkeypatch.setattr(tuned, "lookup", lambda p: row)
+    _patch_lookup(monkeypatch, lambda p: row)
     return resolver.resolve(problem, a16w4.SEGMENTS)
 
 
@@ -905,7 +914,7 @@ def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
 def _default_resolve(monkeypatch, token, quant, inter_dim=256, arch="gfx950", **kw):
     from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok
 
-    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    _patch_lookup(monkeypatch, lambda problem: None)
     p = _problem(token=token, quant=quant, arch=arch, **kw)
     p = dataclasses.replace(p, shape=dataclasses.replace(p.shape, inter_dim=inter_dim))
     path = {QuantType.per_1x128: a8w8_blockscale, QuantType.per_Tensor: a8w8_pt}
@@ -938,7 +947,7 @@ def test_swiglu_and_gelutanh_defaults_run_two_stages_with_the_activation(
 ):
     from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
 
-    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    _patch_lookup(monkeypatch, lambda problem: None)
     i8, fp8, bf16 = dtypes.i8, dtypes.fp8, dtypes.bf16
     # Legacy's heuristic: CK stage 1, ASM for int8 weights; no 1-stage kernel.
     cases = (
@@ -1016,7 +1025,7 @@ _NO_G1U0_PLAN = (
 def test_g1u0_keys_run_1stage_fmoe_where_legacy_does(monkeypatch):
     from aiter.moev2.migration import a8w8_ptok, a16w16
 
-    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    _patch_lookup(monkeypatch, lambda problem: None)
 
     def g1u0(token, arch="gfx942", **kw):
         p = _problem(token=token, arch=arch, **kw)
@@ -1144,7 +1153,7 @@ _ROW_1STAGE = {
 def _tuned_1stage(monkeypatch, row, **kw):
     from aiter.moev2.migration import a8w8_blockscale
 
-    monkeypatch.setattr(tuned, "lookup", lambda problem: row)
+    _patch_lookup(monkeypatch, lambda problem: row)
     p = _problem(quant=QuantType.per_1x128, **kw)
     return resolver.resolve(p, a8w8_blockscale.SEGMENTS)
 
@@ -1232,7 +1241,7 @@ def test_the_bypass_ranks_a_problem_with_a_1stage_row(monkeypatch):
 def test_the_relookup_logs_a_1stage_choice(monkeypatch, caplog):
     from aiter.moev2.migration import a8w8_ptok
 
-    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    _patch_lookup(monkeypatch, lambda problem: None)
     tuned.clear_cache()
     p = _problem(token=16, quant=QuantType.per_Token)
     with caplog.at_level(logging.INFO, logger="aiter"):
@@ -1251,7 +1260,7 @@ def test_a_tuned_asm_blockscale_row_runs_the_packed_stage1(monkeypatch):
         "kernelName1": "_ZN5aiter59fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1_16x256_2tg_pf3E",
         "kernelName2": "moe_ck2stages_gemm2_256x16x128x256_1x4_MulABScaleExpertWeightA8W8blkscale_v1_Nswizzle0_Quant4_MulRoutedWeight1_F8_F8_B16",
     }
-    monkeypatch.setattr(tuned, "lookup", lambda problem: row)
+    _patch_lookup(monkeypatch, lambda problem: row)
     res = resolver.resolve(
         _problem(quant=QuantType.per_1x128), a8w8_blockscale.SEGMENTS
     )
@@ -1302,15 +1311,16 @@ def test_tuned_cache_clear_also_resets_path_caches():
         assert all(cache in tuned._CACHES for cache in caches)
 
 
-def test_v2_reads_and_resets_with_the_legacy_table(monkeypatch):
+def test_v2_does_not_read_the_legacy_table_and_resets_with_it(monkeypatch):
+    from aiter.moev2.dispatch import tuned_table
     from aiter.moev2.migration import a8w8_pt
 
     p = _problem()
-    keys, _ = tuned.lookup_keys(p)
-    key = keys[:7] + (str(p.activation.activation),) + keys[8:]
-    row = {"kernelName1": "", "kernelName2": "", "block_m": 64, "ksplit": 0}
-    monkeypatch.setattr(legacy, "cfg_2stages", ({key: row}, {}))
-    assert tuned.lookup(p) is row
+    before = tuned_table.lookup(p)
+    row = {"kernelName1": "x", "kernelName2": "y", "block_m": 64, "ksplit": 0}
+    monkeypatch.setattr(legacy, "cfg_2stages", ({tuned.exact_key(p): row}, {}))
+    tuned.clear_cache()
+    assert tuned_table.lookup(p) == before
     a8w8_pt.LOCAL.resolve(p, False)
     assert a8w8_pt.LOCAL.resolve.cache_info().currsize == 1
     legacy.get_2stage_cfgs.cache_clear()
@@ -1338,7 +1348,7 @@ def test_the_log_only_relookup_runs_after_the_sort(monkeypatch, caplog):
 
     monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(local, "get_cu_num", lambda: 256)
-    monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+    _patch_lookup(monkeypatch, lambda problem: None)
     monkeypatch.setattr(QuantA1, "run", stop)
     line, seen = "[fused_moe] using 2stage default", []
     with caplog.at_level(logging.INFO, logger="aiter"), hooks.set_sort_impl(sort):
@@ -1372,7 +1382,7 @@ def test_the_relookup_buckets_the_hidden_states_rows(monkeypatch):
 
     monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(local, "get_cu_num", lambda: 256)
-    monkeypatch.setattr(tuned, "lookup", lookup)
+    _patch_lookup(monkeypatch, lookup)
     monkeypatch.setattr(QuantA1, "run", stop)
     call = _per_tensor_op_call()
     call["hidden_states"] = torch.empty(3, 64, dtype=dtypes.bf16)
@@ -1397,7 +1407,7 @@ def _a4w4_problem(
 def _a4w4_resolve(monkeypatch, problem, row=None):
     from aiter.moev2.migration import a4w4
 
-    monkeypatch.setattr(tuned, "lookup", lambda p: row)
+    _patch_lookup(monkeypatch, lambda p: row)
     return resolver.resolve(problem, a4w4.SEGMENTS)
 
 
@@ -1610,7 +1620,7 @@ def test_a8w4_defaults_and_tuned_rows(monkeypatch):
     from aiter.ops.flydsl.moe_common import GateMode
 
     def resolve(problem, row=None):
-        monkeypatch.setattr(tuned, "lookup", lambda p: row)
+        _patch_lookup(monkeypatch, lambda p: row)
         return resolver.resolve(problem, a8w4.SEGMENTS)
 
     # Gate and up interleaved: the FlyDSL heuristic with fp8 names (Silu, SiTUv2) and
@@ -1681,7 +1691,7 @@ def test_consistency_flags_come_from_the_boundaries(monkeypatch):
     from aiter.moev2.migration import a8w4
 
     def resolve(problem, row):
-        monkeypatch.setattr(tuned, "lookup", lambda p: row)
+        _patch_lookup(monkeypatch, lambda p: row)
         return resolver.resolve(problem, a8w4.SEGMENTS)
 
     opus = {
@@ -1747,7 +1757,7 @@ def test_mxfp8_defaults_and_tuned_rows(monkeypatch):
     from aiter.ops.flydsl.moe_common import GateMode
 
     def resolve(problem, row=None):
-        monkeypatch.setattr(tuned, "lookup", lambda p: row)
+        _patch_lookup(monkeypatch, lambda p: row)
         return resolver.resolve(problem, mxfp8.SEGMENTS)
 
     # The FlyDSL heuristic (gate/up interleaved, or w1 tagged as not interleaved) adds
@@ -1794,7 +1804,7 @@ def test_a16wi4_fallback_and_tuned_rows(monkeypatch):
     from aiter.moev2.migration import a16wi4
 
     def resolve(problem, row=None):
-        monkeypatch.setattr(tuned, "lookup", lambda p: row)
+        _patch_lookup(monkeypatch, lambda p: row)
         return resolver.resolve(problem, a16wi4.SEGMENTS)
 
     # The untuned fallback: one tile per token tier, no split-K, a warning.
@@ -1890,9 +1900,8 @@ def test_chosen_kernels_must_agree_on_boundaries(monkeypatch):
     assert boundary(res.plan, "inter").fmt.dtype == dtypes.fp8
 
     # A FlyDSL stage 1 writes what its layout GEMM2 reads.
-    monkeypatch.setattr(
-        tuned,
-        "lookup",
+    _patch_lookup(
+        monkeypatch,
         lambda p: {
             "kernelName1": "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8",
             "kernelName2": "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x256_reduce_nt_sbm32",
@@ -1905,9 +1914,8 @@ def test_chosen_kernels_must_agree_on_boundaries(monkeypatch):
     assert boundary(res.plan, "inter").fmt.dtype == dtypes.fp8
 
     # Opus stage 1 runs its own block_m, which must be the plan's and the sort's.
-    monkeypatch.setattr(
-        tuned,
-        "lookup",
+    _patch_lookup(
+        monkeypatch,
         lambda p: {
             "kernelName1": "opus_moe1_afp8_wfp4_bf16_t64x384_gs_qgb3_aff32_p2_fp8",
             "kernelName2": "opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584",
@@ -2162,7 +2170,7 @@ def test_fhmoe_stages_run_the_flydsl_kernels_through_the_fhmoe_wrappers(monkeypa
     from aiter.moev2.segments import flydsl_fhmoe
     from aiter.ops.flydsl.moe_common import GateMode
 
-    monkeypatch.setattr(tuned, "lookup", lambda p: None)
+    _patch_lookup(monkeypatch, lambda p: None)
     p = _mxfp8_problem(gate_mode=GateMode.INTERLEAVE, gate_up_interleave=True)
     plain = resolver.resolve(p, mxfp8.SEGMENTS)
     res = resolver.resolve(api.fhmoe_problem(p), fhmoe.SEGMENTS)
@@ -2422,7 +2430,7 @@ def test_ck_param_space_lists_the_1x128_split_k_codegen_list(monkeypatch):
     for kernel, ksplit in ((stage1, 4), (plain, 0)):
         row = {"block_m": 32, "ksplit": ksplit, "run_1stage": 0, "nt": 0}
         row |= {"kernelName1": kernel, "kernelName2": stage2}
-        monkeypatch.setattr(tuned, "lookup", lambda _, row=row: row)
+        _patch_lookup(monkeypatch, lambda _, row=row: row)
         res = resolver.resolve(p, path.SEGMENTS)
         assert res.plan.source == "tuned", res.declined
         assert res.metadata.ksplit == ksplit
@@ -2618,7 +2626,7 @@ def test_flydsl_param_space_lists_a16w4_and_a16wi4_on_gfx942(monkeypatch):
         "kernelName1": "flydsl_moe1_abf16_wint4_bf16_t16x64x128",
         "kernelName2": "flydsl_moe2_abf16_wint4_bf16_t16x128x256_reduce",
     }
-    monkeypatch.setattr(tuned, "lookup", lambda _: row)
+    _patch_lookup(monkeypatch, lambda _: row)
     res = resolver.resolve(p, path.SEGMENTS)
     assert res.plan.source == "tuned", res.declined
     reasons = coverage.param_reasons(p, res.plan)
@@ -2680,7 +2688,7 @@ def test_doweight_resolves_tuned_flydsl_and_opus_rows(monkeypatch):
     from aiter.moev2.migration import a4w4, a8w4, a16wi4
 
     def resolve(path, p, row=None):
-        monkeypatch.setattr(tuned, "lookup", lambda _: row)
+        _patch_lookup(monkeypatch, lambda _: row)
         return resolver.resolve(p, path.SEGMENTS)
 
     def row(block_m, kn1, kn2):
@@ -3016,7 +3024,7 @@ def test_fhmoe_candidates_resolve_to_their_segments(monkeypatch):
                 )
                 row = {"block_m": block_m, "ksplit": 0}
                 row |= {"kernelName1": kernel1, "kernelName2": kernel2}
-                monkeypatch.setattr(tuned, "lookup", lambda _, row=row: row)
+                _patch_lookup(monkeypatch, lambda _, row=row: row)
                 res = resolver.resolve(p, fhmoe.SEGMENTS)
                 assert res.plan.source == "tuned", (row, res.declined)
                 names = res.plan.structure()[0]
@@ -3192,7 +3200,7 @@ def test_whole_graph_candidates_resolve_to_the_implementation(monkeypatch):
                 name = f"impl__flydsl_gfx942__{config}"
                 row = {"block_m": block_m, "ksplit": 0, "run_1stage": 0}
                 row |= {"kernelName1": name, "kernelName2": ""}
-                monkeypatch.setattr(tuned, "lookup", lambda _, row=row: row)
+                _patch_lookup(monkeypatch, lambda _, row=row: row)
                 res = resolver.resolve(p, path.SEGMENTS)
                 assert res.plan.source == "tuned", (arch, config, res.declined)
                 assert res.plan.structure()[0] == ("impl.whole_graph",)
@@ -3270,7 +3278,7 @@ def test_cktile_param_space_lists_the_alias_row_for_a16w4_swiglu(monkeypatch):
     alias = kernel_names.CKTILE_ALIAS
     row = {"block_m": 16, "ksplit": 0, "run_1stage": 0}
     row |= {"kernelName1": alias, "kernelName2": alias}
-    monkeypatch.setattr(tuned, "lookup", lambda _: row)
+    _patch_lookup(monkeypatch, lambda _: row)
     interleave_gate = {**_interleaved(), "gate_up_interleave": False}
     layouts = (({}, 2), (_interleaved(), 1), (interleave_gate, 2))
     for (kwargs, split_k), (token, block_m) in itertools.product(
@@ -3386,7 +3394,7 @@ def test_asm_1stage_runs_the_formats_only_a_tuned_row_reaches(monkeypatch):
                 a8w8_blockscale if quant == QuantType.per_1x128 else a8w8_ptok
             ).SEGMENTS
             assert one_stage.accepts(p) and not default_1stage(p), (arch, p)
-            monkeypatch.setattr(tuned, "lookup", lambda problem: None)
+            _patch_lookup(monkeypatch, lambda problem: None)
             res = resolver.resolve(p, segments)
             assert "asm.fmoe_1stage" not in res.plan.structure()[0], (arch, p)
             params = one_stage.param_space(p)[0]
@@ -3397,7 +3405,7 @@ def test_asm_1stage_runs_the_formats_only_a_tuned_row_reaches(monkeypatch):
                 "xbf16": int(params.get("xbf16", False)),
                 "flat": float(params.get("flat", 0)),
             }
-            monkeypatch.setattr(tuned, "lookup", lambda problem, row=row: row)
+            _patch_lookup(monkeypatch, lambda problem, row=row: row)
             res = resolver.resolve(p, segments)
             assert res.plan.structure()[0][-1] == "asm.fmoe_1stage", (arch, p)
             assert res.metadata.stage1.keywords["kernelName"] == params["kernel"]
@@ -3488,7 +3496,7 @@ def test_asm_1stage_per_1x32_candidates_run_as_tuned_rows(monkeypatch):
                 "xbf16": int(params["xbf16"]),
                 "flat": float(params["flat"]),
             }
-            monkeypatch.setattr(tuned, "lookup", lambda problem, row=row: row)
+            _patch_lookup(monkeypatch, lambda problem, row=row: row)
             res = resolver.resolve(p, path.SEGMENTS)
             assert res.plan.structure()[0][-1] == "asm.fmoe_1stage", params
             kw = res.metadata.stage1.keywords

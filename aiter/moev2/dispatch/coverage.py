@@ -19,7 +19,7 @@ tests/moe_dispatch/coverage_checks.py):
 """
 
 from ..segments.base import REACHES, Params
-from . import tuned
+from . import tuned_table
 from .ranking import _default_table, best
 from .resolver import WARNING, resolve
 
@@ -50,7 +50,7 @@ def classify(problem, segments):
         return "plan", resolution
     if reason.startswith("ranking ") and reason.endswith(" is not ported"):
         return "legacy", resolution
-    if reason == "no feasible plan" and tuned.lookup(problem) is None:
+    if reason == "no feasible plan" and tuned_table.lookup(problem).cells is None:
         hit = best(problem, [])
         if hit is not None and hit[2] is not None:
             return "legacy", resolution
@@ -64,7 +64,7 @@ def classify(problem, segments):
 
 def row_status(problem, resolution) -> str | None:
     """None without an exact tuned row; "used"; else why the row does not run."""
-    if tuned.lookup(problem) is None:
+    if tuned_table.lookup(problem).cells is None:
         return None
     if resolution.declined is not None:
         return f"declined: {resolution.declined}"

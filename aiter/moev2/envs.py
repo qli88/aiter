@@ -37,20 +37,52 @@ def moev2_selection():
     return names or "default"
 
 
-AITER_MOEV2_TUNED_PLANS = "AITER_MOEV2_TUNED_PLANS"
+AITER_MOEV2_TUNED_TABLE = "AITER_MOEV2_TUNED_TABLE"
+AITER_MOEV2_TUNED_TABLE_MODE = "AITER_MOEV2_TUNED_TABLE_MODE"
+TUNED_TABLE_MODES = ("replace", "override", "extend")
+# Legacy's own tuned-table variables; v2 does not read them (`legacy_tuned_tables`).
+LEGACY_TUNED_TABLES = ("AITER_CONFIG_FMOE", "AITER_CONFIG_FHMOE")
 
 
 @functools.cache
-def tuned_plans_file() -> str:
-    """`AITER_MOEV2_TUNED_PLANS`: the v2 tuner's plan file v2 dispatch reads first
-    (`dispatch.tuned_plans`); unset or empty: none."""
-    return os.environ.get(AITER_MOEV2_TUNED_PLANS, "").strip()
+def tuned_table() -> tuple:
+    """`(files, mode)`: `AITER_MOEV2_TUNED_TABLE`, the user's tuned tables v2 dispatch
+    reads (`dispatch.tuned_table`; `os.pathsep`-separated, each a v2 plan file or a legacy
+    tuned CSV), and `AITER_MOEV2_TUNED_TABLE_MODE`, how they combine with the shipped
+    tables: `replace` (the shipped tables are not read), `override` (the shipped tables
+    are read for a key only when the user's have no row for it, fallbacks included)
+    or `extend` (one table; a key in both raises). `((), None)` with no file named.
+    Raises for a mode not one of these, for files without a mode and for a mode
+    without files."""
+    raw = os.environ.get(AITER_MOEV2_TUNED_TABLE, "")
+    files = tuple(f.strip() for f in raw.split(os.pathsep) if f.strip())
+    mode = os.environ.get(AITER_MOEV2_TUNED_TABLE_MODE, "").strip().lower()
+    if not files:
+        if mode:
+            raise ValueError(
+                f"{AITER_MOEV2_TUNED_TABLE_MODE}={mode} is set without "
+                f"{AITER_MOEV2_TUNED_TABLE}"
+            )
+        return (), None
+    if mode not in TUNED_TABLE_MODES:
+        raise ValueError(
+            f"{AITER_MOEV2_TUNED_TABLE} is set; {AITER_MOEV2_TUNED_TABLE_MODE} must be "
+            f"one of {', '.join(TUNED_TABLE_MODES)}, not {mode!r}"
+        )
+    return files, mode
+
+
+@functools.cache
+def legacy_tuned_tables() -> tuple:
+    """The names in `LEGACY_TUNED_TABLES` that are set (non-empty)."""
+    return tuple(n for n in LEGACY_TUNED_TABLES if os.environ.get(n, "").strip())
 
 
 def reload():
     """Forget cached values so the next accessor call re-reads the environment."""
     moev2_selection.cache_clear()
-    tuned_plans_file.cache_clear()
+    tuned_table.cache_clear()
+    legacy_tuned_tables.cache_clear()
     from . import paths
 
     paths.reload()

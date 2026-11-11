@@ -7,7 +7,8 @@ The legacy entry points ask `route_to_v2(call, entry)` which path, if any, takes
 with no path active this costs one cached boolean check. A claimed call may still be
 handed back: `run` returns `DECLINED` when the resolver finds no plan it may run (a tuned
 row naming a kernel family the path has not ported, a ranking region marked legacy, no
-feasible listed structure), and the legacy code then runs the call as before.
+feasible listed structure), and the legacy code then runs the call as before. While
+legacy's own tuned-table variables are set, `route_to_v2` hands every call back.
 
 Predicates run on every call, including during graph capture: they may read dtypes,
 shapes and Python values, never tensor contents.
@@ -207,7 +208,11 @@ def any_active() -> bool:
 
 
 def route_to_v2(call: Mapping, entry: str = "api"):
-    """The active path at `entry` that claims this call, or None for the legacy code."""
+    """The active path at `entry` that claims this call, or None for the legacy code.
+
+    While legacy's tuned-table variables are set (`envs.legacy_tuned_tables`), which v2
+    does not read, a claimed call goes to the legacy code (warned once); with
+    `AITER_MOEV2_TUNED_TABLE` set too, raises."""
     by_default = envs.moev2_selection() == "default"
     for path in active():
         if path.entry != entry or not path.claims(call):
@@ -215,10 +220,36 @@ def route_to_v2(call: Mapping, entry: str = "api"):
         gate = path.graduated_claims
         if by_default and gate is not None and not gate(call):
             continue
+        return _unless_legacy_tables(path)
+    return None
+
+
+_warned_legacy_tables = False
+
+
+def _unless_legacy_tables(path):
+    global _warned_legacy_tables
+    legacy = envs.legacy_tuned_tables()
+    if not legacy:
         return path
+    if envs.tuned_table()[0]:
+        raise ValueError(
+            f"{', '.join(legacy)} and {envs.AITER_MOEV2_TUNED_TABLE} are both set; "
+            f"v2 reads only {envs.AITER_MOEV2_TUNED_TABLE} and legacy only "
+            f"{', '.join(legacy)}: unset one"
+        )
+    if not _warned_legacy_tables:
+        _warned_legacy_tables = True
+        logger.warning(
+            "[fused_moe] %s set: the calls aiter.moev2 takes run on the legacy code, "
+            "which reads it (v2 reads its tuned tables from %s)",
+            ", ".join(legacy),
+            envs.AITER_MOEV2_TUNED_TABLE,
+        )
     return None
 
 
 def reload():
-    global _active
+    global _active, _warned_legacy_tables
     _active = None
+    _warned_legacy_tables = False

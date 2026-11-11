@@ -9,7 +9,8 @@
 
 Runs on CPU: GPUs are hidden and dispatch-affecting environment variables are dropped
 (arch_sim.prepare_process). Legacy dispatch reads a frozen copy of the tuned tables
-(golden/inputs/), so tuning PRs do not change the snapshot; only dispatch logic does.
+(golden/inputs/), v2 dispatch its conversion, so tuning PRs do not change the snapshot;
+only dispatch logic does.
 Re-freeze the inputs when new kinds of tuned rows should be covered, in a PR of its own.
 
 One gzip-compressed JSON-lines file per simulated arch, sorted by key. A call variant
@@ -28,28 +29,40 @@ _HERE = pathlib.Path(__file__).resolve().parent
 GOLDEN_DIR = _HERE / "golden"
 INPUTS_DIR = GOLDEN_DIR / "inputs"
 FORMAT_VERSION = 1
-FROZEN_TABLES = {
-    "AITER_CONFIG_FMOE": "tuned_fmoe.csv",
-    "AITER_CONFIG_FHMOE": "tuned_fhmoe.csv",
-}
+# Legacy dispatch reads these, v2 dispatch their conversion (`FROZEN_CONVERTED`,
+# checked by convert_tables.py).
+FROZEN_TABLES = {"fmoe": "tuned_fmoe.csv", "fhmoe": "tuned_fhmoe.csv"}
+FROZEN_CONVERTED = {"fmoe": "tuned_fmoe.moev2.csv", "fhmoe": "tuned_fhmoe.moev2.csv"}
 SAME_AS_BASE = "=base"
 
 
-def _setup(frozen=True):
+def read_input(name) -> bytes:
+    return gzip.decompress((INPUTS_DIR / f"{name}.gz").read_bytes())
+
+
+def write_input(name, data: bytes):
+    INPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(INPUTS_DIR / f"{name}.gz", "wb") as raw, gzip.GzipFile(
+        fileobj=raw, mode="wb", mtime=0
+    ) as f:
+        f.write(data)
+
+
+def _setup(frozen=True, env=()):
     sys.path.insert(0, str(_HERE.parent))
     from moe_dispatch import arch_sim
 
-    tables = None
-    if frozen:
-        tmp = pathlib.Path(tempfile.mkdtemp(prefix="moe_dispatch_inputs_"))
-        tables = {}
-        for env_name, file_name in FROZEN_TABLES.items():
-            target = tmp / file_name
-            target.write_bytes(
-                gzip.decompress((INPUTS_DIR / f"{file_name}.gz").read_bytes())
-            )
-            tables[env_name] = target
-    arch_sim.prepare_process(tables)
+    if not frozen:
+        arch_sim.prepare_process(env=env)
+        return
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="moe_dispatch_inputs_"))
+    for name in (*FROZEN_TABLES.values(), *FROZEN_CONVERTED.values()):
+        (tmp / name).write_bytes(read_input(name))
+    arch_sim.prepare_process(
+        {k: tmp / name for k, name in FROZEN_TABLES.items()},
+        [tmp / name for name in FROZEN_CONVERTED.values()],
+        env,
+    )
 
 
 def _variant_label(label, variant):
@@ -165,22 +178,20 @@ def diff(expected, actual, limit=40):
 
 
 def refresh_inputs():
-    """Freeze the current merged runtime tuned tables as the snapshot inputs."""
+    """Freeze the current merged runtime tuned tables as the snapshot inputs, with
+    their conversion."""
     from aiter.jit.core import AITER_CONFIGS
+    from moe_dispatch import convert_tables
 
     sources = {
-        "AITER_CONFIG_FMOE": AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
-        "AITER_CONFIG_FHMOE": AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
+        "fmoe": AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
+        "fhmoe": AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
     }
-    INPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    for env_name, file_name in FROZEN_TABLES.items():
-        data = pathlib.Path(sources[env_name]).read_bytes()
-        target = INPUTS_DIR / f"{file_name}.gz"
-        with open(target, "wb") as raw, gzip.GzipFile(
-            fileobj=raw, mode="wb", mtime=0
-        ) as f:
-            f.write(data)
-        print(f"{env_name}: {sources[env_name]} -> {target}")
+    for key, name in FROZEN_TABLES.items():
+        write_input(name, pathlib.Path(sources[key]).read_bytes())
+        print(f"{sources[key]} -> {INPUTS_DIR / name}.gz")
+    convert_tables._frozen_problems(update=True)
+    print(f"converted -> {', '.join(FROZEN_CONVERTED.values())}")
 
 
 def main(argv=None):

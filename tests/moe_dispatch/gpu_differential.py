@@ -18,7 +18,9 @@ tests/moe_dispatch/mega_moe_tp_differential.py.
 
 Shipped tables have per-tensor rows for gfx942 only (and bf16 rows for gfx942 and a few
 gfx950 shapes). `--synth-table` adds the path's gfx942 CK rows, copied to the running
-arch, to the arch's own rows in a temporary AITER_CONFIG_FMOE, so the tuned CK branch runs
+arch, to the arch's own rows in a temporary table, which legacy reads instead of the
+default table (`arch_sim.use_legacy_tables`) and v2 instead of its shipped tables (with
+the FHMoE table, `AITER_MOEV2_TUNED_TABLE` mode replace), so the tuned CK branch runs
 on a gfx950 too. ASM and FlyDSL rows are not copied: their gfx942 configs give garbage on
 gfx950 (legacy and v2 alike). For a8w8_blockscale, whose shipped ASM stage-1 rows are
 gfx942 only, the arch's own CK rows are also added with stage 1 swapped for the arch's
@@ -931,7 +933,12 @@ def _run_case(path_name, case):
     import torch
 
     import aiter.fused_moe as fm
-    from moe_dispatch.differential import captured_logs, moev2_mode, run_differential
+    from moe_dispatch.differential import (
+        _as_v2_logs,
+        captured_logs,
+        moev2_mode,
+        run_differential,
+    )
 
     call = _make_call(path_name, case)
     with moev2_mode("off"), captured_logs():
@@ -943,7 +950,9 @@ def _run_case(path_name, case):
     _clear_dispatch_caches()
     with moev2_mode(path_name), captured_logs() as v2_logs:
         v2_error = _raised(lambda: fm.fused_moe(**call))
-    if _without_build_output(legacy_logs) != _without_build_output(v2_logs):
+    if _without_build_output(_as_v2_logs(legacy_logs)) != _without_build_output(
+        v2_logs
+    ):
         return f"{case}: log lines differ\n    legacy: {legacy_logs}\n    v2:     {v2_logs}"
     if legacy_error or v2_error:
         if legacy_error != v2_error:
@@ -964,6 +973,15 @@ def _child(args):
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
     synth_cases = json.loads(os.environ.get("_MOEV2_SYNTH_CASES", "[]"))
+    synth_table = os.environ.get("_MOEV2_SYNTH_TABLE")
+    if synth_table:
+        from aiter.jit.core import AITER_CONFIGS
+        from moe_dispatch import arch_sim
+
+        fhmoe = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+        arch_sim.use_legacy_tables({"fmoe": synth_table})
+        os.environ["AITER_MOEV2_TUNED_TABLE"] = os.pathsep.join((synth_table, fhmoe))
+        os.environ["AITER_MOEV2_TUNED_TABLE_MODE"] = "replace"
     todo = cases(args.path, [tuple(c) for c in synth_cases])
     print(
         f"{get_gfx_runtime()} cu{get_cu_num()} torch {torch.__version__}: {len(todo)} cases"
@@ -1043,7 +1061,7 @@ def main(argv=None):
     rows.to_csv(table, index=False)
     print(f"synthesized {len(rows)} {args.path} rows for {gfx} cu{cu_num} in {table}")
     env = dict(
-        os.environ, AITER_CONFIG_FMOE=str(table), _MOEV2_SYNTH_CASES=json.dumps(synth)
+        os.environ, _MOEV2_SYNTH_TABLE=str(table), _MOEV2_SYNTH_CASES=json.dumps(synth)
     )
     cmd = [sys.executable, __file__, "--path", args.path, "--child"]
     return subprocess.run(cmd, env=env, cwd=_REPO, check=False).returncode

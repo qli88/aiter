@@ -12,7 +12,6 @@ Log lines are collected, not emitted, so a declined resolution prints nothing; t
 emits them (`Resolution.emit`) once per problem, where the legacy cache would have logged.
 """
 
-import csv
 import logging
 import math
 from dataclasses import dataclass
@@ -32,7 +31,7 @@ from ..segments.defaults import (
 from ..segments.mxfp4 import mx_token
 from ..segments.sort import AUX_SORT_OPUS
 from ..segments.whole_graph import FusedMoeImplResolutionError, resolve_fused_moe_impl
-from . import kernel_names, overrides, ranking, tuned, tuned_plans
+from . import kernel_names, overrides, ranking, tuned_table
 from .buf import CALL_INPUT
 from .ops import Op, chain
 from .plan import MoePlan, SegmentChoice
@@ -463,13 +462,8 @@ def resolve(problem, segments) -> Resolution:
     if not plans:
         return declined("no feasible plan")
     keys = problem.log_keys()
-    try:
-        chosen = () if overrides.bypass_tuned() else tuned_plans.lookup(problem)
-    except (OSError, ValueError, KeyError, csv.Error) as error:
-        chosen = ()
-        file_logs.append(
-            (WARNING, f"[fused_moe] moev2 tuned plan file not read: {error}")
-        )
+    found = tuned_table.lookup(problem)
+    chosen = () if overrides.bypass_tuned() else found.tuner
     for names, candidates in chosen:
         structure = next((s for s in plans if _names(s) == names), None)
         built = (
@@ -478,7 +472,7 @@ def resolve(problem, segments) -> Resolution:
             else Resolution(None, declined="the structure is not feasible here")
         )
         if built.plan is not None:
-            note(f"tuned plan file: selected {built.plan.describe()}")
+            note(f"tuned plan: selected {built.plan.describe()}")
             message = f"[fused_moe] moev2 tuned plan {_plan_name(structure)} for {keys}"
             return Resolution(
                 built.plan,
@@ -492,7 +486,7 @@ def resolve(problem, segments) -> Resolution:
     for _, message in file_logs:
         note(message)
     logs = list(file_logs)
-    cfg = tuned.lookup(problem)
+    cfg = found.cells
     if cfg is None:
         note(f"tuned lookup: miss (tier {problem.shape.m})")
         matched = None

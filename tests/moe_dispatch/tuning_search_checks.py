@@ -8,7 +8,7 @@ For a sample of the keys each single-GPU path serves from a shipped tuned row (t
 (`search.tune`, in `tuning.pool` workers) over a sample of each tunable segment's
 candidates (`--per-group` per block_m and nt, plus the shipped row's own; `--full` for
 all), then its winner and the shipped plan are timed again in turn (`task.Rivals`;
-not when the winner is the shipped plan). `AITER_MOEV2_TUNED_PLANS` is ignored.
+not when the winner is the shipped plan). `AITER_MOEV2_TUNED_TABLE` is ignored.
 Verdicts: "same plan"; "faster" or "within noise" (`--tie-rel`, `--tie-abs-us`);
 "slower, outside the candidates" when the shipped plan is not one the search can pick
 (listed, not a problem). A winner slower than a shipped plan the search could pick, a
@@ -126,7 +126,8 @@ def main(argv=None):
             f"--{field.replace('_', '-')}", type=type(value), default=value
         )
     args = parser.parse_args(argv)
-    os.environ.pop("AITER_MOEV2_TUNED_PLANS", None)
+    os.environ.pop("AITER_MOEV2_TUNED_TABLE", None)
+    os.environ.pop("AITER_MOEV2_TUNED_TABLE_MODE", None)
     settings = Settings(**{f: getattr(args, f) for f in vars(defaults)})
 
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
