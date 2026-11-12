@@ -779,9 +779,10 @@ def test_hook_passes_every_forward_argument(h, monkeypatch):
 
     def route_to_v2(call, entry):
         assert entry == "mega_gfx1250"
-        return types.SimpleNamespace(run=run)
+        return types.SimpleNamespace(name=path.NAME, entry="mega_gfx1250", run=run)
 
     monkeypatch.setattr(paths, "route_to_v2", route_to_v2)
+    paths.reset_outcomes()
     with simulated_arch("gfx1250"):
         mega, mem, _ = _pipeline(h)
         call = _forward_args(_STEP, 0)
@@ -789,6 +790,7 @@ def test_hook_passes_every_forward_argument(h, monkeypatch):
         with moev2_mode(path.NAME):
             assert mega.forward(**call) == "v2 result"
     assert set(seen[0]) == {"mega", *path.FORWARD_ARGS}
+    assert paths.outcomes() == {("mega_gfx1250", path.NAME, "served"): 1}
     assert seen[0]["mega"] is mega and seen[0]["recv_token_bound"] is None
 
 

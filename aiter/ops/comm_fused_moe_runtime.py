@@ -120,7 +120,7 @@ class CommFusedMoeRuntime:
                     legacy.kernel_bench_callable,
                     legacy._fused_decode_sort_quant_disabled,
                 ):
-                    out = v2_path.run(call)
+                    out = moev2_paths.run(v2_path, call)
                 if out is not moev2_paths.DECLINED:
                     return out
 

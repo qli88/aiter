@@ -78,11 +78,22 @@ def legacy_tuned_tables() -> tuple:
     return tuple(n for n in LEGACY_TUNED_TABLES if os.environ.get(n, "").strip())
 
 
+AITER_MOEV2_TRACE = "AITER_MOEV2_TRACE"
+
+
+@functools.cache
+def trace_file() -> str:
+    """`AITER_MOEV2_TRACE`: a file every process appends one JSON line to for each
+    distinct routing outcome of a call (`paths.outcomes`), or "" for no trace."""
+    return os.environ.get(AITER_MOEV2_TRACE, "").strip()
+
+
 def reload():
     """Forget cached values so the next accessor call re-reads the environment."""
     moev2_selection.cache_clear()
     tuned_table.cache_clear()
     legacy_tuned_tables.cache_clear()
+    trace_file.cache_clear()
     from . import paths
 
     paths.reload()

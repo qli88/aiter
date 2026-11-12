@@ -572,7 +572,7 @@ def fused_moe(
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "api")
         if v2_path is not None:
-            out = v2_path.run(call)
+            out = moev2_paths.run(v2_path, call)
             if out is not moev2_paths.DECLINED:
                 return out
     has_shared_expert = (
@@ -813,7 +813,7 @@ def fused_moe_(
             with moev2_hooks.legacy_globals(
                 kernel_bench_callable, _fused_decode_sort_quant_disabled
             ):
-                out = v2_path.run(call)
+                out = moev2_paths.run(v2_path, call)
             if out is not moev2_paths.DECLINED:
                 return out
     stage2_scatter = None

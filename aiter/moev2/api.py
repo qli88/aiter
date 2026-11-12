@@ -331,7 +331,7 @@ def fused_moe(
 ):
     """Same contract as `aiter.fused_moe.fused_moe`, served by aiter.moev2."""
     for path, path_call in claiming_paths(dict(locals())):
-        out = path.run(path_call)
+        out = paths.run(path, path_call, "api")
         if out is not paths.DECLINED:
             return out
     raise NotImplementedError(NO_PATH)

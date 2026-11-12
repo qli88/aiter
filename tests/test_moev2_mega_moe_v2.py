@@ -242,8 +242,11 @@ def test_hook_passes_every_argument():
     scales = torch.ones(3, 2)
     stream = _Stream()
     seen = []
-    fake_path = types.SimpleNamespace(run=lambda call: seen.append(call) or "out")
+    fake_path = types.SimpleNamespace(
+        name="mega_moe_v2", entry="mega_v2", run=lambda call: seen.append(call) or "out"
+    )
     mega = _Fake()
+    paths.reset_outcomes()
     with moev2_mode("mega_moe_v2"), mock.patch.object(
         paths, "route_to_v2", side_effect=lambda call, entry: (entry, fake_path)[1]
     ) as route:
@@ -252,6 +255,7 @@ def test_hook_passes_every_argument():
             mega.forward_prequant(x, scales, wts, ids, mask_invalid_slots=True) == "out"
         )
     assert [c.args[1] for c in route.call_args_list] == ["mega_v2", "mega_v2"]
+    assert paths.outcomes() == {("mega_v2", "mega_moe_v2", "served"): 2}
     common = {"mega": mega, "wts": wts, "topk_ids": ids}
     assert seen[0] == {
         **common,
@@ -277,12 +281,16 @@ def test_hook_passes_every_argument():
 def test_declined_runs_legacy():
     x, wts, ids = _inputs(3)
     mega = _Fake()
-    declined = types.SimpleNamespace(run=lambda call: paths.DECLINED)
+    paths.reset_outcomes()
+    declined = types.SimpleNamespace(
+        name="mega_moe_v2", entry="mega_v2", run=lambda call: paths.DECLINED
+    )
     with moev2_mode("mega_moe_v2"), mock.patch.object(
         paths, "route_to_v2", return_value=declined
     ):
         mega.forward(x, wts, ids)
     assert [s[0] for s in mega.log] == ["quantize", "select", "stage1", "stage2"]
+    assert paths.outcomes() == {("mega_v2", "mega_moe_v2", "declined"): 1}
 
 
 def _weights(epr, *, dtype=torch.uint8, short=0):

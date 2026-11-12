@@ -344,8 +344,11 @@ def test_hook_passes_every_argument():
     out = torch.zeros(3, H, dtype=torch.bfloat16)
     tail = _tail(3)
     seen = []
-    fake_path = types.SimpleNamespace(run=lambda call: seen.append(call) or "out")
+    fake_path = types.SimpleNamespace(
+        name="mega_moe_tp", entry="mega_tp", run=lambda call: seen.append(call) or "out"
+    )
     mtp = _Fake()
+    paths.reset_outcomes()
     with (
         moev2_mode("mega_moe_tp"),
         mock.patch.object(
@@ -355,6 +358,7 @@ def test_hook_passes_every_argument():
         assert mtp.forward(x, wts, ids, out=out, tail=tail, bf16=True) == "out"
         assert mtp(x, wts, ids) == "out"
     assert [c.args[1] for c in route.call_args_list] == ["mega_tp", "mega_tp"]
+    assert paths.outcomes() == {("mega_tp", "mega_moe_tp", "served"): 2}
     common = {"mtp": mtp, "x": x, "topk_weights": wts, "topk_ids": ids}
     assert seen[0] == {**common, "out": out, "tail": tail, "bf16": True}
     assert seen[1] == {**common, "out": None, "tail": None, "bf16": False}
@@ -364,13 +368,17 @@ def test_hook_passes_every_argument():
 def test_declined_runs_legacy():
     x, wts, ids = _inputs(3)
     mtp = _Fake()
-    declined = types.SimpleNamespace(run=lambda call: paths.DECLINED)
+    paths.reset_outcomes()
+    declined = types.SimpleNamespace(
+        name="mega_moe_tp", entry="mega_tp", run=lambda call: paths.DECLINED
+    )
     with (
         moev2_mode("mega_moe_tp"),
         mock.patch.object(paths, "route_to_v2", return_value=declined),
     ):
         mtp.forward(x, wts, ids)
     assert [s[0] for s in mtp.log] == ["small"]
+    assert paths.outcomes() == {("mega_tp", "mega_moe_tp", "declined"): 1}
 
 
 # The template.

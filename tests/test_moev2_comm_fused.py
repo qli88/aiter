@@ -18,6 +18,7 @@ from moe_dispatch.differential import moev2_mode
 
 import aiter.fused_moe as legacy_fused_moe
 from aiter.moev2 import engine as engine_mod
+from aiter.moev2 import paths
 from aiter.moev2.dispatch.ops import Op
 from aiter.moev2.dispatch.plan import MoePlan, SegmentChoice
 from aiter.moev2.migration import comm_fused, local
@@ -527,9 +528,11 @@ def test_the_hook_routes_claimed_calls_to_v2(monkeypatch):
         raise AssertionError("legacy must not run a claimed call")
 
     monkeypatch.setattr(legacy_fused_moe, "_fused_moe_impl", legacy_impl)
+    paths.reset_outcomes()
     with moev2_mode("comm_fused"):
         out = runtime.run(shared_partial=_shared(4), **_moe_args(3))
         runtime.run(shared_partial=_shared(4), **_moe_args(4))
+    assert paths.outcomes() == {("comm_fused", "comm_fused", "served"): 2}
     assert out.shape == (3, MODEL_DIM)
     assert [shape for shape, *_ in fake.ran] == [(4, TOPK), (4, TOPK)]
     assert fake.ran[0][1].startswith("comm_fused.stage2_rs(runner=_Config(m=4,")
@@ -547,8 +550,10 @@ def test_a_declined_call_runs_on_legacy_before_any_barrier(monkeypatch):
     kw = {"shared_partial": _shared(16)}
     _, expected = _legacy(monkeypatch, _runners([], **runner_kw), _moe_args(64), **kw)
     log = []
+    paths.reset_outcomes()
     with moev2_mode("comm_fused"):
         _, out = _legacy(monkeypatch, _runners(log, **runner_kw), _moe_args(64), **kw)
+    assert paths.outcomes() == {("comm_fused", "comm_fused", "declined"): 1}
     # One barrier, legacy's: v2 declined before its own.
     assert log.count(("reuse_wait",)) == 1 and torch.equal(out, expected)
 

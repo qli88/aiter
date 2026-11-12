@@ -709,35 +709,52 @@ def run_differential(path_name, call, *, bitwise=False):
             f"{path_name}: launches differ: " + "; ".join(list(problems.values())[:6])
         )
     if bitwise:
-        assert torch.equal(ref, out), f"{path_name}: output differs from legacy"
+        same = (ref.dtype, ref.shape) == (out.dtype, out.shape) and torch.equal(
+            ref.contiguous().view(torch.uint8), out.contiguous().view(torch.uint8)
+        )
+        assert same, f"{path_name}: output differs from legacy"
         return ref, out
     _check_output(path_name, ref, ref2, out)
     return ref, out
 
 
-def _check_output(path_name, ref, ref2, out):
-    """`out` matches legacy `ref` within the noise between two legacy runs."""
+def _check_output(path_name, ref, ref2, out, names=("legacy", "v2")):
+    """`out` matches legacy `ref` within the noise between two legacy runs. `names`:
+    what the messages call the reference and `out`."""
     import torch
 
+    ref_name, out_name = names
     finite = ref.isfinite()
+
+    def same_non_finite(x):
+        """NaN where `ref` has NaN, the same infinities where it has those."""
+        nan = ref.isnan()
+        inf = ~finite & ~nan
+        return (
+            torch.equal(finite, x.isfinite())
+            and torch.equal(nan, x.isnan())
+            and torch.equal(ref[inf], x[inf])
+        )
 
     def gap(x):
         diff = (x.float()[finite] - ref.float()[finite]).abs()
         return diff.max().item() if diff.numel() else 0.0
 
-    noise = gap(ref2) if torch.equal(finite, ref2.isfinite()) else float("inf")
+    noise = gap(ref2) if same_non_finite(ref2) else float("inf")
     peak = ref.float()[finite].abs().max().item() if finite.any() else 0.0
-    assert (
-        noise <= peak
-    ), f"{path_name}: legacy output not reproducible (noise {noise}, peak {peak})"
-    assert torch.equal(finite, out.isfinite()) and torch.equal(
-        ref[~finite], out[~finite]
-    ), f"{path_name}: non-finite outputs differ from legacy"
+    assert noise <= peak, (
+        f"{path_name}: {ref_name} output not reproducible (noise {noise}, peak "
+        f"{peak})"
+    )
+    assert same_non_finite(
+        out
+    ), f"{path_name}: non-finite outputs differ from {ref_name}"
     err = gap(out)
     tol = max(4 * _ulp(ref), 2 * noise)
-    assert (
-        err <= tol
-    ), f"{path_name}: max |v2 - legacy| {err} > {tol} (legacy noise {noise})"
+    assert err <= tol, (
+        f"{path_name}: max |{out_name} - {ref_name}| {err} > {tol} ({ref_name} "
+        f"noise {noise})"
+    )
 
 
 if __name__ == "__main__":

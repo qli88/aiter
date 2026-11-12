@@ -19,6 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 def _clean(monkeypatch):
     """Each test starts with no path registered (the built-in ones are restored after)."""
     monkeypatch.delenv(envs.AITER_MOEV2, raising=False)
+    monkeypatch.delenv(envs.AITER_MOEV2_TRACE, raising=False)
     saved = paths.registered()
     paths._REGISTRY.clear()
     envs.reload()
@@ -156,6 +157,163 @@ def test_declined_calls_fall_back_to_legacy(monkeypatch):
     monkeypatch.setattr(legacy, "_fused_moe_impl", fake_impl)
     assert legacy.fused_moe(*_cpu_moe_args()) is legacy_out
     assert len(op_calls) == 1 and len(legacy_calls) == 1
+
+
+def _legacy_impl(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(
+        legacy,
+        "_fused_moe_impl",
+        lambda *args, **kwargs: torch.zeros(2, 8, dtype=torch.bfloat16),
+    )
+
+
+def test_outcomes_count_how_each_routed_call_ran(monkeypatch):
+    import torch
+
+    _legacy_impl(monkeypatch)
+    served = torch.zeros(2, 8, dtype=torch.bfloat16)
+    _fake_path(
+        "a16w16",
+        entry="op",
+        claims=lambda call: call["hidden_states"].shape[0] != 3,
+        out=lambda call: (
+            paths.DECLINED if call["hidden_states"].shape[0] == 4 else served
+        ),
+    )
+    paths.reset_outcomes()
+    legacy.fused_moe(*_cpu_moe_args())
+    assert paths.outcomes() == {}, "nothing is counted without an active path"
+    _set(monkeypatch, "a16w16")
+    for tokens in (2, 2, 3, 4):
+        legacy.fused_moe(*_cpu_moe_args(tokens=tokens))
+    assert paths.outcomes() == {
+        ("op", "a16w16", "served"): 2,
+        ("op", None, "unclaimed"): 1,
+        ("op", "a16w16", "declined"): 1,
+    }
+    monkeypatch.setenv("AITER_CONFIG_FMOE", "legacy.csv")
+    envs.reload()
+    paths.reset_outcomes()
+    legacy.fused_moe(*_cpu_moe_args())
+    assert paths.outcomes() == {("op", "a16w16", "legacy_tables"): 1}
+
+
+def test_trace_file_has_a_line_per_distinct_outcome(monkeypatch, tmp_path):
+    import json
+    import os
+
+    _legacy_impl(monkeypatch)
+    _fake_path("a16w16", entry="op", out=lambda call: paths.DECLINED)
+    trace = tmp_path / "trace.jsonl"
+    monkeypatch.setenv(envs.AITER_MOEV2_TRACE, str(trace))
+    _set(monkeypatch, "a16w16")
+    paths.reset_outcomes()
+    for tokens in (2, 2, 5):
+        legacy.fused_moe(*_cpu_moe_args(tokens=tokens))
+    lines = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert [line["call"]["hidden_states"] for line in lines] == [
+        "bfloat16[2, 8]",
+        "bfloat16[5, 8]",
+    ]
+    first = lines[0]
+    assert (first["entry"], first["path"], first["outcome"]) == (
+        "op",
+        "a16w16",
+        "declined",
+    )
+    assert first["pid"] == os.getpid()
+    assert first["call"]["quant_type"] == 0 and first["call"]["output"] is None
+    assert paths.outcomes() == {("op", "a16w16", "declined"): 3}
+
+
+def test_fhmoe_entry_counts_served_and_declined_calls(monkeypatch):
+    import torch
+
+    from aiter import fhmoe
+
+    _legacy_impl(monkeypatch)
+    monkeypatch.setattr(fhmoe, "_validate_fhmoe_contract", lambda *a, **k: None)
+    served = torch.ones(2, 8, dtype=torch.bfloat16)
+    _fake_path(
+        "fhmoe",
+        entry="fhmoe",
+        out=lambda call: (
+            served if call["hidden_states"].shape[0] == 2 else paths.DECLINED
+        ),
+    )
+    _set(monkeypatch, "fhmoe")
+    paths.reset_outcomes()
+    assert torch.equal(fhmoe.fhmoe_(*_cpu_moe_args(tokens=2)), served)
+    assert not fhmoe.fhmoe_(*_cpu_moe_args(tokens=3)).any()
+    assert paths.outcomes() == {
+        ("fhmoe", "fhmoe", "served"): 1,
+        ("fhmoe", "fhmoe", "declined"): 1,
+    }
+
+
+def test_no_trace_without_the_variable(monkeypatch):
+    _legacy_impl(monkeypatch)
+    _fake_path("a16w16", entry="op", out=lambda call: paths.DECLINED)
+    _set(monkeypatch, "a16w16")
+    paths.reset_outcomes()
+    legacy.fused_moe(*_cpu_moe_args())
+    assert paths.outcomes() and not paths._traced
+
+
+def test_an_unwritable_trace_warns_once_and_the_call_goes_on(
+    monkeypatch, tmp_path, caplog
+):
+    _legacy_impl(monkeypatch)
+    _fake_path("a16w16", entry="op", out=lambda call: paths.DECLINED)
+    monkeypatch.setenv(envs.AITER_MOEV2_TRACE, str(tmp_path / "missing" / "t.jsonl"))
+    _set(monkeypatch, "a16w16")
+    paths.reset_outcomes()
+    with caplog.at_level(logging.WARNING, logger="aiter"):
+        for tokens in (2, 5):
+            legacy.fused_moe(*_cpu_moe_args(tokens=tokens))
+    assert caplog.text.count("not traced") == 1
+    assert paths.outcomes() == {("op", "a16w16", "declined"): 2}
+
+
+def test_trace_describes_arguments_without_their_contents():
+    import enum
+    import json
+
+    import torch
+
+    from aiter import ActivationType
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    class Opaque:
+        pass
+
+    class Color(enum.Enum):
+        RED = 1
+
+    call = {
+        "t": torch.zeros(3, 4, dtype=torch.bfloat16),
+        "act": ActivationType.Silu,
+        "gate": GateMode.INTERLEAVE,
+        "color": Color.RED,
+        "dtype": torch.float8_e4m3fn,
+        "pair": (1, torch.zeros(2, dtype=torch.int32)),
+        "nested": {"deeper": {"x": 1}},
+        "obj": Opaque(),
+    }
+    described = {k: paths._describe(v) for k, v in call.items()}
+    assert described == {
+        "t": "bfloat16[3, 4]",
+        "act": str(ActivationType.Silu),
+        "gate": GateMode.INTERLEAVE.value,
+        "color": "Color.RED",
+        "dtype": "torch.float8_e4m3fn",
+        "pair": [1, "int32[2]"],
+        "nested": {"deeper": "dict"},
+        "obj": "Opaque",
+    }
+    json.dumps(described)
 
 
 def test_op_entry_path_records_into_the_legacy_kernel_bench(monkeypatch):
@@ -326,6 +484,17 @@ def test_legacy_fused_moe_is_a_plain_function():
 def test_v2_api_without_a_path_raises():
     with pytest.raises(NotImplementedError):
         api.fused_moe(None, None, None, None, None)
+
+
+def test_v2_api_counts_its_calls_under_entry_api():
+    _fake_path("a4w4", out=lambda call: paths.DECLINED)
+    _fake_path("a16w16", entry="op")
+    paths.reset_outcomes()
+    assert api.fused_moe(*_cpu_moe_args()) == ("v2", "a16w16")
+    assert paths.outcomes() == {
+        ("api", "a4w4", "declined"): 1,
+        ("api", "a16w16", "served"): 1,
+    }
 
 
 def test_v2_api_matches_legacy_signature():

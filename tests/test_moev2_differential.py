@@ -13,6 +13,7 @@ gfx1250).
 """
 
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -79,3 +80,23 @@ def test_outputs_match_legacy(path_name):
         check=False,
     )
     assert proc.returncode == 0, proc.stdout[-6000:] + proc.stderr[-3000:]
+
+
+def test_check_output_compares_non_finite_values_by_position():
+    import torch
+    from moe_dispatch.differential import _check_output
+
+    nan, inf = float("nan"), float("inf")
+    ref = torch.tensor([1.0, nan, -inf, 2.0], dtype=torch.bfloat16)
+    ref2 = torch.tensor([1.0078125, nan, -inf, 2.0], dtype=torch.bfloat16)
+    _check_output("p", ref, ref2, ref.clone())
+    for out, says in (
+        ([1.0, 0.0, -inf, 2.0], "non-finite outputs differ from legacy"),
+        ([1.0, nan, inf, 2.0], "non-finite outputs differ from legacy"),
+        ([1.5, nan, -inf, 2.0], "max |v2 - legacy|"),
+    ):
+        with pytest.raises(AssertionError, match=re.escape(says)):
+            _check_output("p", ref, ref2, torch.tensor(out, dtype=torch.bfloat16))
+    moved = torch.tensor([nan, 1.0, -inf, 2.0], dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="reference output not reproducible"):
+        _check_output("p", ref, moved, ref.clone(), ("reference", "candidate"))

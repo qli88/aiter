@@ -295,7 +295,7 @@ class MegaMoeTP:
         v2_path = moev2_paths.route_to_v2(call, "mega_tp")
         if v2_path is None:
             return None
-        res = v2_path.run(call)
+        res = moev2_paths.run(v2_path, call)
         return None if res is moev2_paths.DECLINED else res
 
     def _local(self, rows: int) -> int:

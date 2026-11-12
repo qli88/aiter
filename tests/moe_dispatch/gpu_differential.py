@@ -701,7 +701,11 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
 
 def _weights(row):
     """The case weight format of a tuned row."""
-    w = str(row.q_dtype_w)
+    return _weight_format(row.q_dtype_w)
+
+
+def _weight_format(q_dtype_w):
+    w = str(q_dtype_w)
     return "i8" if "int8" in w else "i4" if "uint32" in w or "int4" in w else "fp8"
 
 
@@ -859,6 +863,150 @@ def cases(path_name, synth_cases=()):
     return list(_CASES[path_name]) + list(synth_cases)
 
 
+MODEL_TOKENS = (1, 16, 64, 256, 1024, 4096)
+_CONFIGS = _REPO / "aiter" / "configs"
+_TABLE_COLUMNS = {"cu_num", "token", "model_dim", "inter_dim", "expert", "topk"}
+_TABLE_COLUMNS |= {"act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type", "use_g1u1"}
+_TABLE_COLUMNS |= {"doweight_stage1"}
+
+
+def model_tables(names):
+    """The legacy tuned tables named: files, and for `all` `aiter/configs/tuned_fmoe.csv`
+    and every `aiter/configs/model_configs/*tuned*fmoe*.csv` with the dispatch key
+    columns. Exits for a named file without them."""
+    import pandas as pd
+
+    def has_key(f):
+        return _TABLE_COLUMNS <= set(pd.read_csv(f, nrows=0).columns)
+
+    found = []
+    for name in names:
+        if name != "all":
+            if not pathlib.Path(name).is_file():
+                raise SystemExit(f"{name}: no such table file")
+            if not has_key(name):
+                raise SystemExit(f"{name}: not a tuned table (no dispatch key columns)")
+            found.append(pathlib.Path(name))
+            continue
+        everything = [_CONFIGS / "tuned_fmoe.csv"]
+        everything += sorted((_CONFIGS / "model_configs").glob("*tuned*fmoe*.csv"))
+        found += [f for f in everything if "untuned" not in f.name and has_key(f)]
+    return list(dict.fromkeys(found))
+
+
+def row_path(row):
+    """The migration path whose GPU cases build a call of tuned `row`'s format."""
+    q_type = str(row["q_type"]).split(".")[-1]
+    a, w = str(row["q_dtype_a"]), str(row["q_dtype_w"])
+    if q_type == "per_1x32":
+        if "float4" in w:
+            return "a4w4" if "float4" in a else "a8w4" if "float8" in a else "a16w4"
+        return "a16wi4" if "int4" in w else "mxfp8" if "float8" in w else None
+    return {
+        "No": "a16w16",
+        "per_Tensor": "a8w8_pt",
+        "per_Token": "a8w8_ptok",
+        "per_1x128": "a8w8_blockscale",
+        "per_128x128": "a8w8_blockscale",
+    }.get(q_type)
+
+
+def _row_case(path_name, row, token, options):
+    """The `_make_call` case of tuned `row`'s key at `token` tokens: its weight format and
+    activation dtype as the row has them, `options` added."""
+    a = str(row["q_dtype_a"])
+    weights, own = {
+        "a4w4": ("fp4", {"q_a": "fp4"}),
+        "a8w4": ("fp4", {"q_a": "fp8"}),
+        "a16w4": ("fp4", {"q_a": "bf16"}),
+        "a16wi4": ("wi4", {}),
+        "mxfp8": ("mxfp8", {"q_a": "fp8"} if "float8" in a else {}),
+        "a8w8_blockscale": ("fp8", {}),
+    }.get(path_name, (_weight_format(row["q_dtype_w"]), {}))
+    if int(row["use_g1u1"]) == 0:
+        own = {**own, "g1u0": True}
+    own = {**own, **options}
+    case = (
+        int(token), int(row["model_dim"]), int(row["inter_dim"]), int(row["expert"]),
+        int(row["topk"]), str(row["act_type"]).split(".")[-1],
+        bool(int(row["doweight_stage1"])),
+        "bf16" if "bfloat16" in str(row["dtype"]) else "fp16", False, weights,
+    )  # fmt: skip
+    return (*case, own) if own else case
+
+
+def model_cases(path_name, tables, gfx, cu_num, tokens=MODEL_TOKENS, options=None):
+    """`(case, source)` for every row of `tables` that `(gfx, cu_num)` reads (`cu_num`
+    equal, and `gfx` equal where the table has that column) and whose format is
+    `path_name`'s: the row's key at its own token count and at each of `tokens`
+    (duplicates dropped, first source kept). `options`: added to every case."""
+    import pandas as pd
+
+    out, seen = [], set()
+    for table in tables:
+        df = pd.read_csv(table)
+        df = df[df["cu_num"] == cu_num]
+        if "gfx" in df.columns:
+            df = df[df["gfx"] == gfx]
+        for i, row in df.iterrows():
+            if row_path(row) != path_name:
+                continue
+            for token in dict.fromkeys((int(row["token"]), *tokens)):
+                case = _row_case(path_name, row, token, options or {})
+                key = json.dumps(case)
+                if key not in seen:
+                    seen.add(key)
+                    out.append((case, f"{pathlib.Path(table).name}:{i + 2}"))
+    return out
+
+
+def add_model_arguments(parser):
+    parser.add_argument(
+        "--model-table",
+        nargs="+",
+        metavar="CSV",
+        help="run the rows of these legacy tuned tables (or `all`) instead of the "
+        "built-in cases",
+    )
+    parser.add_argument(
+        "--tokens",
+        default=",".join(map(str, MODEL_TOKENS)),
+        help="token counts each row also runs at (comma-separated)",
+    )
+    parser.add_argument(
+        "--case-options",
+        default="{}",
+        help="JSON options added to every table case (as in `_make_call`)",
+    )
+    parser.add_argument(
+        "--arch",
+        nargs=2,
+        metavar=("GFX", "CU_NUM"),
+        help="select the rows of this arch and CU count, not the GPU's (for --list)",
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="print the table cases, run nothing"
+    )
+
+
+def selected_model_cases(args, path_name):
+    if args.arch:
+        gfx, cu_num = args.arch[0], int(args.arch[1])
+    else:
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+        gfx, cu_num = get_gfx_runtime(), get_cu_num()
+    tokens = tuple(int(t) for t in args.tokens.split(",") if t.strip())
+    return model_cases(
+        path_name,
+        model_tables(args.model_table),
+        gfx,
+        cu_num,
+        tokens,
+        json.loads(args.case_options),
+    )
+
+
 def _clear_dispatch_caches():
     import aiter.fhmoe as legacy_fhmoe
     import aiter.fused_moe as fm
@@ -966,23 +1114,27 @@ def _run_case(path_name, case):
     return None
 
 
-def _child(args):
+def _child(args, todo=None):
+    """Runs `todo` (cases), by default the path's cases plus the synthesized ones."""
     sys.path.insert(0, str(_HERE.parent))
     import torch
 
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
-    synth_cases = json.loads(os.environ.get("_MOEV2_SYNTH_CASES", "[]"))
-    synth_table = os.environ.get("_MOEV2_SYNTH_TABLE")
-    if synth_table:
-        from aiter.jit.core import AITER_CONFIGS
-        from moe_dispatch import arch_sim
+    if todo is None:
+        synth_cases = json.loads(os.environ.get("_MOEV2_SYNTH_CASES", "[]"))
+        synth_table = os.environ.get("_MOEV2_SYNTH_TABLE")
+        if synth_table:
+            from aiter.jit.core import AITER_CONFIGS
+            from moe_dispatch import arch_sim
 
-        fhmoe = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
-        arch_sim.use_legacy_tables({"fmoe": synth_table})
-        os.environ["AITER_MOEV2_TUNED_TABLE"] = os.pathsep.join((synth_table, fhmoe))
-        os.environ["AITER_MOEV2_TUNED_TABLE_MODE"] = "replace"
-    todo = cases(args.path, [tuple(c) for c in synth_cases])
+            fhmoe = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+            arch_sim.use_legacy_tables({"fmoe": synth_table})
+            os.environ["AITER_MOEV2_TUNED_TABLE"] = os.pathsep.join(
+                (synth_table, fhmoe)
+            )
+            os.environ["AITER_MOEV2_TUNED_TABLE_MODE"] = "replace"
+        todo = cases(args.path, [tuple(c) for c in synth_cases])
     print(
         f"{get_gfx_runtime()} cu{get_cu_num()} torch {torch.__version__}: {len(todo)} cases"
     )
@@ -1014,8 +1166,23 @@ def main(argv=None):
     parser.add_argument("--path", required=True)
     parser.add_argument("--synth-table", action="store_true")
     parser.add_argument("--synth-limit", type=int, default=48)
+    add_model_arguments(parser)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.model_table and args.synth_table:
+        raise SystemExit("--model-table and --synth-table do not combine")
+    if args.list and not args.model_table:
+        raise SystemExit("--list lists --model-table cases")
+    if args.model_table:
+        if args.path not in _CASES or args.path == "fhmoe":
+            raise SystemExit(f"--model-table: no table cases for path {args.path}")
+        found = selected_model_cases(args, args.path)
+        if args.list:
+            for case, source in found:
+                print(f"{source} {case}")
+            print(f"{len(found)} cases")
+            return 0
+        return _child(args, [case for case, _ in found])
     if args.path == "comm_fused":
         sys.path.insert(0, str(_HERE.parent))
         from moe_dispatch import comm_fused_differential

@@ -9,15 +9,23 @@ handed back: `run` returns `DECLINED` when the resolver finds no plan it may run
 row naming a kernel family the path has not ported, a ranking region marked legacy, no
 feasible listed structure), and the legacy code then runs the call as before. While
 legacy's own tuned-table variables are set, `route_to_v2` hands every call back.
+The entry points run a routed call with `run(path, call)`, which counts its outcome
+(`outcomes`; with `AITER_MOEV2_TRACE` set, also a trace file), so a run can show that
+v2 served its calls rather than handing them back.
 
 Predicates run on every call, including during graph capture: they may read dtypes,
 shapes and Python values, never tensor contents.
 """
 
+import collections
 import importlib
+import json
 import logging
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+
+import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -214,14 +222,106 @@ def route_to_v2(call: Mapping, entry: str = "api"):
     does not read, a claimed call goes to the legacy code (warned once); with
     `AITER_MOEV2_TUNED_TABLE` set too, raises."""
     by_default = envs.moev2_selection() == "default"
+    used = False
     for path in active():
-        if path.entry != entry or not path.claims(call):
+        if path.entry != entry:
+            continue
+        used = True
+        if not path.claims(call):
             continue
         gate = path.graduated_claims
         if by_default and gate is not None and not gate(call):
             continue
-        return _unless_legacy_tables(path)
+        routed = _unless_legacy_tables(path)
+        if routed is None:
+            _record(entry, path.name, "legacy_tables", call)
+        return routed
+    if used:
+        _record(entry, None, "unclaimed", call)
     return None
+
+
+def run(path: Path, call: Mapping, entry: str | None = None):
+    """`path.run(call)` for a path `route_to_v2` returned, its outcome counted under
+    `entry` (the path's own by default)."""
+    out = path.run(call)
+    outcome = "declined" if out is DECLINED else "served"
+    _record(entry or path.entry, path.name, outcome, call)
+    return out
+
+
+_outcomes: collections.Counter = collections.Counter()
+_traced: set = set()
+_trace_failed = False
+
+
+def outcomes() -> dict:
+    """`{(entry, path name, outcome): calls}` since `reset_outcomes`: the calls that
+    reached a legacy entry point some active path uses, and every call of
+    `api.fused_moe` (entry `api`, whatever AITER_MOEV2 says). Outcomes: `served` and
+    `declined` (`run`; from a legacy entry point a declined call runs on the legacy
+    code, from `api.fused_moe` the next path is tried), `unclaimed` (no active path
+    took it: none claims it, or under the default selection its graduation gate
+    refuses it; path name None), `legacy_tables` (claimed, handed back by
+    `route_to_v2`). Calls replayed from a captured graph do not reach an entry and are
+    not counted."""
+    return dict(_outcomes)
+
+
+def reset_outcomes():
+    global _trace_failed
+    _outcomes.clear()
+    _traced.clear()
+    _trace_failed = False
+
+
+def _record(entry, name, outcome, call):
+    _outcomes[entry, name, outcome] += 1
+    file = envs.trace_file()
+    if file and not _trace_failed:
+        _trace(file, entry, name, outcome, call)
+
+
+def _trace(file, entry, name, outcome, call):
+    """Appends `{entry, path, outcome, call, pid}` the first time this process sees
+    the outcome for a call of these argument shapes, dtypes and values. A file it
+    cannot write is warned about once and no longer traced: the call goes on."""
+    global _trace_failed
+    record = {"entry": entry, "path": name, "outcome": outcome}
+    record["call"] = {k: _describe(v) for k, v in call.items()}
+    key = json.dumps(record, sort_keys=True)
+    if key in _traced:
+        return
+    _traced.add(key)
+    record["pid"] = os.getpid()
+    line = (json.dumps(record, sort_keys=True) + "\n").encode()
+    try:
+        # One O_APPEND write per line, so lines of several processes do not interleave.
+        fd = os.open(file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError as error:
+        _trace_failed = True
+        logger.warning("%s=%s: not traced: %s", envs.AITER_MOEV2_TRACE, file, error)
+
+
+def _describe(value, nested=False):
+    """`value` as JSON without reading tensor contents."""
+    if isinstance(value, torch.Tensor):
+        return f"{str(value.dtype).removeprefix('torch.')}{list(value.shape)}"
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (torch.dtype, torch.device)) or hasattr(
+        type(value), "__members__"
+    ):
+        return str(value)
+    if isinstance(value, (tuple, list)):
+        return [_describe(v, True) for v in value]
+    if isinstance(value, Mapping) and not nested:
+        return {str(k): _describe(v, True) for k, v in value.items()}
+    return type(value).__name__
 
 
 _warned_legacy_tables = False

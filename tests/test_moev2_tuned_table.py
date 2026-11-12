@@ -377,7 +377,7 @@ def test_v2_hands_its_calls_back_while_legacys_variables_are_set(
     monkeypatch, caplog, tmp_path
 ):
     path = types.SimpleNamespace(
-        entry="api", claims=lambda call: True, graduated_claims=None
+        name="a16w16", entry="api", claims=lambda call: True, graduated_claims=None
     )
     monkeypatch.setattr(paths, "active", lambda: (path,))
     monkeypatch.setenv("AITER_MOEV2", "on")

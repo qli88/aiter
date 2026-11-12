@@ -890,7 +890,7 @@ class MegaMoEV2:
         v2_path = moev2_paths.route_to_v2(call, "mega_v2")
         if v2_path is None:
             return None
-        out = v2_path.run(call)
+        out = moev2_paths.run(v2_path, call)
         return None if out is moev2_paths.DECLINED else out
 
     forward_bf16 = forward

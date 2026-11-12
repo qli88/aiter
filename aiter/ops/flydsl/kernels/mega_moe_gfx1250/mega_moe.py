@@ -836,7 +836,7 @@ class MegaMoEGfx1250:
             }
             v2_path = moev2_paths.route_to_v2(call, "mega_gfx1250")
             if v2_path is not None:
-                out = v2_path.run(call)
+                out = moev2_paths.run(v2_path, call)
                 if out is not moev2_paths.DECLINED:
                     return out
 
