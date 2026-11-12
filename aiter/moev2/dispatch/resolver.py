@@ -439,6 +439,19 @@ def _default_params(problem, structure) -> dict:
 def resolve(problem, segments, cells=None) -> Resolution:
     """`problem`'s plan over `segments`: the tuned table's rows of its key (`cells`,
     a legacy comm_fused row's: those cells instead), else the default ranking."""
+    return _resolve(problem, segments, cells, None)
+
+
+def default_plan(problem, segments, structure) -> Resolution:
+    """What `resolve` runs for `problem` without a tuned row if the default ranking
+    picked `structure` (segment names, one of `feasible_plans`): its default params.
+    Declined where `resolve` declines without a tuned row whatever the ranking (a
+    dedicated table, FHMoE: no default ranking), where it is not feasible, or where a
+    segment has no default params."""
+    return _resolve(problem, segments, None, tuple(structure))
+
+
+def _resolve(problem, segments, cells, default_structure) -> Resolution:
     explain = [] if overrides.explain() else None
 
     def note(line):
@@ -464,11 +477,12 @@ def resolve(problem, segments, cells=None) -> Resolution:
     if not plans:
         return declined("no feasible plan")
     keys = problem.log_keys()
-    found = (
-        tuned_table.lookup(problem)
-        if cells is None
-        else tuned_table.Found(cells=dict(cells))
-    )
+    if default_structure is not None:
+        found = tuned_table.Found()
+    elif cells is None:
+        found = tuned_table.lookup(problem)
+    else:
+        found = tuned_table.Found(cells=dict(cells))
     chosen = () if overrides.bypass_tuned() else found.tuner
     for names, candidates in chosen:
         structure = next((s for s in plans if _names(s) == names), None)
@@ -570,15 +584,27 @@ def resolve(problem, segments, cells=None) -> Resolution:
     s = problem.shape
     q_type = problem.quant_type
     if cfg is None or bypass_tuned_config:
-        best = ranking.best(problem, ranking.rankable(plans), tuned_row=cfg is not None)
-        if best is None:
-            return declined("no default ranking entry applies")
-        region, structure, legacy = best
-        if legacy is not None:
-            return declined(f"ranking {region}: {legacy} is not ported")
-        if structure is None:
-            return declined(f"ranking {region}: no listed structure is feasible")
-        defaults = _default_params(problem, structure)
+        if default_structure is not None:
+            region = "requested"
+            structure = next((s for s in plans if _names(s) == default_structure), None)
+            if structure is None:
+                return declined("the structure is not feasible here")
+            try:
+                defaults = _default_params(problem, structure)
+            except ValueError as error:
+                return declined(str(error))
+        else:
+            best = ranking.best(
+                problem, ranking.rankable(plans), tuned_row=cfg is not None
+            )
+            if best is None:
+                return declined("no default ranking entry applies")
+            region, structure, legacy = best
+            if legacy is not None:
+                return declined(f"ranking {region}: {legacy} is not ported")
+            if structure is None:
+                return declined(f"ranking {region}: no listed structure is feasible")
+            defaults = _default_params(problem, structure)
         kernelName2 = ""
         one_stage = _one_stage(structure)
         run_1stage = one_stage is not None

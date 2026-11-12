@@ -7,7 +7,8 @@ names known, adjacent segments, and the last structure of every list is always f
 Over the dispatch snapshot key grid, on every simulated arch: every key some registered
 path takes and can rank lands in exactly one entry and one region whose last structure
 is feasible (or that hands it to the legacy code), and every region is reached by some
-key.
+key; without a tuned row, `resolver.default_plan` of the structure the ranking picks
+runs what `resolve` runs.
 
     python tests/moe_dispatch/ranking_checks.py --check [--arch gfx950]
 """
@@ -47,6 +48,36 @@ def grid_problems(arch):
         yield f"{arch} {key.label()}|fhmoe", api.fhmoe_problem(problem)
 
 
+def default_plan_problems(problems, paths):
+    """`(checked, errors)`: without a tuned row, `resolver.default_plan` of the
+    structure the ranking picks runs what `resolve` runs, for every problem a path
+    takes and ranks."""
+    from unittest import mock
+
+    from aiter.moev2.dispatch import ranking, resolver, tuned_table
+    from aiter.moev2.tuning.search import _runs
+
+    checked, errors = 0, []
+    with mock.patch.object(tuned_table, "lookup", lambda p: tuned_table.Found()):
+        for label, p in problems:
+            for path in paths:
+                if not path.takes(p):
+                    continue
+                resolved = resolver.resolve(p, path.segments)
+                if resolved.plan is None:
+                    continue
+                plans = ranking.rankable(resolver.feasible_plans(p, path.segments)[0])
+                _, structure, _ = ranking.best(p, plans)
+                names = tuple(s.name for s in structure)
+                default = resolver.default_plan(p, path.segments, names)
+                checked += 1
+                if default.plan is None:
+                    errors.append(f"{label} {path.name}: declined {default.declined}")
+                elif _runs(p, default) != _runs(p, resolved):
+                    errors.append(f"{label} {path.name}: runs another plan")
+    return checked, errors
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--check", action="store_true", required=True)
@@ -69,10 +100,15 @@ def main(argv=None):
     for arch in args.arch or list(arch_sim.ARCHS):
         with arch_sim.simulated_arch(arch), captured_logs():
             grid_errors, arch_hits = ranking.check_problems(grid_problems(arch), served)
+            checked, default_errors = default_plan_problems(grid_problems(arch), served)
         print(
             f"{arch}: {sum(arch_hits.values())} ranked keys, {len(grid_errors)} problems"
         )
-        errors += grid_errors
+        print(
+            f"{arch}: default_plan of the pick: {checked} keys, "
+            f"{len(default_errors)} problems"
+        )
+        errors += grid_errors + default_errors
         hits += arch_hits
     errors += ranking.dead_lists(hits)
     for label, n in sorted(hits.items()):

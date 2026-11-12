@@ -5,9 +5,10 @@
 
 A task names one problem, the registered path serving it, and the plan to measure: a
 structure (its segment names, one of `resolver.feasible_plans`) and the candidate of
-each tunable segment (`resolver.build`), or neither for the plan dispatch resolves
-today. The worker builds the inputs once per problem and keeps the last ones. A failure
-that leaves the device unusable restarts the worker (`pool.Restart`).
+each tunable segment (`resolver.build`) or none (its default params,
+`resolver.default_plan`), or neither for the plan dispatch resolves today. The worker
+builds the inputs once per problem and keeps the last ones. A failure that leaves the
+device unusable restarts the worker (`pool.Restart`).
 """
 
 from dataclasses import dataclass
@@ -26,7 +27,8 @@ class Task:
     problem: object  # MoeProblem
     path: str  # `paths.registered()` name
     structure: tuple | None = None  # segment names; None: what dispatch resolves
-    candidates: tuple | None = None  # ((segment name, Params), ...) with `structure`
+    # ((segment name, Params), ...) with `structure`; None: its default params
+    candidates: tuple | None = None
     mode: str | None = None  # "graph" or "eager"; None: `measure.deploy_mode`
     iters: int = 50
     warmup: int = 3
@@ -63,10 +65,13 @@ def _inputs(problem, seed):
 
 def plan_of(problem, path, structure=None, candidates=None):
     """The plan to measure (a `Resolution`, possibly declined): `structure` (segment
-    names) built with `candidates`, or what dispatch resolves when None."""
+    names) built with `candidates` (at its default params when None), or what dispatch
+    resolves when None."""
     segments = paths.registered()[path].segments
     if structure is None:
         return resolver.resolve(problem, segments)
+    if candidates is None:
+        return resolver.default_plan(problem, segments, structure)
     plans, _ = resolver.feasible_plans(problem, segments)
     names = tuple(structure)
     found = next((s for s in plans if tuple(x.name for x in s) == names), None)
