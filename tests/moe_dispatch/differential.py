@@ -17,11 +17,16 @@ default environment).
 
 GPU: `run_differential(path_name, call)` runs one call through AITER_MOEV2=off and
 AITER_MOEV2=<path> and compares the kernel launches and outputs (see
-tests/moe_dispatch/gpu_differential.py).
+tests/moe_dispatch/gpu_differential.py). It raises `LegacyNotRepeatable` where legacy's
+own runs explain every difference of v2 (by element for launch arguments; by element,
+within a small bound for its row, for outputs), so the comparison does not
+decide, and `KnownDecline` where the path
+declines the call as `known_declines.py` lists it.
 """
 
 import argparse
 import contextlib
+import itertools
 import json
 import os
 import pathlib
@@ -458,10 +463,123 @@ def moev2_mode(value):
         envs.reload()
 
 
-def _bits(t):
+class LegacyNotRepeatable(AssertionError):
+    """Legacy differs from itself where the comparison needs it to repeat: undecided,
+    not a v2 failure."""
+
+
+class KnownDecline(AssertionError):
+    """The path declines the call (legacy runs it) as `known_declines.py` lists it."""
+
+
+# The calls of `dirty_allocator`; cross_checkout's workers take every other one each.
+_FILLS = itertools.count()
+# The largest request the caching allocator serves from its small pool.
+_SMALL_REQUEST = 1 << 20
+_ALLOC_CONF = (
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "PYTORCH_HIP_ALLOC_CONF",
+    "PYTORCH_ALLOC_CONF",
+)
+
+
+def fill_byte(n):
+    """The byte `dirty_allocator` writes on its `n`-th call: 96 values in turn, each of
+    them finite repeated as fp32, bf16, fp16, fp8 (e4m3fn, e4m3fnuz, e5m2, e5m2fnuz)
+    and e8m0."""
+    return 0x10 + n % 96
+
+
+def _free_blocks(segments, device, stream):
+    """The requests that take every inactive block of the caching allocator that
+    `stream` on `device` can reuse, largest first (it serves the smallest free block
+    that fits): small-pool blocks in pieces the small pool serves."""
+    sizes = []
+    for segment in segments:
+        if (segment["device"], segment["stream"]) != (device, stream):
+            continue
+        if tuple(segment["segment_pool_id"]) != (0, 0):
+            continue
+        small = segment["segment_type"] == "small"
+        for block in segment["blocks"]:
+            if block["state"] != "inactive":
+                continue
+            n = block["size"]
+            while small and n > _SMALL_REQUEST:
+                sizes.append(_SMALL_REQUEST)
+                n -= _SMALL_REQUEST
+            sizes.append(n)
+    return sorted(sizes, reverse=True)
+
+
+def dirty_allocator():
+    """Fill every freed block of the caching allocator with a byte new to each call, so
+    the next run's `torch.empty` buffers hold other bytes than any run before, at every
+    offset (back-to-back runs often repeat bitwise even where the kernels do not, and
+    bytes no kernel writes then look repeatable). A 256 MiB block first, so that memory
+    not cached yet is filled too. Taking each block whole relies on the allocator's
+    default configuration (no expandable segments, no rounding to powers of two)."""
     import torch
 
-    return t.view(torch.uint8) if t.element_size() == 1 else t
+    for name in _ALLOC_CONF:
+        if os.environ.get(name):
+            raise RuntimeError(
+                f"dirty_allocator needs the default caching allocator: unset {name}"
+            )
+    value = fill_byte(next(_FILLS))
+    torch.full((256 << 20,), value, dtype=torch.uint8, device="cuda")
+    sizes = _free_blocks(
+        torch.cuda.memory_snapshot(),
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+    )
+    held = [torch.full((n,), value, dtype=torch.uint8, device="cuda") for n in sizes]
+    del held
+
+
+def entry_call(path, call):
+    """`call` (legacy fused_moe arguments by name) as `path`'s legacy hook passes it:
+    every parameter, defaults included."""
+    import inspect
+
+    import aiter.fused_moe as fm
+    from aiter.moev2 import api
+
+    bound = inspect.signature(fm.fused_moe).bind(**call)
+    bound.apply_defaults()
+    return {"api": dict, "op": api.op_call, "fhmoe": api.fhmoe_call}[path.entry](
+        bound.arguments
+    )
+
+
+def known_decline(path_name, call):
+    """`(reason, entry)`: the resolver's last decline when `path_name` runs `call` again
+    with v2's caches cleared (its log lines dropped), and the `known_declines.py` entry
+    covering it (None if none does); None when the path does not decline it there."""
+    from unittest import mock
+
+    from aiter.moev2 import paths
+    from aiter.moev2.dispatch import resolver, tuned
+    from moe_dispatch import known_declines
+
+    path = paths.registered()[path_name]
+    resolve = resolver.resolve
+    declined = []
+
+    def recording(problem, *args, **kwargs):
+        resolution = resolve(problem, *args, **kwargs)
+        if resolution.declined is not None:
+            declined.append((problem, resolution.declined))
+        return resolution
+
+    with moev2_mode(path_name), captured_logs():
+        tuned.clear_cache()
+        with mock.patch.object(resolver, "resolve", recording):
+            out = path.run(entry_call(path, call))
+    if out is not paths.DECLINED or not declined:
+        return None
+    problem, reason = declined[-1]
+    return reason, known_declines.find(path_name, problem, reason)
 
 
 def _sorted_scale_defined(sorted_ids, token_num, groups, padded_groups):
@@ -484,7 +602,17 @@ def _sorted_scale_defined(sorted_ids, token_num, groups, padded_groups):
     return idx.flatten()
 
 
-def compare_launches(legacy, v2, call, out_legacy, out_v2):
+def _raw(t):
+    """`t`'s bits as integers, so that equal NaNs compare equal."""
+    import torch
+
+    width = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+    return t.view(width[t.element_size()])
+
+
+def compare_launches(
+    legacy, v2, call, out_legacy, out_v2, *, as_v2=True, positions=None
+):
     """`{(stage, argument): problem}` between two `kernel_bench_callable` recordings.
 
     Same stages, same functions, equal non-tensor arguments, and bitwise-equal tensors
@@ -493,9 +621,18 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
     (`_sorted_scale_defined`), other buffers in sorted order at the routed rows (stage 1
     skips block padding), `[token, topk, inter]` buffers at the slots in the sorted ids
     (stage 1 writes no others: not the slots of experts that are not local, nor the
-    repeats of an expert in one token's top-k), and nothing for the output buffer, for the
-    `out` argument of a stage 1 that writes a buffer of its own (`_own_stage1_buffer`),
-    nor for the output of a split-K stage 1 (accumulated with atomics).
+    repeats of an expert in one token's top-k), stage 1's 2-D activation and its scale
+    (`[token, ...]`) at the tokens in the sorted ids (an activation quant can leave the
+    rows of tokens without a local expert unwritten; the ASM 1x128 stage 1 reads its
+    scale transposed, `[K / 128, rows]` in memory, `_transposed_scale`), and nothing for
+    the output buffers (a problem where only one side passes its own),
+    for the `out` argument of a stage 1 that writes a buffer of its own
+    (`_own_stage1_buffer`); only dtypes and shapes for the output of a split-K stage 1
+    (accumulated with atomics) and stage 2's activation and `a2_scale` made from it.
+    `as_v2`: the legacy stage 1 kernel name is compared as v2 names it; off
+    for two legacy runs. `positions`: a dict that gets, for each problem that is only
+    "values differ", a bool tensor of where the compared elements differ; the elements
+    are the same ones in every comparison against the same `legacy` recording.
     """
     import torch
 
@@ -559,7 +696,7 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
             continue
         pairs = [(i, x, y) for i, (x, y) in enumerate(zip(a.args, b.args))]
         pairs += [(k, a.keywords[k], b.keywords[k]) for k in a.keywords]
-        if name == "stage1" and isinstance(a.keywords.get("kernelName"), str):
+        if as_v2 and name == "stage1" and isinstance(a.keywords.get("kernelName"), str):
             kernel2 = dict(legacy).get("stage2")
             kernel2 = getattr(kernel2, "keywords", {}).get("kernelName")
             if isinstance(kernel2, str):
@@ -573,12 +710,20 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
                 ]
         if name == "stage1" and _own_stage1_buffer(a):
             pairs = [pair for pair in pairs if pair[0] != 6]
-        if name == "stage1" and (a.keywords.get("split_k") or 1) > 1:
-            skip |= {a.args[6].data_ptr(), b.args[6].data_ptr()}
+        unvalued = set()
+        if name == "stage1" and _split_k_stage1(a):
+            unvalued = {6}
+        if name == "stage2" and _split_k_stage1(stage1):
+            unvalued = {0, "a2_scale"}
         for where, x, y in pairs:
             if not isinstance(x, torch.Tensor) or not isinstance(y, torch.Tensor):
                 if x != y:
                     problems[name, where] = f"{name}[{where}]: {x!r} vs {y!r}"
+                continue
+            if (x.data_ptr() in skip) != (y.data_ptr() in skip):
+                problems[name, where] = (
+                    f"{name}[{where}]: only one side passes its output buffer here"
+                )
                 continue
             if x.data_ptr() in skip:
                 continue
@@ -586,6 +731,8 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
                 problems[name, where] = (
                     f"{name}[{where}]: {x.dtype}{tuple(x.shape)} vs {y.dtype}{tuple(y.shape)}"
                 )
+                continue
+            if where in unvalued:
                 continue
             role = roles.get(x.data_ptr())
             rows = x.shape[0] if x.dim() == 2 else 0
@@ -599,19 +746,38 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
                 defined = _sorted_scale_defined(
                     sorted_ids[:num_valid], topk_ids.shape[0], groups, -groups // 8 * -8
                 )
-                x, y = (_bits(t).reshape(-1)[defined] for t in (x, y))
+                x, y = (_raw(t).reshape(-1)[defined] for t in (x, y))
             elif role is None and rows == len(sorted_ids):
-                x, y = (_bits(t)[:num_valid][routed_rows] for t in (x, y))
+                x, y = (_raw(t)[:num_valid][routed_rows] for t in (x, y))
             elif role == "ids":
                 x, y = x[:num_valid], y[:num_valid]
             elif role == "blocks":
                 x, y = x[: num_valid // block_m], y[: num_valid // block_m]
             elif x.dim() == 3 and x.shape[:2] == topk_ids.shape and slots is not None:
-                x, y = (_bits(t)[slots] for t in (x, y))
-            if not torch.equal(_bits(x), _bits(y)):
+                x, y = (_raw(t)[slots] for t in (x, y))
+            elif (
+                name == "stage1"
+                and where in (0, "a1_scale")
+                and rows == topk_ids.shape[0]
+                and slots is not None
+            ):
+                tokens = slots.any(1)
+                if where == "a1_scale" and _transposed_scale(a, x):
+                    n = call.get("num_local_tokens")
+                    n = rows if n is None else int(n.reshape(-1)[0])
+                    groups = x.shape[1]
+                    x, y = (
+                        _raw(t).reshape(-1)[: groups * n].view(groups, n)[:, tokens[:n]]
+                        for t in (x, y)
+                    )
+                else:
+                    x, y = (_raw(t)[tokens] for t in (x, y))
+            if not torch.equal(_raw(x), _raw(y)):
                 problems[name, where] = (
                     f"{name}[{where}]: {x.dtype}{tuple(x.shape)} values differ"
                 )
+                if positions is not None:
+                    positions[name, where] = _raw(x) != _raw(y)
     return problems
 
 
@@ -631,47 +797,231 @@ def _own_stage1_buffer(launch) -> bool:
     )
 
 
-def _ulp(t):
+def _split_k_stage1(launch) -> bool:
+    """The stage 1 accumulates K splits into its output with atomics, in no fixed order:
+    CK-Tile `split_k`, the CK 1x128 `splitk`, the ASM `ksplit` (legacy never passes
+    one), the FlyDSL `_kb{n}` kernels."""
+    from aiter import QuantType
+    from aiter.moev2.segments.asm import asm_stage1
+    from aiter.moev2.segments.ck import ck_moe_stage1
+    from aiter.moev2.segments.flydsl import _flydsl_stage1_wrapper
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    keywords = launch.keywords
+    if launch.func is asm_stage1:
+        return (keywords.get("ksplit") or 0) > 0
+    if launch.func is ck_moe_stage1:
+        return (keywords.get("splitk") or 1) > 1 and keywords.get(
+            "quant_type"
+        ) == QuantType.per_1x128
+    if launch.func is _flydsl_stage1_wrapper:
+        parsed = get_flydsl_kernel_params(keywords.get("kernelName") or "") or {}
+        return parsed.get("k_batch", 1) > 1
+    return (keywords.get("split_k") or 1) > 1
+
+
+def _transposed_scale(launch, scale) -> bool:
+    """The ASM 1x128 stage 1 takes its activation scale as the quant wrote it with
+    `transpose_scale=True`: shape `[token, K / 128]`, memory `[K / 128, rows]` (rows:
+    `num_local_tokens` when given, else `token`)."""
+    from aiter import QuantType
+    from aiter.moev2.segments.asm import asm_stage1
+
+    return (
+        launch.func is asm_stage1
+        and launch.keywords.get("quant_type") == QuantType.per_1x128
+        and scale.is_contiguous()
+    )
+
+
+def _mantissa(dtype):
     import torch
 
-    finite = t.float()[t.isfinite()]
-    peak = finite.abs().max().item() if finite.numel() else 0.0
-    if peak == 0:
+    return {
+        torch.bfloat16: 7,
+        torch.float16: 10,
+        torch.float64: 52,
+        torch.float8_e4m3fn: 3,
+        torch.float8_e4m3fnuz: 3,
+        torch.float8_e5m2: 2,
+        torch.float8_e5m2fnuz: 2,
+    }.get(dtype, 23)
+
+
+def _ulp(peak, dtype):
+    """One unit in the last place of `dtype` at magnitude `peak` (0 for integers)."""
+    import math
+
+    if peak == 0 or not dtype.is_floating_point:
         return 0.0
-    mantissa = {torch.bfloat16: 7, torch.float16: 10}.get(t.dtype, 23)
-    return 2.0 ** (int(torch.tensor(peak).log2().floor()) - mantissa)
+    return 2.0 ** (math.floor(math.log2(peak)) - _mantissa(dtype))
+
+
+def _ulps(t, dtype):
+    """`_ulp` of `dtype` at each element of `t`, a float tensor."""
+    import torch
+
+    if not dtype.is_floating_point:
+        return torch.zeros_like(t)
+    _, exponent = torch.frexp(t)
+    unit = torch.ldexp(torch.ones_like(t), exponent - 1 - _mantissa(dtype))
+    return unit.where(t != 0, 0)
+
+
+# Legacy runs taken, beyond the first two, when v2's launches or output differ from
+# legacy's first run, to see whether legacy differs from itself there too.
+_MORE_LEGACY_RUNS = 4
+
+
+def unexplained_launches(problems, positions, varies):
+    """The `compare_launches` problems of v2 that legacy's own runs do not explain: any
+    other than "values differ" (a function, an argument, a dtype or a shape), and values
+    that differ at an element where every legacy run equals the first. `positions`: v2's
+    differing elements per problem; `varies`: the elements where some legacy run differs
+    from the first, per argument."""
+    unexplained = {}
+    for key, problem in problems.items():
+        if key not in positions:
+            unexplained[key] = problem
+            continue
+        alone = positions[key] & ~varies[key] if key in varies else positions[key]
+        if alone.any():
+            unexplained[key] = (
+                f"{problem} at {int(alone.sum())} of {alone.numel()} elements where "
+                "legacy's runs agree"
+            )
+    return unexplained
+
+
+# The bound for a row of an output, in ulps of its peak: twice the largest difference of
+# the quietest legacy run that differs there, kept within these. Atomic accumulation in
+# GEMM2 varies by a few ulps; where legacy varies by more, only its runs at that element
+# widen the bound. The upper one also sets which elements are calm.
+_WHOLE_ULPS = (4, 16)
+
+
+def output_outside(ref, runs, out, *, bitwise=False):
+    """Why `out` is farther from legacy's first output `ref` than legacy's other outputs
+    `runs` let it be, or None. `out` and every run must have `ref`'s dtype and shape.
+    Where every run has `ref`'s NaN or infinity, `out` must have it too, and an element
+    whose NaN or infinity differs between legacy's runs is not compared; with `bitwise`,
+    an element every run repeats bitwise must be repeated bitwise. Every other element
+    must be within twice the largest difference of a legacy run there, or within a bound
+    for its row (the last dimension; a 1-D output is one row): none with `bitwise`, else
+    `_WHOLE_ULPS` at the row's peak over its calm elements, where every legacy run is
+    within 16 ulps of the element's own magnitude (garbage that legacy reads, in one
+    run or in all, widens neither the peak nor the bound if it changes between runs,
+    as the fill of `dirty_allocator` makes it; a row without a calm element has no
+    bound of its own)."""
+    import torch
+
+    shapes = [(f"legacy run {i}", r) for i, r in enumerate(runs, 2)] + [("out", out)]
+    for label, x in shapes:
+        if (x.dtype, x.shape) != (ref.dtype, ref.shape):
+            return (
+                f"{label} is {x.dtype}{tuple(x.shape)}, legacy run 1 "
+                f"{ref.dtype}{tuple(ref.shape)}"
+            )
+    if ref.numel() == 0:
+        return None
+    finite, nan = ref.isfinite(), ref.isnan()
+
+    def same_state(x):
+        return (
+            (x.isfinite() == finite) & (x.isnan() == nan) & (finite | nan | (x == ref))
+        )
+
+    stable = torch.ones_like(finite)
+    for r in runs:
+        stable &= same_state(r)
+    wrong = stable & ~same_state(out)
+    if wrong.any():
+        return (
+            f"NaN or infinity other than legacy's at {int(wrong.sum())} elements where "
+            f"legacy's {len(runs) + 1} runs agree on them"
+        )
+    if bitwise:
+        exact = torch.ones_like(finite)
+        for r in runs:
+            exact &= _raw(r) == _raw(ref)
+        changed = exact & (_raw(out) != _raw(ref))
+        if changed.any():
+            return (
+                f"bits other than legacy's at {int(changed.sum())} elements where "
+                f"legacy's {len(runs) + 1} runs repeat bitwise"
+            )
+    keep = stable & finite
+    base = ref.float().where(keep, 0)
+
+    def gap(x):
+        return (x.float().where(keep, 0) - base).abs()
+
+    spread = torch.zeros_like(base)
+    for r in runs:
+        spread = torch.maximum(spread, gap(r))
+    bound = 2 * spread
+    whole = torch.zeros_like(base)
+    if not bitwise:
+        low, high = _WHOLE_ULPS
+        calm = keep & (spread <= high * _ulps(base, ref.dtype))
+        width = base.shape[-1] if base.dim() > 1 else base.numel()
+
+        def by_row(x):
+            return x.reshape(-1, width)
+
+        peak = by_row(base.abs().where(calm, 0)).amax(1)
+        unit = _ulps(peak, ref.dtype)
+        quiet = torch.full_like(peak, float("inf"))
+        for r in runs:
+            row = by_row(gap(r).where(calm, 0)).amax(1)
+            quiet = torch.minimum(quiet, row.where(row > 0, float("inf")))
+        quiet = quiet.where(quiet.isfinite(), 0)
+        row = torch.minimum(torch.maximum(low * unit, 2 * quiet), high * unit)
+        whole = row[:, None].expand(-1, width).reshape(base.shape)
+        bound = torch.maximum(bound, whole)
+    over = gap(out) > bound
+    if not over.any():
+        return None
+    worst = (gap(out) - bound).where(over, float("-inf")).argmax()
+    return (
+        f"{int(over.sum())} elements beyond what legacy's {len(runs) + 1} runs vary "
+        f"(worst: off by {gap(out).flatten()[worst].item()}, where legacy runs differ by "
+        f"up to {spread.flatten()[worst].item()} and the bound is "
+        f"{bound.flatten()[worst].item()}; its row's bound is "
+        f"{whole.flatten()[worst].item()})"
+    )
 
 
 def run_differential(path_name, call, *, bitwise=False):
     """Run `call` (legacy fused_moe arguments by name) on legacy and on `path_name`.
 
     The path must claim and run the call (not decline it), launch the same kernels on the
-    same inputs (`compare_launches`), and produce the same output: bitwise with
-    `bitwise=True`, else within the larger of 4 ulps of the output's peak and twice the
-    difference between two legacy runs (atomic accumulation in GEMM2 and in a split-K
-    stage 1 is not deterministic).
+    same inputs as legacy's first run (`compare_launches`), and produce an output of the
+    same dtype and shape that matches legacy's first run: bitwise with `bitwise=True`,
+    else within `_check_output` of legacy's first two runs and within `output_outside`
+    of them (atomic accumulation in GEMM2 and in a split-K stage 1 is not
+    deterministic). The allocator is dirtied before each run.
+
+    Raises `KnownDecline` when the path declines the call as `known_declines.py` lists
+    it. Where v2 does not pass, legacy runs up to `_MORE_LEGACY_RUNS` more times, and
+    `LegacyNotRepeatable` (undecided) is raised when legacy's own runs explain every
+    difference: v2's launch arguments differ from legacy's first run only at elements
+    where another legacy run differs from it too (`unexplained_launches`), and v2's
+    output is within `output_outside` of all legacy runs. Anything else fails. v2 runs
+    once: a later legacy run never stands in for the first.
     """
     import dataclasses
-    import inspect
 
     import torch
 
     import aiter.fused_moe as fm
-    from aiter.moev2 import api, paths
+    from aiter.moev2 import paths
 
     path = paths.registered()[path_name]
-    bound = inspect.signature(fm.fused_moe).bind(**call)
-    bound.apply_defaults()
-    # The legacy hooks pass every parameter, defaults included; check the same mapping.
-    entry_call = {
-        "api": dict,
-        "op": api.op_call,
-        "fhmoe": api.fhmoe_call,
-    }[
-        path.entry
-    ](bound.arguments)
+    entry = entry_call(path, call)
 
     def launch(mode):
+        dirty_allocator()
         bench = []
         fm.kernel_bench_callable = bench
         try:
@@ -683,7 +1033,19 @@ def run_differential(path_name, call, *, bitwise=False):
         return out, bench
 
     ref, legacy_launches = launch("off")
-    ref2, _ = launch("off")
+    more, varies = [], {}
+
+    def legacy_again():
+        again, launches = launch("off")
+        where = {}
+        compare_launches(
+            legacy_launches, launches, call, ref, again, as_v2=False, positions=where
+        )
+        for key, differ in where.items():
+            varies[key] = varies[key] | differ if key in varies else differ
+        more.append(again)
+
+    legacy_again()
     results = []
 
     def run(c):
@@ -694,28 +1056,73 @@ def run_differential(path_name, call, *, bitwise=False):
     paths._REGISTRY[path_name] = dataclasses.replace(path, run=run)
     try:
         with moev2_mode(path_name):
-            routed = paths.route_to_v2(entry_call, path.entry)
+            routed = paths.route_to_v2(entry, path.entry)
             if routed is None or routed.name != path_name:
                 raise AssertionError(f"path {path_name} does not claim this call")
         out, v2_launches = launch(path_name)
     finally:
         paths._REGISTRY[path_name] = path
         paths.reload()
-    if len(results) != 1 or results[0] is paths.DECLINED:
+    if len(results) == 1 and results[0] is paths.DECLINED:
+        declined = known_decline(path_name, call)
+        if declined is not None and declined[1] is not None:
+            raise KnownDecline(
+                f"{path_name} declines this call: {declined[1].name} ({declined[0]})"
+            )
+        reason = "" if declined is None else f" ({declined[0]})"
+        raise AssertionError(f"path {path_name} declined this call{reason}")
+    if len(results) != 1:
         raise AssertionError(f"path {path_name} did not run this call: {results}")
-    problems = compare_launches(legacy_launches, v2_launches, call, ref, out)
-    if problems:
+    positions = {}
+    problems = compare_launches(
+        legacy_launches, v2_launches, call, ref, out, positions=positions
+    )
+    while len(more) <= _MORE_LEGACY_RUNS and any(
+        key in positions for key in unexplained_launches(problems, positions, varies)
+    ):
+        legacy_again()
+    differ = unexplained_launches(problems, positions, varies)
+    if differ:
         raise AssertionError(
-            f"{path_name}: launches differ: " + "; ".join(list(problems.values())[:6])
+            f"{path_name}: launches differ: " + "; ".join(list(differ.values())[:6])
+        )
+    if (ref.dtype, ref.shape) != (out.dtype, out.shape):
+        raise AssertionError(
+            f"{path_name}: output {ref.dtype}{tuple(ref.shape)} vs "
+            f"{out.dtype}{tuple(out.shape)}"
+        )
+    undecided = []
+    if problems:
+        undecided.append(
+            "v2 differs from legacy's first run only where legacy runs differ: "
+            + "; ".join(list(problems.values())[:6])
         )
     if bitwise:
-        same = (ref.dtype, ref.shape) == (out.dtype, out.shape) and torch.equal(
-            ref.contiguous().view(torch.uint8), out.contiguous().view(torch.uint8)
-        )
-        assert same, f"{path_name}: output differs from legacy"
+        if not torch.equal(_raw(ref), _raw(out)):
+            undecided.append(f"{path_name}: output differs from legacy")
+    else:
+        try:
+            _check_output(path_name, ref, more[0], out)
+            far = output_outside(ref, more[:1], out)
+            if far is not None:
+                undecided.append(
+                    f"{path_name}: v2's output against 2 legacy runs: {far}"
+                )
+        except AssertionError as exc:
+            undecided.append(str(exc))
+    if not undecided:
         return ref, out
-    _check_output(path_name, ref, ref2, out)
-    return ref, out
+    while len(more) <= _MORE_LEGACY_RUNS:
+        legacy_again()
+    far = output_outside(ref, more, out, bitwise=bitwise)
+    if far is not None:
+        raise AssertionError(
+            f"{path_name}: v2's output: {far}; " + "; ".join(undecided)
+        )
+    raise LegacyNotRepeatable(
+        f"{path_name}: " + "; ".join(undecided) + f"; v2's output is within what "
+        f"legacy's {len(more) + 1} runs vary"
+    )
 
 
 def _check_output(path_name, ref, ref2, out, names=("legacy", "v2")):
@@ -742,15 +1149,16 @@ def _check_output(path_name, ref, ref2, out, names=("legacy", "v2")):
 
     noise = gap(ref2) if same_non_finite(ref2) else float("inf")
     peak = ref.float()[finite].abs().max().item() if finite.any() else 0.0
-    assert noise <= peak, (
-        f"{path_name}: {ref_name} output not reproducible (noise {noise}, peak "
-        f"{peak})"
-    )
+    if not noise <= peak:
+        raise LegacyNotRepeatable(
+            f"{path_name}: {ref_name} output not reproducible (noise {noise}, peak "
+            f"{peak})"
+        )
     assert same_non_finite(
         out
     ), f"{path_name}: non-finite outputs differ from {ref_name}"
     err = gap(out)
-    tol = max(4 * _ulp(ref), 2 * noise)
+    tol = max(4 * _ulp(peak, ref.dtype), 2 * noise)
     assert err <= tol, (
         f"{path_name}: max |{out_name} - {ref_name}| {err} > {tol} ({ref_name} "
         f"noise {noise})"

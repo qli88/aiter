@@ -108,6 +108,15 @@ KNOWN = (
         "weights not preshuffled (it reads the alias by position)",
     ),
     Known(
+        "cktile_* rows a default MXFP4 branch takes (5.59)",
+        frozenset({"a8w4"}),
+        r"a default MXFP4 branch takes the cktile_\* row$",
+        lambda p: True,
+        "legacy logs the row, then runs its default branch (the FlyDSL heuristic on "
+        "shuffled weights); asm.stage1_cktile runs the row only where legacy's last "
+        "branch would, and declines it otherwise",
+    ),
+    Known(
         "FHMoE on MXMOE rows (5.28)",
         frozenset({"fhmoe"}),
         r"^no segments run kernelName1=flydsl_mxmoe_",

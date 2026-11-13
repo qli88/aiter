@@ -7,25 +7,32 @@ candidate this one; both run with AITER_MOEV2 unset unless `--cand-env` sets it.
 checkout runs the cases in a worker process whose `import aiter` is that checkout's
 (`PYTHONPATH`). Per case the worker builds the call (with its own aiter, from the same
 seed), clears the dispatch caches, calls `fused_moe` once (the first call: dispatch
-log lines, JIT builds), then twice more recording the kernel launches
+log lines, JIT builds), then twice more (the reference six times), the allocator
+dirtied before each (`differential.dirty_allocator`), recording the kernel launches
 (`kernel_bench_callable`) and the output. The two checkouts must have:
 
 - bitwise-equal inputs, before and after the calls;
 - the same error, if either raises (nothing else is compared then);
-- the same log lines on the first call (checkout paths, JIT build and table merge
-  lines left out);
+- the same log lines on the first call (checkout paths, JIT build, table merge and
+  table load lines left out);
 - the same launches: stages, function names, non-tensor arguments, tensor dtypes and
   shapes (a case where none are recorded says so);
-- the same output: where the reference repeats itself bitwise, both candidate runs
-  bitwise equal to it; else each candidate run within `differential._check_output`
-  of the reference's two runs (GEMM2 atomics). `results.jsonl` (`output`) and the
-  last lines say which;
+- the same output: where the reference's first two runs are bitwise equal, both
+  candidate runs bitwise equal to them; else each candidate run within
+  `differential._check_output` and `differential.output_outside` of the reference's
+  first two runs (GEMM2 atomics); the dtype and shape of both candidate runs.
+  `results.jsonl` (`output`) and the last lines say which. A candidate run that fails
+  this is compared with all six reference runs (`differential.output_outside`, not
+  bitwise): it fails where it is farther from the reference's first run than those
+  runs let it be, and is undecided (LEGACY) otherwise, unless all six repeat bitwise;
 - no v2 outcome in the candidate (`aiter.moev2.paths.outcomes`) with AITER_MOEV2
   off or unset.
 
 With `--cand-env AITER_MOEV2=<path>` the candidate runs v2: the reference's log lines
 and stage 1 kernel names are compared as v2 names them (`differential._as_v2_logs`,
-`legacy_stage1_as_v2`), and v2 must serve every call (`outcomes` all `served`).
+`legacy_stage1_as_v2`), and v2 must serve every call (`outcomes` all `served`). A call
+v2 declines as `known_declines.py` lists it (`differential.known_decline`) is compared
+as legacy against legacy and reported as `KNOWN` when nothing else differs.
 
     python tests/moe_dispatch/cross_checkout.py --ref ../aiter_main --path a8w8_blockscale
     python tests/moe_dispatch/cross_checkout.py --ref ../aiter_main --path all \\
@@ -35,8 +42,8 @@ and stage 1 kernel names are compared as v2 names them (`differential._as_v2_log
 
 `--devices`: one GPU (the two workers take turns) or two (one each, same GPU model).
 A case that runs out of GPU memory, crashes a worker, hits a harness error or exceeds
-`--timeout` is reported and fails the run (the worker is restarted). Exit status: 0
-when every case matches.
+`--timeout` is reported and fails the run (the worker is restarted). Exit status: 1
+when a case differs, else 2 when one is undecided, else 0.
 """
 
 import argparse
@@ -80,8 +87,20 @@ _SKIPPED_LINE = re.compile(
 )
 # The process and colour prefixes aiter.jit puts before those.
 _LOG_PREFIX = re.compile(r"^(\x1b\[[0-9;]*m|\[pid=\d+[^\]]*\] ?)+")
-# Logged where a table is first read, which differs between legacy and v2.
-_TABLE_LOAD = re.compile(r"^\[fused_moe\] duplicate tuned rows after disabling")
+# Logged where a table is first read: by legacy or v2, and again by a restarted worker.
+_TABLE_LOAD = re.compile(r"^\[fused_moe\] duplicate tuned rows ")
+# Both checkouts' roots, which a worker writes as <checkout> in errors and log lines.
+_ROOTS_VARIABLE = "_MOEV2_XC_ROOTS"
+# Reference runs beyond the two the candidate's are compared with: whether the reference
+# itself leaves the bitwise value or the tolerance its first two runs give.
+_MORE_REFERENCE_RUNS = 4
+
+
+def _without_roots(text, roots):
+    # Longest first: one checkout can be nested in the other (../aiter/.worktrees/main).
+    for root in sorted(roots, key=len, reverse=True):
+        text = re.sub(re.escape(root) + r"(?![\w.-])", "<checkout>", text)
+    return text
 
 
 # The worker: one per checkout.
@@ -151,7 +170,7 @@ def _clear_dispatch_caches():
 def _worker_case(request, shm, label):
     import gpu_differential as gd
     import torch
-    from differential import captured_logs
+    from differential import captured_logs, dirty_allocator, known_decline
 
     import aiter.fused_moe as fm
 
@@ -162,7 +181,12 @@ def _worker_case(request, shm, label):
 
     path_name, case = request["path"], tuple(request["case"])
     env = case[10].get("env", {}) if len(case) > 10 else {}
-    root = str(pathlib.Path(fm.__file__).resolve().parents[1])
+    own_root = str(pathlib.Path(fm.__file__).resolve().parents[1])
+    # A checkout running another's compiled modules reports that one's source paths.
+    roots = {
+        own_root,
+        *filter(None, os.environ.get(_ROOTS_VARIABLE, "").split(os.pathsep)),
+    }
     reply = {"id": request["id"]}
     saved = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
@@ -178,15 +202,16 @@ def _worker_case(request, shm, label):
             paths.reset_outcomes()
         with captured_logs() as logs:
             error = gd._raised(lambda: fm.fused_moe(**call))
-        reply["error"] = None if error is None else error.replace(root, "<checkout>")
+        reply["error"] = None if error is None else _without_roots(error, roots)
         reply["logs"] = [
-            (level, msg.replace(root, "<checkout>"))
+            (level, _without_roots(msg, roots))
             for level, msg in logs
             if _dispatch_line(msg)
         ]
         if reply["error"] is None:
             reply["runs"] = []
-            for i in range(2):
+            for i in range(2 + (_MORE_REFERENCE_RUNS if label == "reference" else 0)):
+                dirty_allocator()
                 bench = []
                 fm.kernel_bench_callable = bench
                 try:
@@ -202,6 +227,11 @@ def _worker_case(request, shm, label):
             reply["inputs_after"] = digests(call)
         if paths is not None:
             reply["outcomes"] = [[*k, n] for k, n in paths.outcomes().items()]
+            declined = sorted({k[1] for k in paths.outcomes() if k[2] == "declined"})
+            reply["declines"] = []
+            for name in declined:
+                reason, known = known_decline(name, call) or (None, None)
+                reply["declines"].append([name, reason, known and known.name])
     except torch.OutOfMemoryError:
         reply = {"id": request["id"], "oom": True}
     finally:
@@ -214,11 +244,22 @@ def _worker_case(request, shm, label):
     return reply
 
 
+def _fills(label):
+    """`differential._FILLS` for a worker: the calls whose fill bytes the other
+    checkout's worker never writes (`differential.fill_byte`)."""
+    import itertools
+
+    return itertools.count(int(label != "reference"), 2)
+
+
 def _worker(reply_fd, shm, label):
-    sys.path.insert(0, str(_HERE))
+    sys.path[:0] = [str(_HERE), str(_HERE.parent)]
+    import differential
     import torch
 
     import aiter
+
+    differential._FILLS = _fills(label)
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
     replies = os.fdopen(reply_fd, "w")
@@ -252,9 +293,10 @@ def _worker(reply_fd, shm, label):
 
 
 class _Worker:
-    def __init__(self, label, root, device, env, shm, log_dir):
+    def __init__(self, label, root, device, env, shm, log_dir, roots):
         self.label, self.root, self.device = label, root, device
         self.env, self.shm, self.log_dir = env, shm, log_dir
+        self.roots = roots
         self.process = None
 
     def start(self):
@@ -262,6 +304,7 @@ class _Worker:
         env = {k: v for k, v in os.environ.items() if k != "AITER_MOEV2"}
         env.update(self.env)
         env["HIP_VISIBLE_DEVICES"] = self.device
+        env[_ROOTS_VARIABLE] = os.pathsep.join(str(r) for r in self.roots)
         env["PYTHONPATH"] = os.pathsep.join(
             [str(self.root), *filter(None, [os.environ.get("PYTHONPATH")])]
         )
@@ -353,12 +396,27 @@ def _as_v2_launches(launches):
     return out
 
 
+def _known(cand):
+    """The `known_declines.py` entries of the candidate's declines when every call it
+    counted was declined and each decline is known, else None."""
+    outcomes, declines = cand.get("outcomes", []), cand.get("declines", [])
+    if not declines or any(o[2] != "declined" for o in outcomes):
+        return None
+    if not all(known for _, _, known in declines):
+        return None
+    return [known for _, _, known in declines]
+
+
 def compare(ref, cand, v2, info=None):
     """Problems (strings) between a case's reference and candidate replies. `info`
     gets `output`: "bitwise" or "tolerance" (the reference did not repeat itself),
-    where the outputs were compared."""
+    where the outputs were compared; `known`: the entries of a v2 candidate's known
+    declines (legacy ran the call on both sides, so it is compared as legacy); and,
+    when there is no problem, `undecided`: why the output comparison does not decide (a
+    candidate run fails the check of the reference's first two runs, but is no farther
+    from the first than the reference's six runs vary)."""
     import torch
-    from differential import _as_v2_logs, _check_output
+    from differential import _as_v2_logs, _check_output, output_outside
 
     for label, reply in (("reference", ref), ("candidate", cand)):
         if reply is None:
@@ -379,11 +437,14 @@ def compare(ref, cand, v2, info=None):
         problems.append(
             f"errors: reference {ref['error']!r}, candidate {cand['error']!r}"
         )
-    ref_logs = [tuple(x) for x in ref["logs"]]
-    cand_logs = [tuple(x) for x in cand["logs"]]
-    if v2:
-        ref_logs = _as_v2_logs([x for x in ref_logs if not _TABLE_LOAD.match(x[1])])
-        cand_logs = [x for x in cand_logs if not _TABLE_LOAD.match(x[1])]
+    known = _known(cand) if v2 else None
+    if known and info is not None:
+        info["known"] = known
+    served = v2 and known is None
+    ref_logs = [tuple(x) for x in ref["logs"] if not _TABLE_LOAD.match(x[1])]
+    cand_logs = [tuple(x) for x in cand["logs"] if not _TABLE_LOAD.match(x[1])]
+    if served:
+        ref_logs = _as_v2_logs(ref_logs)
     if ref_logs != cand_logs:
         problems.append(
             f"log lines differ\n      ref:  {ref_logs}\n      cand: {cand_logs}"
@@ -391,15 +452,18 @@ def compare(ref, cand, v2, info=None):
     if ref["error"] is not None or cand["error"] is not None:
         return problems
     outcomes = cand.get("outcomes", [])
-    if v2:
-        served = [o for o in outcomes if o[2] == "served"]
-        if not served or len(served) != len(outcomes):
-            problems.append(f"v2 did not serve every call: {outcomes}")
-    elif outcomes:
+    if served:
+        if not outcomes or any(o[2] != "served" for o in outcomes):
+            reasons = [d for d in cand.get("declines", []) if d[1]]
+            problems.append(
+                f"v2 did not serve every call: {outcomes}"
+                + (f"; declines {reasons}" if reasons else "")
+            )
+    elif outcomes and not v2:
         problems.append(f"v2 routed calls with AITER_MOEV2 off or unset: {outcomes}")
     for i in range(2):
         ref_launches = ref["runs"][i]["launches"]
-        if v2:
+        if served:
             ref_launches = _as_v2_launches(ref_launches)
         if ref_launches != cand["runs"][i]["launches"]:
             problems.append(
@@ -408,23 +472,40 @@ def compare(ref, cand, v2, info=None):
             )
             break
     files = [run["output"] for reply in (ref, cand) for run in reply["runs"]]
-    if len(set(files)) != 4:
+    if len(set(files)) != len(files):
         return problems + [f"harness: output files collide: {files}"]
-    r1, r2, c1, c2 = (torch.load(f, map_location="cpu") for f in files)
-    if r1.dtype != c1.dtype or r1.shape != c1.shape:
+    r1, r2, *more = (torch.load(r["output"], map_location="cpu") for r in ref["runs"])
+    c1, c2 = (torch.load(r["output"], map_location="cpu") for r in cand["runs"][:2])
+    undecided = None
+    other = [c for c in (c1, c2) if (c.dtype, c.shape) != (r1.dtype, r1.shape)]
+    if other:
         problems.append(
-            f"output {r1.dtype}{tuple(r1.shape)} vs {c1.dtype}{tuple(c1.shape)}"
+            f"output {r1.dtype}{tuple(r1.shape)} vs {other[0].dtype}"
+            f"{tuple(other[0].shape)}"
         )
     elif _same(r1, r2):
         # The reference repeats itself bitwise: so must the candidate, at its value.
         if info is not None:
             info["output"] = "bitwise"
+        clean = all(_same(r1, r) for r in more)
         for i, c in enumerate((c1, c2), 1):
-            if not _same(r1, c):
+            if _same(r1, c):
+                continue
+            if clean:
                 problems.append(
                     f"candidate run {i} output differs from the reference, which "
-                    f"repeats bitwise (max diff {_max_diff(r1, c)}; candidate "
-                    f"runs {'equal' if _same(c1, c2) else 'differ'})"
+                    f"repeats bitwise (max diff {_max_diff(r1, c)}; candidate runs "
+                    f"{'equal' if _same(c1, c2) else 'differ'})"
+                )
+                continue
+            far = output_outside(r1, [r2, *more], c)
+            if far is not None:
+                problems.append(f"candidate run {i} output: {far}")
+            elif undecided is None:
+                undecided = (
+                    f"candidate run {i} differs from the reference's first, which its "
+                    f"runs 3 to {len(more) + 2} do not repeat, and is no farther from "
+                    f"it than its {len(more) + 2} runs vary"
                 )
     else:
         if info is not None:
@@ -434,8 +515,22 @@ def compare(ref, cand, v2, info=None):
                 _check_output(
                     f"candidate run {i}", r1, r2, c, ("reference", "candidate")
                 )
+                failed = output_outside(r1, [r2], c)
+                if failed is None:
+                    continue
+                failed = f"candidate run {i} against 2 reference runs: {failed}"
             except AssertionError as exc:
-                problems.append(str(exc))
+                failed = str(exc)
+            far = output_outside(r1, [r2, *more], c)
+            if far is not None:
+                problems.append(f"{failed}; {far}")
+            elif undecided is None:
+                undecided = (
+                    f"{failed}; no farther from the reference's first run than its "
+                    f"{len(more) + 2} runs vary"
+                )
+    if undecided is not None and not problems and info is not None:
+        info["undecided"] = undecided
     return problems
 
 
@@ -545,9 +640,10 @@ def main(argv=None):
         prefix="moev2_xc_", dir="/dev/shm" if os.path.isdir("/dev/shm") else None
     )
 
+    roots = (ref_root, _REPO)
     workers = [
-        _Worker("reference", ref_root, devices[0], {}, shm, log_dir),
-        _Worker("candidate", _REPO, devices[-1], cand_env, shm, log_dir),
+        _Worker("reference", ref_root, devices[0], {}, shm, log_dir, roots),
+        _Worker("candidate", _REPO, devices[-1], cand_env, shm, log_dir, roots),
     ]
     try:
         infos = [w.start() for w in workers]
@@ -565,13 +661,15 @@ def main(argv=None):
             )
         print(f"{len(todo)} cases; worker logs and results.jsonl in {log_dir}")
         with open(log_dir / "results.jsonl", "a") as results:
-            failed, compared = _run(todo, workers, args, v2, results)
+            counts, compared = _run(todo, workers, args, v2, results)
         print(
             f"outputs compared: {compared['bitwise']} bitwise, "
             f"{compared['tolerance']} within tolerance (the reference not repeatable)"
         )
-        print(f"{failed} of {len(todo)} cases differ")
-        return 1 if failed else 0
+        print(f"{counts['known']} known declines (known_declines.py)")
+        print(f"{counts['undecided']} cases undecided (the reference not repeatable)")
+        print(f"{counts['failed']} of {len(todo)} cases differ")
+        return 1 if counts["failed"] else 2 if counts["undecided"] else 0
     finally:
         for w in workers:
             w.stop()
@@ -579,9 +677,10 @@ def main(argv=None):
 
 
 def _run(todo, workers, args, v2, results):
-    """Runs every case on both workers; returns the number that differ and how many
-    outputs were compared each way (`compare`)."""
-    failed = 0
+    """Runs every case on both workers; returns how many cases differ, are undecided and
+    are known declines (`counts`: `failed`, `undecided`, `known`), and how many outputs
+    were compared each way (`compare`)."""
+    counts = collections.Counter()
     compared = collections.Counter()
     together = workers[0].device != workers[1].device
     for n, (name, case, source) in enumerate(todo):
@@ -605,16 +704,25 @@ def _run(todo, workers, args, v2, results):
         problems = compare(*replies, v2, info)
         compared[info.get("output")] += 1
         notes = [] if problems else _notes(replies[0])
+        if info.get("known"):
+            notes.append(f"known decline: {', '.join(info['known'])}")
+        if info.get("undecided") and not problems:
+            notes.append(f"undecided: {info['undecided']}")
         _cleanup(*replies)
-        failed += bool(problems)
-        status = "FAIL" if problems else "ok  "
+        status = "FAIL" if problems else "LEGACY" if info.get("undecided") else "ok"
+        if status == "ok" and info.get("known"):
+            status = "KNOWN"
+        counts["failed"] += status == "FAIL"
+        counts["undecided"] += status == "LEGACY"
+        counts["known"] += status == "KNOWN"
         seconds = time.monotonic() - start
         print(
-            f"{status} {name} {source} {json.dumps(case)} ({seconds:.0f} s)", flush=True
+            f"{status:<6} {name} {source} {json.dumps(case)} ({seconds:.0f} s)",
+            flush=True,
         )
         for p in problems + notes:
             print(f"    {p}")
-        if problems:
+        if problems or status == "LEGACY":
             print(
                 f"    repro: python {(_HERE / _NAME).relative_to(_REPO)} "
                 f"--ref {args.ref} --path {name} --case '{json.dumps(case)}'"
@@ -623,9 +731,10 @@ def _run(todo, workers, args, v2, results):
         record = {"path": name, "source": source, "case": case, "problems": problems}
         record["notes"] = notes
         record["output"] = info.get("output")
+        record["status"] = status
         results.write(json.dumps(record) + "\n")
         results.flush()
-    return failed, compared
+    return counts, compared
 
 
 if __name__ == "__main__":

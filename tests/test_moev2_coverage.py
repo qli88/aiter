@@ -79,10 +79,13 @@ def test_each_reach_is_checked():
 
 
 def test_the_registered_segments_hold_their_reach():
+    from moe_dispatch import hibernating
+
     from aiter.moev2 import paths
 
     registered = paths.registered().values()
-    assert coverage.segment_errors(registered) == []
+    tested = set(hibernating.TESTS)
+    assert coverage.segment_errors(registered, tested=tested) == []
     ranked = coverage.ranked_segments()
     segments = {s.name: s for p in registered for s in p.segments}
     assert {"sort", "ck.gemm1", "flydsl_fhmoe.gemm2"} <= ranked
@@ -149,3 +152,6 @@ def test_known_declines_name_the_row_families():
     assert known_declines.find("a4w4", padded, mxmoe) is not None
     plain = "no segments run kernelName1=flydsl_moe1_x, kernelName2=flydsl_moe2_y"
     assert known_declines.find("a4w4", padded, plain) is None
+    taken = "a default MXFP4 branch takes the cktile_* row"
+    assert "5.59" in known_declines.find("a8w4", padded, taken).name
+    assert known_declines.find("a4w4", padded, taken) is None

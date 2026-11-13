@@ -4,8 +4,9 @@
 
 Each case runs on the same inputs with AITER_MOEV2=off and AITER_MOEV2=<path>: the path
 must run the call (not decline it), launch the same kernels on bitwise-equal inputs, give
-the same output up to the GEMM2 atomics, and log the same dispatch lines on a first call
-(see `differential.run_differential`).
+the same output up to the GEMM2 atomics, and log the same dispatch lines on a call after
+a warm-up with the cached decisions cleared (see `differential.run_differential`, which
+dirties the allocator before each run).
 
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt --synth-table
@@ -33,7 +34,16 @@ token-major FlyDSL stage 1 and a token-major FlyDSL, Opus or CK stage 2 are copi
 
 A case that does not fit in the free GPU memory is reported as skipped and fails the run
 (it was not compared); one that raises the same error on legacy and v2 passes, with the
-error printed.
+error printed. A case the path declines as `known_declines.py` lists it is reported as
+KNOWN and passes. One where legacy's own runs explain every difference of v2 from
+legacy's first run is reported as LEGACY: undecided, not a v2 failure. That is, v2's
+launch arguments differ only at elements where another legacy run differs too, and each
+element of v2's output is no farther from legacy's first than twice what legacy's runs
+vary there, or than a small bound for its row (`differential.output_outside`: 4 to 16
+ulps of the row's peak over the elements where legacy is calm;
+`differential.run_differential`). Neither ok nor LEGACY says anything about v2 within
+that bound. Exit status: 1 on a failure or a skipped case, else 2 on an undecided case,
+else 0.
 """
 
 import argparse
@@ -1008,37 +1018,28 @@ def selected_model_cases(args, path_name):
 
 
 def _clear_dispatch_caches():
-    import aiter.fhmoe as legacy_fhmoe
     import aiter.fused_moe as fm
-    from aiter.moev2.migration import (
-        a4w4,
-        a8w4,
-        a8w8_blockscale,
-        a8w8_pt,
-        a8w8_ptok,
-        a16w4,
-        a16w16,
-        a16wi4,
-        fhmoe,
-        mxfp8,
-    )
 
     fm.get_2stage_cfgs.cache_clear()
-    paths = (
-        a8w8_pt,
-        a16w16,
-        a8w8_ptok,
-        a8w8_blockscale,
-        a4w4,
-        a16w4,
-        a16wi4,
-        a8w4,
-        mxfp8,
-        fhmoe,
-    )
-    for path in paths:
-        for cache in (path.LOCAL.dispatch, path.LOCAL.resolve, path.LOCAL.relookup):
-            cache.cache_clear()
+    _clear_decision_caches()
+
+
+def _clear_decision_caches():
+    """The dispatch decisions of legacy and v2, which log once per key; not v2's tuned
+    tables."""
+    import importlib
+
+    import aiter.fhmoe as legacy_fhmoe
+    import aiter.fused_moe as fm
+    from aiter.moev2 import paths
+    from aiter.moev2.migration import fhmoe
+
+    fm._get_2stage_cfgs_cache_clear()
+    for name in paths._BUILTIN_MODULES:
+        local = getattr(importlib.import_module(name), "LOCAL", None)
+        if local is not None:
+            for cache in (local.dispatch, local.resolve, local.relookup):
+                cache.cache_clear()
     # The FHMoE capability checks resolve and log their token buckets once.
     for module in (legacy_fhmoe, fhmoe):
         module._supports_dsv4_i384_fhmoe_config.cache_clear()
@@ -1058,7 +1059,8 @@ def _raised(fn):
 
 
 def run_case(path_name, case):
-    """Return a problem string, or None when legacy and v2 agree."""
+    """`(verdict, message)`: verdict `ok` (message None, or what both raise), `FAIL`,
+    `LEGACY` (legacy not repeatable: undecided) or `KNOWN` (a known decline)."""
     env = case[10].get("env", {}) if len(case) > 10 else {}
     with mock.patch.dict(os.environ, env):
         return _run_case(path_name, case)
@@ -1082,6 +1084,8 @@ def _run_case(path_name, case):
 
     import aiter.fused_moe as fm
     from moe_dispatch.differential import (
+        KnownDecline,
+        LegacyNotRepeatable,
         _as_v2_logs,
         captured_logs,
         moev2_mode,
@@ -1095,23 +1099,39 @@ def _run_case(path_name, case):
     _clear_dispatch_caches()
     with moev2_mode("off"), captured_logs() as legacy_logs:
         _raised(lambda: fm.fused_moe(**call))
+    # Clearing also drops v2's tuned tables, which legacy keeps loaded: v2 reads them
+    # here, and logs their load warnings, as legacy did when it first read them.
     _clear_dispatch_caches()
-    with moev2_mode(path_name), captured_logs() as v2_logs:
+    with moev2_mode(path_name), captured_logs():
         v2_error = _raised(lambda: fm.fused_moe(**call))
+    torch.cuda.synchronize()
+    _clear_decision_caches()
+    with moev2_mode(path_name), captured_logs() as v2_logs:
+        _raised(lambda: fm.fused_moe(**call))
     if _without_build_output(_as_v2_logs(legacy_logs)) != _without_build_output(
         v2_logs
     ):
-        return f"{case}: log lines differ\n    legacy: {legacy_logs}\n    v2:     {v2_logs}"
+        return (
+            "FAIL",
+            f"{case}: log lines differ\n    legacy: {legacy_logs}\n    v2:     {v2_logs}",
+        )
     if legacy_error or v2_error:
         if legacy_error != v2_error:
-            return f"{case}: legacy raises {legacy_error}; v2 raises {v2_error}"
-        print(f"     both raise {legacy_error[:160]}")
-        return None
+            return "FAIL", f"{case}: legacy raises {legacy_error}; v2 raises {v2_error}"
+        return "ok", f"both raise {legacy_error[:160]}"
     try:
         run_differential(path_name, call)
+    except KnownDecline as exc:
+        return "KNOWN", f"{case}: {exc}"
+    except LegacyNotRepeatable as exc:
+        return "LEGACY", f"{case}: {exc}"
     except AssertionError as exc:
-        return f"{case}: {exc}"
-    return None
+        return "FAIL", f"{case}: {exc}"
+    except torch.OutOfMemoryError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return "FAIL", f"{case}: the comparison raised {type(exc).__name__}: {exc}"
+    return "ok", None
 
 
 def _child(args, todo=None):
@@ -1138,27 +1158,35 @@ def _child(args, todo=None):
     print(
         f"{get_gfx_runtime()} cu{get_cu_num()} torch {torch.__version__}: {len(todo)} cases"
     )
-    problems, skipped = [], []
+    found = {"FAIL": [], "LEGACY": [], "KNOWN": [], "SKIP": []}
     for case in todo:
         try:
-            problem = run_case(args.path, case)
+            verdict, message = run_case(args.path, case)
         except torch.OutOfMemoryError:
             # The GPU may be shared; a case that does not fit is reported, not compared.
-            problem = None
-            skipped.append(case)
+            verdict, message = "SKIP", None
         torch.cuda.empty_cache()
-        status = (
-            "SKIP" if skipped and skipped[-1] is case else "FAIL" if problem else "ok  "
+        print(f"{verdict:<6} {case}", flush=True)
+        if verdict == "ok" and message:
+            print(f"       {message}")
+        elif verdict != "ok":
+            found[verdict].append(message or str(case))
+    for verdict in ("KNOWN", "LEGACY", "FAIL"):
+        for line in found[verdict]:
+            print(f"  {verdict}: {line}")
+    print(f"{len(found['KNOWN'])} known declines (known_declines.py)")
+    if found["SKIP"]:
+        print(
+            f"{len(found['SKIP'])} cases not compared (out of GPU memory): rerun them"
         )
-        print(f"{status} {case}", flush=True)
-        if problem:
-            problems.append(problem)
-    for line in problems:
-        print("  " + line)
-    if skipped:
-        print(f"{len(skipped)} cases not compared (out of GPU memory): rerun them")
-    print(f"{len(problems)} problems")
-    return 1 if problems or skipped else 0
+    print(
+        f"{len(found['LEGACY'])} cases undecided (legacy not repeatable where v2 "
+        "differs from it)"
+    )
+    print(f"{len(found['FAIL'])} problems")
+    if found["FAIL"] or found["SKIP"]:
+        return 1
+    return 2 if found["LEGACY"] else 0
 
 
 def main(argv=None):
