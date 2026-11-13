@@ -652,6 +652,29 @@ def test_claims_only_unquantized_16_bit(monkeypatch):
     assert not a16w16.claims(call)
 
 
+def test_paths_without_activation_parameters_read_a_zero_swiglu_limit_as_none(
+    monkeypatch,
+):
+    """vLLM passes `swiglu_limit=0.0` on every call, which legacy reads as no limit
+    (todo 5.86)."""
+    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16, local
+
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    for path, call in (
+        (a16w16, _a16w16_op_call()),
+        (a8w8_pt, _per_tensor_op_call()),
+        (a8w8_ptok, _fp8_op_call(QuantType.per_Token)),
+        (a8w8_blockscale, _fp8_op_call(QuantType.per_1x128)),
+    ):
+        assert path.claims(call), path.NAME
+        assert path.claims({**call, "swiglu_limit": 0.0}), path.NAME
+        for limit in (7.0, -1.0, float("nan")):
+            assert not path.claims({**call, "swiglu_limit": limit}), (path.NAME, limit)
+    assert a8w8_pt.takes(_problem()) and a8w8_pt.takes(_problem(swiglu_limit=0.0))
+    assert not a8w8_pt.takes(_problem(swiglu_limit=7.0))
+
+
 _LOCAL_PATHS = (
     "a8w8_pt",
     "a16w16",

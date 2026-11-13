@@ -68,6 +68,8 @@ _REPO = _HERE.parents[1]
 # a8w4 and mxfp8), "std_shuffle" (a16w4/a8w4 "fp4" and "mxfp8" weights shuffled as
 # a4w4's, untagged), "env" (environment variables set for the legacy and the v2 runs).
 _SWIGLU_GELUTANH = ("Swiglu", "GeluTanh")
+# As vLLM calls aiter: `swiglu_limit=0.0` on every call, which legacy reads as no limit.
+_VLLM = {"swiglu_limit": 0.0}
 _A8W8_PT_DEFAULT = (
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 64, 256, 1024, 4096)),
     *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 32, 512)),
@@ -84,6 +86,7 @@ _A8W8_PT_DEFAULT = (
     *((m, 7168, 256, 256, 8, a, False, "bf16", False) for a in _SWIGLU_GELUTANH for m in (1, 64, 1024)),
     *((m, 2048, 256, 64, 6, "Swiglu", True, "fp16", False) for m in (200,)),
     *((m, 4096, 384, 128, 8, a, False, "bf16", False, "i8") for a in _SWIGLU_GELUTANH for m in (16, 512)),
+    *((m, 7168, 256, 256, 8, a, False, "bf16", False, "fp8", _VLLM) for a in ("Silu", "Swiglu") for m in (64,)),
 )  # fmt: skip
 
 _A16W16_DEFAULT = (
@@ -99,6 +102,7 @@ _A16W16_DEFAULT = (
     *((m, 7168, 256, 256, 8, a, False, "bf16", False) for a in _SWIGLU_GELUTANH for m in (1, 64, 1024)),
     *((m, 2048, 256, 64, 6, a, False, "fp16", False) for a in _SWIGLU_GELUTANH for m in (5, 200)),
     *((m, 7168, 256, 64, 8, "Swiglu", True, "bf16", True) for m in (16,)),
+    *((m, 7168, 256, 256, 8, a, False, "bf16", False, "fp8", _VLLM) for a in ("Silu", "Swiglu") for m in (64,)),
 )  # fmt: skip
 
 # gfx950's default 1-stage ASM region is `token > 16 or inter_dim % 128` (bf16 output,
@@ -145,6 +149,9 @@ _A8W8_PTOK_DEFAULT = (
     *((m, 7168, 256, 64, 8, "GeluTanh", False, "bf16", True) for m in (16,)),
     *((m, 7168, 256, 256, 8, a, False, "bf16", False, "i8") for a in _SWIGLU_GELUTANH for m in (16, 64)),
     *((m, 4096, 384, 128, 8, a, False, "bf16", False, "i4") for a in _SWIGLU_GELUTANH for m in (8, 512)),
+    # 1-stage ASM and CK.
+    *((m, 4096, 384, 128, 8, "Silu", False, "bf16", False, "fp8", _VLLM) for m in (64,)),
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False, "fp8", _VLLM) for m in (16,)),
 )  # fmt: skip
 
 # gfx950's default 1-stage ASM region is `token > 32` (bf16 output, no doweight_stage1,
@@ -182,6 +189,8 @@ _A8W8_BLOCKSCALE_DEFAULT = (
     # at 16 the tiles fill the CUs (ksplit 0).
     *((m, 7168, 256, 256, 8, a, False, "bf16", False) for a in _SWIGLU_GELUTANH for m in (1, 16, 512)),
     *((m, 4096, 384, 128, 8, "Swiglu", True, "bf16", False) for m in (64,)),
+    # 1-stage ASM and CK.
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False, "fp8", _VLLM) for m in (16, 512)),
 )  # fmt: skip
 
 # gfx950: shapes of each shipped cu256 row family, untuned shapes (the FlyDSL heuristic on
@@ -249,6 +258,8 @@ _A4W4 = (
     *((m, 8192, 256, 512, 10, "Silu", False, "bf16", False, "fp4") for m in (1,)),
     *((m, 4096, 512, 256, 1, "Silu", False, "bf16", False, "fp4") for m in (8,)),
     *((m, 4096, 512, 513, 11, "Silu", False, "bf16", False, "fp4") for m in (4,)),
+    *((m, 3072, 384, 256, 8, "Silu", False, "bf16", False, "fp4", _VLLM) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _VLLM) for m in (512,)),
 )  # fmt: skip
 
 _G1U0 = {"g1u0": True}
@@ -282,6 +293,7 @@ _A16W4 = (
     *((m, 2048, 512, 64, 6, "Situv2", True, "bf16", False, "fp4") for m in (4,)),
     # Relu2 with a gate-only w1: CK-Tile.
     *((m, 7168, 256, 256, 8, "Relu2", False, "bf16", False, "fp4", _G1U0) for m in (1, 64, 512)),
+    *((m, 3072, 512, 128, 4, "Swiglu", False, "bf16", False, "fp4", _VLLM) for m in (16,)),
 )  # fmt: skip
 
 # gfx950 and gfx942, bf16 activations into int4 weights ("wi4"): the tuned rows (gfx950:
@@ -296,6 +308,7 @@ _A16WI4 = (
     *((m, 2048, 768, 128, 8, "Silu", False, "bf16", False, "wi4", _BIAS) for m in (64,)),
     # Routed weights in stage 1: the untuned fallback takes them.
     *((m, 2048, 768, 128, 8, a, True, "bf16", False, "wi4") for a in ("Silu", "Situv2") for m in (64,)),
+    *((m, 7168, 256, 384, 8, "Silu", False, "bf16", False, "wi4", _VLLM) for m in (16,)),
 )  # fmt: skip
 
 _FP8_A = {"q_a": "fp8"}
@@ -348,6 +361,7 @@ _A8W4 = (
     *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4", _FP8_A_INTERLEAVE) for m in (16, 1024)),
     *((m, 2048, 256, 64, 6, "Situv2", False, "bf16", False, "fp4", _FP8_A_INTERLEAVE) for m in (64,)),
     *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _FP8_A_INTERLEAVE) for m in (64,)),
+    *((m, 4096, 256, 256, 6, "Silu", False, "bf16", False, "fp4", {**_FP8_A, **_VLLM}) for m in (8,)),
 )  # fmt: skip
 
 _STD = {"std_shuffle": True}
@@ -375,6 +389,7 @@ _MXFP8 = (
     *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "mxfp8", _STD) for m in (64,)),
     *((m, 2048, 256, 64, 6, "Silu", True, "bf16", False, "mxfp8", _STD) for m in (64,)),
     *((m, 2048, 256, 64, 6, "Silu", False, "bf16", True, "mxfp8", _STD) for m in (64,)),
+    *((m, 6144, 512, 257, 9, "Silu", False, "bf16", False, "mxfp8", _VLLM) for m in (128,)),
 )  # fmt: skip
 
 # gfx950, FHMoE (calls with the shared expert, as op_tests/test_fhmoe.py builds them;

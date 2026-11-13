@@ -35,7 +35,7 @@ _RELOOKUP_DROPS_EXTRAS = frozenset({"disable_inline_sort"})
 # `fused_moe_` arguments no local path supports yet.
 _UNSUPPORTED_ARGS = ("quant_dtype_a2", "ep_source_token_map")
 _BIAS_ARGS = ("bias1", "bias2")
-_ACT_PARAM_ARGS = ("swiglu_limit", "beta", "linear_beta")
+_ACT_PARAM_ARGS = ("beta", "linear_beta")
 # The activations the CK codegen maps (`ACT_OP_MAP`).
 CK_ACTIVATIONS = (
     ActivationType.Silu,
@@ -95,8 +95,8 @@ def claims(
     in `activations` and a gate mode in `gate_modes`, no `quant_dtype_a2` or scatter,
     outside AITER_ONLINE_TUNE, on `archs`, with 3D `w1`/`w2` of one of `weight_dtypes`
     and, unless `g1u0`, `w1` holding gate and up (g1u1). A caller-chosen
-    `quant_dtype_a`, bias tensors, `swiglu_limit`/`beta`/`linear_beta` and padding only
-    where allowed. With `act_dtypes`, the activation format of the call
+    `quant_dtype_a`, bias tensors, a nonzero `swiglu_limit`, `beta`/`linear_beta` and
+    padding only where allowed. With `act_dtypes`, the activation format of the call
     (`activation_dtype`) must be one of them (paths that share a weight format split it
     by activation format).
     """
@@ -116,6 +116,9 @@ def claims(
     if not act_params:
         unsupported += _ACT_PARAM_ARGS
     if any(call[name] is not None for name in unsupported):
+        return False
+    # Legacy reads a falsy limit as none.
+    if not act_params and call["swiglu_limit"]:
         return False
     if not pads and (call["hidden_pad"] or call["intermediate_pad"]):
         return False
@@ -186,7 +189,7 @@ def key_args_supported(
         and (
             act_params
             or (
-                activation.swiglu_limit is None
+                not activation.swiglu_limit
                 and (activation.situ_beta, activation.situ_linear_beta) == (1.0, 1.0)
             )
         )
