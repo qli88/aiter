@@ -1042,9 +1042,11 @@ def test_per_token_fp8_defaults_run_1stage_fmoe_in_its_region(monkeypatch):
     assert (res.metadata.block_m, res.metadata.ksplit) == (32, 0)
 
 
+# Without a 1-stage `fmoe` key, the int8 g1u0 keys have no plan at all; the bf16 ones
+# reach the ranking (a whole-graph plan is feasible), which names legacy's CK branch.
 _NO_G1U0_PLAN = (
     "no feasible plan",
-    "ranking a16w16_g1u0[otherwise]: no listed structure is feasible",
+    "ranking a16w16_g1u0[not fmoe_1stage]: CK 2-stage g1u0 is not ported",
 )
 
 

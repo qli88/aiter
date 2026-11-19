@@ -131,14 +131,17 @@ class Segment:
     (`kernel_names.FAMILIES`) whose tuned rows this segment runs. `covers`: the first and
     last op of the chain it implements. `capabilities`: the `Cap`s it supports.
     `structure_params`: parameters that change the boundary buffers (e.g. `block_m`), so
-    every segment of a plan must agree on them. The remaining attributes describe stateful
-    and collective segments; no ported segment sets them yet.
+    every segment of a plan must agree on them. `tuned_only`: reached only through tuned
+    rows, as in legacy, so it is in no ranking entry (`coverage.py` fails a segment that
+    is in none without it). The remaining attributes describe stateful and collective
+    segments; no ported segment sets them yet.
     """
 
     name: str = ""
     prefixes: tuple = ()
     covers: tuple = (Op.SORT, Op.SORT)
     capabilities: tuple = ()
+    tuned_only: bool = False
     stateful: bool = False
     structure_params: frozenset = frozenset()
     rank_local_params: bool = False

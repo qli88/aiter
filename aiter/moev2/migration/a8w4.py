@@ -113,9 +113,12 @@ def takes(problem) -> bool:
     return (
         local.key_args_supported(
             problem,
+            ARCHS,
             activations=tuple(a.name.lower() for a in ACTIVATIONS),
             gate_modes=GATE_MODES,
             act_params=True,
+            bias=True,
+            pads=True,
         )
         and problem.quant_type == QuantType.per_1x32
         and problem.w1 == mxfp4()

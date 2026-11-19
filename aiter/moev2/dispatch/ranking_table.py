@@ -93,14 +93,14 @@ RANKING = (
         otherwise=[CK_2STAGE],
     ),
     # g1u0: keys in fused_moe_1stage_dict (gfx942, Silu) run 1-stage ASM `fmoe` when
-    # `token < 256`; everything else takes the CK branch (no segment runs g1u0 there,
-    # so the other keys have no feasible plan and are declined).
+    # `token < 256`; everything else takes the CK branch (no segment runs g1u0 there).
     Entry(
         "a16w16_g1u0",
         match(quant_type=QuantType.No, w1_dtype=B16, g1u1=False),
         regions=[
             Region(when(fmoe_1stage=True, m__lt=256), prefer=[ASM_1STAGE]),
             Region(when(fmoe_1stage=True, m__ge=256), legacy=CK_G1U0),
+            Region(when(fmoe_1stage=False), legacy=CK_G1U0),
         ],
     ),
     # get_2stage_cfgs without a tuned row, per-token fp8 weights: keys in
@@ -150,14 +150,15 @@ RANKING = (
         otherwise=[ASM_2STAGE],
     ),
     # g1u0: keys in fused_moe_1stage_dict (gfx942, Silu and Gelu) run 1-stage ASM
-    # `fmoe_int8_g1u0` when `token > 32`; everything else takes the ASM branch (as for
-    # a16w16_g1u0, the other keys have no feasible plan).
+    # `fmoe_int8_g1u0` when `token > 32`; everything else takes the ASM branch (no
+    # segment runs it for g1u0).
     Entry(
         "int8_per_token_g1u0",
         match(quant_type=QuantType.per_Token, w1_dtype=dtypes.i8, g1u1=False),
         regions=[
             Region(when(fmoe_1stage=True, m__gt=32), prefer=[ASM_1STAGE]),
             Region(when(fmoe_1stage=True, m__le=32), legacy=ASM_G1U0),
+            Region(when(fmoe_1stage=False), legacy=ASM_G1U0),
         ],
     ),
     Entry(

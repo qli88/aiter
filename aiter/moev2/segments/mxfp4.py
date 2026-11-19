@@ -434,6 +434,7 @@ class FlydslGemm1Quant(_FlydslStage1):
     in its options)."""
 
     name = "flydsl.gemm1_q"
+    tuned_only = True
     covers = (Op.GEMM1, Op.QUANT_INTER)
 
     def owns(self, kernel) -> bool:
@@ -465,6 +466,7 @@ class FlydslGemm1Layout(_FlydslStage1):
     """A FlyDSL stage 1 writing the sorted, quantized input of a layout GEMM2."""
 
     name = "flydsl.gemm1_layout"
+    tuned_only = True
     covers = (Op.GEMM1, Op.QUANT_INTER)
 
     def owns(self, kernel) -> bool:
@@ -550,6 +552,7 @@ class FlydslLayoutGemm2(Segment):
     """A FlyDSL v2 GEMM2 (`flydsl_moe2_layout_*`) with the atomic or reduce epilog."""
 
     name = "flydsl_layout.gemm2"
+    tuned_only = True
     prefixes = (kernel_names.FLYDSL_LAYOUT,)
     covers = (Op.GEMM2, Op.REDUCE)
     scatter = False

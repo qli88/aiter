@@ -74,6 +74,8 @@ _OP_DEFAULTS = {
 }
 # Problem features `_validate_fhmoe_contract` rejects before the dispatch.
 _CONTRACT_EXCLUDES = frozenset({"ep_mask", "bias1", "bias2"})
+# Problem features of the arguments `why_not` refuses.
+_REFUSED = frozenset({"act_scales", "num_local_tokens", "doweight_stage1"})
 # What the legacy capability checks treat as "not supported".
 _PROBE_ERRORS = (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError)
 
@@ -109,13 +111,15 @@ def takes(problem) -> bool:
     return (
         local.key_args_supported(
             problem,
+            ARCHS,
             activations=("silu",),
             gate_modes=(GateMode.SEPARATED, GateMode.INTERLEAVE),
             act_params=True,
+            bias=True,
+            pads=True,
             shared="fused_row",
         )
-        and problem.arch in ARCHS
-        and not problem.features & _CONTRACT_EXCLUDES
+        and not problem.features & (_CONTRACT_EXCLUDES | _REFUSED)
         and problem.quant_type == QuantType.per_1x32
         and problem.w1 in (mxfp4(), mxfp8())
         and problem.act_in == (mxfp8() if interleave else mxfp4())

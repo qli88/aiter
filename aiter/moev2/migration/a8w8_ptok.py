@@ -72,7 +72,7 @@ def claims(call) -> bool:
 def takes(problem) -> bool:
     """The dispatch keys this path runs: the key-level counterpart of `claims`."""
     return (
-        local.key_args_supported(problem, g1u0=problem.w1 == per_token_int8())
+        local.key_args_supported(problem, ARCHS, g1u0=problem.w1 == per_token_int8())
         and problem.quant_type == QuantType.per_Token
         and problem.w1 in (per_token_fp8(), per_token_int8(), per_token_int4())
     )

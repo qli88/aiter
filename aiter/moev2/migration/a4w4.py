@@ -100,10 +100,12 @@ def takes(problem) -> bool:
     return (
         local.key_args_supported(
             problem,
+            ARCHS,
             activations=tuple(a.name.lower() for a in ACTIVATIONS),
             act_params=True,
+            bias=True,
+            pads=True,
         )
-        and problem.arch in ARCHS
         and problem.quant_type == QuantType.per_1x32
         and problem.w1 == mxfp4()
         and problem.act_in == mxfp4()

@@ -214,20 +214,35 @@ def legacy_grouped_gfx1250(call) -> bool:
 
 def key_args_supported(
     problem,
+    archs,
     *,
     activations=("silu", "gelu"),
     gate_modes=SEPARATED,
     act_params=False,
+    bias=False,
+    pads=False,
     g1u0=False,
     shared=None,
 ) -> bool:
     """False for keys with arguments or a layout the path does not support (see
-    `why_not`; bias and padding are left to the segments' `Cap`s). `shared`: the
-    placement of the shared expert the path runs (None: no shared expert)."""
+    `why_not`, whose `archs`, `bias`, `pads` and scatter rule it checks too; which bias
+    and padding run is left to the segments' `Cap`s). `shared`: the placement of the
+    shared expert the path runs (None: no shared expert)."""
     activation = problem.activation
     placement = None if problem.shared is None else problem.shared.placement
     return (
-        placement == shared
+        problem.arch in archs
+        and placement == shared
+        # A dedicated tuned table comes only with `fhmoe_`.
+        and (shared is not None or problem.extras.get("tuned_table") is None)
+        # Legacy excludes MXMOE only after an MXMOE stage 1 (per_1x32).
+        and (
+            problem.quant_type == QuantType.per_1x32
+            or problem.extras.get("exclude_mxmoe") is None
+        )
+        and "scatter" not in problem.features
+        and (bias or not problem.features & {"bias1", "bias2"})
+        and (pads or not (problem.layout.hidden_pad or problem.layout.intermediate_pad))
         and (g1u0 or problem.layout.g1u1)
         and activation.kind in activations
         and problem.gate_mode in gate_modes

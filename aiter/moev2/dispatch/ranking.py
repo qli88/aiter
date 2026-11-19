@@ -565,7 +565,8 @@ def check_problems(problems, paths, table=None):
     region (or `otherwise`) whose last structure is feasible, or that hands it to the
     legacy code. A 1-stage plan its entry lists nowhere does not count: legacy reaches
     1-stage there through tuned rows only. `hits` counts problems per region label, for
-    `dead_lists`.
+    `dead_lists`; a region that hands its problems to the legacy code also counts the
+    taken problems without a plan.
     """
     from .resolver import _one_stage, feasible_plans
 
@@ -576,9 +577,13 @@ def check_problems(problems, paths, table=None):
             if not path.takes(p):
                 continue
             plans = rankable(feasible_plans(p, path.segments)[0])
-            if not plans:
-                continue
             entries = [e for e in table if e.match.holds(p)]
+            if not plans:
+                if len(entries) == 1:
+                    regions = [r for r in entries[0].regions if r.when.holds(p)]
+                    if len(regions) == 1 and regions[0].legacy is not None:
+                        hits[entries[0].region_for(p)[0]] += 1
+                continue
             if len(entries) != 1:
                 names = [e.name for e in entries]
                 errors.append(f"{label}: lands in {len(entries)} entries {names}")
