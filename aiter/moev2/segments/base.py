@@ -154,6 +154,12 @@ class Segment:
         """Whether this segment runs the parsed tuned kernel name `kernel`."""
         return kernel is not None and kernel.family in self.prefixes
 
+    def reads(self, p: MoeProblem) -> tuple:
+        """The boundary `Buf`s this segment reads, each from the last segment before it
+        that produced that kind. `fmt=None` reads any format; `block_m` is a plan
+        parameter, shared by every segment, so it is not compared."""
+        raise NotImplementedError(self.name)
+
     def produces(self, p: MoeProblem, params: Params):
         """The `Buf` this segment hands to the next one."""
         raise NotImplementedError(self.name)

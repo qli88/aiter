@@ -524,6 +524,9 @@ class Sort(Segment):
         ),
     )
 
+    def reads(self, p):
+        return ()
+
     def produces(self, p, params):
         return Buf("sorted", None, block_m=params.get("block_m"))
 

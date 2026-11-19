@@ -240,6 +240,9 @@ class CkGemm1(Segment):
             kernel.family == kernel_names.CK2STAGES and kernel.stage == 1
         )
 
+    def reads(self, p):
+        return (Buf("sorted", None), Buf("tokens", p.act_in))
+
     def produces(self, p, params):
         return Buf("inter", ScaleSpec(p.out_dtype))
 
@@ -268,6 +271,9 @@ class CkGemm2(Segment):
         return kernel is None or (
             kernel.family == kernel_names.CK2STAGES and kernel.stage == 2
         )
+
+    def reads(self, p):
+        return (Buf("sorted", None), Buf("inter", p.act_in))
 
     def produces(self, p, params):
         return Buf("out", ScaleSpec(p.out_dtype))
