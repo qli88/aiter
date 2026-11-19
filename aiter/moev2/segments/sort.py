@@ -662,8 +662,11 @@ class Sort(Segment):
                     "doweight_stage1",
                     "act_scales",
                     "a1_scale",
+                    "bias1",
+                    "bias2",
                 }
             ),
+            pads=True,
             extras=frozenset({"disable_inline_sort", "exclude_mxmoe"}),
         ),
     )
@@ -687,7 +690,9 @@ class Sort(Segment):
         dispatch_policy,
         output,
         accumulate=True,
+        return_local_topk_ids=False,
     ):
+        kwargs = {"return_local_topk_ids": True} if return_local_topk_ids else {}
         return hooks.sort_impl(moe_sorting)(
             topk_ids,
             topk_weights,
@@ -700,6 +705,7 @@ class Sort(Segment):
             dispatch_policy,
             accumulate=accumulate,
             output=output,
+            **kwargs,
         )
 
 
@@ -724,7 +730,9 @@ class SortAux(Sort):
         output_aux,
         accumulate,
         output,
+        return_local_topk_ids=False,
     ):
+        kwargs = {"return_local_topk_ids": True} if return_local_topk_ids else {}
         return hooks.sort_impl(moe_sorting)(
             topk_ids,
             topk_weights,
@@ -737,4 +745,5 @@ class SortAux(Sort):
             accumulate=accumulate,
             output_aux=output_aux,
             output=output,
+            **kwargs,
         )

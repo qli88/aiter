@@ -448,9 +448,29 @@ def test_unknown_entry_is_an_error():
 
 
 def test_builtin_paths():
-    from aiter.moev2.migration import a4w4, a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
+    from aiter.moev2.migration import (
+        a4w4,
+        a8w4,
+        a8w8_blockscale,
+        a8w8_pt,
+        a8w8_ptok,
+        a16w4,
+        a16w16,
+        a16wi4,
+        mxfp8,
+    )
 
-    modules = (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale, a4w4)
+    modules = (
+        a8w8_pt,
+        a16w16,
+        a8w8_ptok,
+        a8w8_blockscale,
+        a4w4,
+        a16w4,
+        a16wi4,
+        a8w4,
+        mxfp8,
+    )
     assert paths._BUILTIN_MODULES == tuple(m.__name__ for m in modules)
     for module in modules:
         assert module.PATH.name == module.NAME and module.PATH.entry == "op"

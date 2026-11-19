@@ -54,3 +54,9 @@ def a4w4_fp8_inter() -> bool:
     """`AITER_SITUV2_A4W4_FP8_INTER=1`: fp8 intermediate for tuned a4w4 FlyDSL rows
     with a layout GEMM2 (when the call sets no `quant_dtype_a2`)."""
     return os.environ.get("AITER_SITUV2_A4W4_FP8_INTER", "0") == "1"
+
+
+def mxmoe_fallback() -> bool:
+    """`AITER_MXMOE_FALLBACK` (default 1): MXFP4 SiTUv2 without a tuned row defaults to
+    the heuristic MXMOE kernels."""
+    return os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"

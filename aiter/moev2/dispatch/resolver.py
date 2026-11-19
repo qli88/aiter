@@ -19,12 +19,16 @@ aiter/moev2/README.md.
 import logging
 from dataclasses import dataclass
 
-from aiter import ActivationType, logger
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter import ActivationType, QuantType, dtypes, logger
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
 
 from ..execute.metadata import AsmMoeMode, MOEMetadata
 from ..segments.asm import stage2_block_m
-from ..segments.base import Params
+from ..segments.base import NO_OPTIONS, Params
 from ..segments.ck import _require_shuffled_gfx950_fp8
 from ..segments.defaults import (
     BLOCK_SIZE_M,
@@ -129,16 +133,84 @@ def _owned_kernel(raw):
     return kernel
 
 
+def _situv2_asm_row(problem, row) -> bool:
+    """`row` is a 1-stage SiTUv2 ASM row on MXFP4 weights, which legacy
+    `get_2stage_cfgs` discards on preshuffled weights (and raises on for a mixed
+    shuffle, a gate/up layout other than separated, or runtime betas unshuffled)."""
+    return bool(
+        row.get("run_1stage", False)
+        and str(row.get("kernelName1", "") or "").strip().startswith("_ZN5aiter")
+        and problem.activation.activation == ActivationType.Situv2
+        and problem.quant_type == QuantType.per_1x32
+        and problem.w1.dtype == dtypes.fp4x2
+    )
+
+
+# The activations of the 1-stage ASM kernels; legacy discards other 1-stage rows.
+_ASM_1STAGE_ACTIVATIONS = (
+    ActivationType.Silu,
+    ActivationType.Gelu,
+    ActivationType.Situv2,
+    ActivationType.Swiglu,
+)
+
+
+def _plain_asm_1stage_row(row) -> bool:
+    """`row` names only an ASM 1-stage kernel (or none). Legacy checks any other
+    1-stage row (Opus, FlyDSL, CK-Tile or whole-graph names) before its 1-stage
+    activation and SwiGLU OAI discards, so those discards apply to plain rows only."""
+
+    def family(cell):
+        name = cell.strip() if isinstance(cell, str) else ""
+        if not name:
+            return None
+        parsed = kernel_names.try_parse(name)
+        return "unknown" if parsed is None else parsed.family
+
+    return family(row.get("kernelName1", "")) in (None, kernel_names.ASM) and family(
+        row.get("kernelName2", "")
+    ) in (None, kernel_names.NULL)
+
+
+def _swiglu_asm_row_unsupported(problem, row) -> str:
+    """Why legacy `get_2stage_cfgs` discards 1-stage Swiglu `row` (the SwiGLU OAI FLAT
+    ASM kernels: an explicit name, flat=1, no bias, limit 7.0, separated GGUU weights),
+    or ""."""
+    if not row.get("run_1stage", False) or problem.activation.activation != (
+        ActivationType.Swiglu
+    ):
+        return ""
+    kernel1 = row.get("kernelName1", "")
+    if not isinstance(kernel1, str):  # a blank cell reads as NaN
+        kernel1 = ""
+    try:
+        flat = int(row.get("flat", AsmMoeMode.SORTED))
+    except (TypeError, ValueError):
+        flat = AsmMoeMode.SORTED
+    limit = problem.activation.swiglu_limit
+    if not kernel1.strip():
+        return "empty kernelName1 (FLAT kernels need an explicit name)"
+    if flat != AsmMoeMode.NO_SORT:
+        return f"flat={row.get('flat')} (FLAT kernels need flat=1)"
+    if "bias1" in problem.features or "bias2" in problem.features:
+        return "per-expert bias"
+    if limit is not None and float(limit) != 7.0:
+        return f"swiglu_limit={limit} (kernel uses 7.0)"
+    if problem.gate_mode != GateMode.SEPARATED:
+        return f"gate mode {problem.gate_mode.value!r}"
+    if problem.layout.gate_up_interleave:
+        return "gate/up-interleaved (GUGU) weights"
+    return ""
+
+
 def _discards_post_reduction(problem, row) -> bool:
     """Legacy `get_2stage_cfgs` discards post-reduction `row` for this layout (not
     separated gate/up on fully shuffled weights). False for rows an earlier legacy
-    check may discard or raise on instead (Opus or FlyDSL names, SiTUv2)."""
+    check may discard or raise on instead (Opus or FlyDSL names)."""
     if row.get("flat", AsmMoeMode.SORTED) != AsmMoeMode.POST_REDUCE:
         return False
     names = (str(row.get(k, "") or "").strip() for k in ("kernelName1", "kernelName2"))
     if any(n.startswith(("opus_", "flydsl_")) for n in names):
-        return False
-    if problem.activation.activation == ActivationType.Situv2:
         return False
     return (
         problem.gate_mode != GateMode.SEPARATED
@@ -182,7 +254,10 @@ def _two_stage_plan(
     ksplit,
     nt,
     run_1stage,
+    options,
+    row,
 ):
+    """`row`: the tuned row the plan runs, None for a default."""
     gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
     is_asm = kernel_names.ASM in gemm1.prefixes
     if is_asm:
@@ -191,17 +266,20 @@ def _two_stage_plan(
     for segment in structure:
         if segment.covers[0] == Op.GEMM1:
             params = Params(
-                kernel=kernelName1, kernel2=kernelName2, ksplit=ksplit, nt=nt
+                options, kernel=kernelName1, kernel2=kernelName2, ksplit=ksplit, nt=nt
             )
         elif segment.covers[0] == Op.GEMM2:
-            params = Params(kernel=kernelName2, nt=nt)
+            params = Params(kernel=kernelName2, kernel1=kernelName1, nt=nt)
         else:
             params = Params()
+        if row is not None:
+            params = params.replace(**segment.row_params(problem, row))
         choices.append(SegmentChoice(segment, params))
     fields = {}
     for choice in choices:
         fields.update(choice.segment.metadata_fields(problem, choice.params))
     block_m = fields.pop("block_m", block_m)
+    ksplit = fields.pop("ksplit", ksplit)
     plan = MoePlan(
         tuple(choices),
         source,
@@ -270,7 +348,32 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
             f"tuned lookup: kernelName1={cfg.get('kernelName1')!r} "
             f"kernelName2={cfg.get('kernelName2')!r}"
         )
-        if _discards_post_reduction(problem, cfg):
+        situv2_asm = _situv2_asm_row(problem, cfg)
+        if situv2_asm and problem.any_shuffled:
+            if (
+                not problem.fully_shuffled
+                or problem.gate_mode != GateMode.SEPARATED
+                or problem.layout.gate_up_interleave is True
+            ):
+                return declined("1-stage SiTUv2 ASM row legacy raises on")
+            if problem.extras.get("tuned_table") is not None:
+                # Legacy raises for a dedicated table without a usable row.
+                return declined(
+                    "1-stage SiTUv2 ASM row discarded for a dedicated table"
+                )
+            warning = (
+                "[fused_moe] discarding 1-stage SiTUv2 ASM config for preshuffled "
+                "MXFP4 weights; using the two-stage layout-compatible path"
+            )
+            logs.append((WARNING, warning))
+            note(f"tuned row discarded: {warning}")
+            cfg = None
+        elif situv2_asm and (
+            problem.activation.situ_beta != DEFAULT_SITUV2_BETA
+            or problem.activation.situ_linear_beta != DEFAULT_SITUV2_LINEAR_BETA
+        ):
+            return declined("1-stage SiTUv2 ASM row with runtime betas (legacy raises)")
+        elif _discards_post_reduction(problem, cfg):
             if problem.extras.get("tuned_table") is not None:
                 # Legacy raises for a dedicated table.
                 return declined("post-reduction row for an incompatible layout")
@@ -281,8 +384,41 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
             logs.append((WARNING, warning))
             note(f"tuned row discarded: {warning}")
             cfg = None
-            matched = None
-        else:
+        activation = problem.activation.activation
+        plain_1stage = (
+            cfg is not None
+            and cfg.get("run_1stage", False)
+            and _plain_asm_1stage_row(cfg)
+        )
+        # A dedicated table is the FHMoE path (not ported), where legacy discards
+        # these rows too and runs the default heuristics.
+        if plain_1stage and activation not in _ASM_1STAGE_ACTIVATIONS:
+            if problem.extras.get("tuned_table") is not None:
+                return declined("1-stage row discarded for a dedicated table")
+            warning = (
+                f"[fused_moe] discarding 1-stage tuned config for unsupported "
+                f"activation {activation}; using default heuristics"
+            )
+            logs.append((WARNING, warning))
+            note(f"tuned row discarded: {warning}")
+            cfg = None
+        swiglu_unsupported = (
+            plain_1stage
+            and cfg is not None
+            and _swiglu_asm_row_unsupported(problem, cfg)
+        )
+        if swiglu_unsupported:
+            if problem.extras.get("tuned_table") is not None:
+                return declined("1-stage row discarded for a dedicated table")
+            warning = (
+                f"[fused_moe] discarding SwiGLU OAI 1-stage asm config for {keys}: "
+                f"unsupported {swiglu_unsupported}; using default heuristics"
+            )
+            logs.append((WARNING, warning))
+            note(f"tuned row discarded: {warning}")
+            cfg = None
+        matched = None
+        if cfg is not None:
             matched = match_row(plans, cfg)
             if isinstance(matched, str):
                 return declined(matched)
@@ -339,7 +475,7 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
     s = problem.shape
     q_type = problem.quant_type
     if cfg is None or bypass_tuned_config:
-        best = ranking.best(problem, ranking.rankable(plans))
+        best = ranking.best(problem, ranking.rankable(plans), tuned_row=cfg is not None)
         if best is None:
             return declined("no default ranking entry applies")
         region, structure, legacy = best
@@ -410,10 +546,13 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
     if "ck.gemm1" in names and "ck.gemm2" in names:
         _require_shuffled_ck_fp8(problem, logs, explain, emit_on_raise)
     default = gemm1.default_kernels(problem) if source != "tuned" else None
+    options = NO_OPTIONS
     if default is not None:
         kernelName1, kernelName2 = default.kernel1, default.kernel2
         block_m, ksplit = default.block_m, default.ksplit
-        logs.append((WARNING, default.warning))
+        options = default.options
+        if default.warning is not None:
+            logs.append((WARNING, default.warning))
     plan, metadata = _two_stage_plan(
         problem,
         structure,
@@ -424,6 +563,8 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
         ksplit,
         use_non_temporal_load,
         run_1stage,
+        options,
+        cfg if source == "tuned" else None,
     )
     note(f"selected {plan.describe()}")
     return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))

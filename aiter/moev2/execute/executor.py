@@ -12,28 +12,41 @@ aiter/moev2/README.md.
 """
 
 import functools
+import math
 from dataclasses import dataclass, replace
 
 import torch
 
-from aiter import ActivationType, QuantType, dtypes
+from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.fused_moe_registry import FusedMoeRequest
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import (
     GateMode,
     _flydsl_stage2_fp8_enabled,
     _mxfp4_intermediate_enabled,
 )
 from aiter.ops.flydsl.mxfp4_kname import _parse_mxfp4_g1_kname, parse_g2_kname_any
+from aiter.ops.moe_limits import normalize_swiglu_limit
+from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
+from aiter.ops.opus.moe_stage1_a8w4 import (
+    opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
+)
 
 from .. import hooks
 from ..dispatch.ops import Op
 from ..policy import _normalize_mxfp4_activation_params
+from ..segments.asm import asm_stage1
+from ..segments.ck import ck_moe_stage1
+from ..segments.ck_tile import cktile_moe_stage1, cktile_moe_stage2
 from ..segments.flydsl import (
+    _can_reroute_mxfp4_to_flydsl,
     _flydsl_route_output_nbytes,
     _flydsl_stage1_wrapper,
     _flydsl_stage2_wrapper,
     _flydsl_v2_stage2_wrapper,
     _is_flydsl_stage2,
+    _needs_swiglu_bias_support,
+    _normalize_bias_for_kernel,
     _stage2_runtime_uses_route_reduce,
     _validate_flydsl_route_output_nbytes,
 )
@@ -42,6 +55,8 @@ from ..segments.mxmoe import (
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
 )
+from ..segments.opus import _opus_stage2_fp8_enabled
+from ..segments.quant import quant_a1_mxfp4, quant_inter_mxfp4
 from ..segments.sort import (
     AUX_SORT_OPUS,
     _fused_decode_sort_quant,
@@ -85,6 +100,14 @@ def prologue(call, quant_remap, *, prepare=True) -> Call:
     without materializing a strided activation or validating its output buffer twice.
     """
     activation = ActivationType(call["activation"])
+    swiglu_limit = call["swiglu_limit"]
+    if (
+        activation == ActivationType.Silu
+        and swiglu_limit is not None
+        and swiglu_limit != 0
+        and swiglu_limit != math.inf
+    ):
+        call = {**call, "swiglu_limit": normalize_swiglu_limit(swiglu_limit)}
     quant_type = QuantType(call["quant_type"])
     gate_mode = GateMode(call["gate_mode"])
     block_size_M = call["block_size_M"]
@@ -315,30 +338,99 @@ def run_two_stage(c: Call, metadata, plan, q_dtype_a, after_sort=None):
     return _return_output(moe_out, output)
 
 
+def a16w4_unsupported(c: Call, q_dtype_a) -> str | None:
+    """Why legacy `_fused_moe_impl` raises NotImplementedError for an a16w4 call (bf16
+    activations into MXFP4 weights, SiTUv2 or Swiglu re-routed to FlyDSL) before the
+    dispatch, or None."""
+    w1, w2 = c["w1"], c["w2"]
+    is_situv2 = (
+        c.quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and c.activation == ActivationType.Situv2
+    )
+    is_swiglu_rerouted = (
+        c.inter_dim % 256 != 0
+        and q_dtype_a == dtypes.bf16
+        and _can_reroute_mxfp4_to_flydsl(
+            model_dim=c.model_dim,
+            inter_dim=c.inter_dim,
+            dtype=c.dtype,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=w1.dtype,
+            q_type=c.quant_type,
+            activation=c.activation,
+            is_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+            use_g1u1=c.isG1U1,
+            doweight_stage1=c["doweight_stage1"],
+            gate_mode=c.gate_mode,
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
+        )
+    )
+    if not (is_situv2 or is_swiglu_rerouted):
+        return None
+    is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    for bad, why in (
+        (
+            get_gfx() not in ("gfx942", "gfx950"),
+            f"requires the FlyDSL kernel on CDNA gfx942/gfx950 (gfx={get_gfx()!r})",
+        ),
+        (c["bias1"] is not None or c["bias2"] is not None, "per-expert bias"),
+        (c["expert_mask"] is not None, "expert-parallel masking"),
+        (
+            not (is_shuffled and c.isG1U1 and not c["doweight_stage1"]),
+            "non-preshuffled / non-g1u1 weights or doweight_stage1=True",
+        ),
+    ):
+        if bad:
+            return why
+    return None
+
+
 def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
-    """`run_two_stage` for MXFP4 weights: the `per_1x32` branches of `_fused_moe_impl`
-    and `fused_moe_2stages` (route-reduce check, auxiliary or fused decode sort, sorted
-    quantization, the FlyDSL and MXMOE stage arguments)."""
+    """`run_two_stage` for `per_1x32`: the legacy `_fused_moe_impl` after the dispatch and
+    `fused_moe_2stages`, branch for branch (route-reduce check, auxiliary or fused decode
+    sort, local topk ids for split-K bias under EP, sorted quantization, the FlyDSL,
+    MXMOE, Opus and CK-Tile stage arguments)."""
     if not _is_mxfp4_inline_sort(metadata) and not c["hidden_states"].is_contiguous():
         c = replace(
             c, args={**c.args, "hidden_states": c["hidden_states"].contiguous()}
+        )
+    hidden_states, w1, w2 = c["hidden_states"], c["w1"], c["w2"]
+    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if (
+        w1.dtype == dtypes.fp4x2
+        and c.inter_dim % 256 != 0
+        and stage2_func is cktile_moe_stage2
+    ):
+        raise NotImplementedError(
+            "No safe MXFP4 MoE backend for this shape and layout: CK-Tile "
+            f"stage2 mis-indexes scales at inter_dim={c.inter_dim}, and the "
+            "FlyDSL fallback cannot accept this invocation."
         )
     block_size_M = metadata.block_m if c.block_size_M is None else c.block_size_M
     if block_size_M is not None:
         block_size_M = int(block_size_M)
     sort = plan.starting(Op.SORT).segment
-    quant_a1 = plan.segment("quant.a1").segment
-    quant_inter = plan.segment("quant.inter")
 
-    hidden_states, w1, w2 = c["hidden_states"], c["w1"], c["w2"]
     topk_ids, topk_weight = c["topk_ids"], c["topk_weight"]
     expert_mask = c["expert_mask"]
     num_local_tokens = c["num_local_tokens"]
     output = c["output"]
     doweight_stage1 = c["doweight_stage1"]
     M, topk, model_dim, dtype = c.M, c.topk, c.model_dim, c.dtype
-    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
-    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    activation, quant_type = c.activation, c.quant_type
+    need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
+    need_local_topk_ids = (
+        not metadata.run_1stage
+        and need_bias_support
+        and metadata.has_bias
+        and metadata.ksplit > 1
+        and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
+        and expert_mask is not None
+    )
 
     runtime_stage2_reduce = _stage2_runtime_uses_route_reduce(
         metadata.stage2, M, model_dim
@@ -354,19 +446,20 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
     prequantized_a1_scale = None
     m_indices = None
     reverse_sorted = None
+    local_topk_ids = None
     fused_sort_quant = not metadata.output_aux and _is_fused_decode_sort_quant_enabled(
         hidden_states,
         topk_ids,
         topk_weight,
         global_experts=c.global_E,
         block_m=block_size_M,
-        quant_type=c.quant_type,
+        quant_type=quant_type,
         q_dtype_a=q_dtype_a,
         q_dtype_w=w1.dtype,
-        activation=c.activation,
+        activation=activation,
         is_g1u1=c.isG1U1,
         expert_mask=expert_mask,
-        need_local_topk_ids=False,
+        need_local_topk_ids=need_local_topk_ids,
         run_1stage=metadata.run_1stage,
         stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
         hidden_pad=c["hidden_pad"],
@@ -384,15 +477,7 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
                 "use a flydsl_moe2_layout_ GEMM2."
             )
         atomic = g2["atomic"]
-        (
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            m_indices,
-            reverse_sorted,
-        ) = sort.run(
+        sorting_ret = sort.run(
             topk_ids,
             topk_weight,
             c.global_E,
@@ -404,9 +489,18 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
             output_aux=metadata.output_aux,
             accumulate=atomic and not runtime_stage2_reduce,
             output=output,
-        )[
-            :7
-        ]
+            return_local_topk_ids=need_local_topk_ids,
+        )
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            m_indices,
+            reverse_sorted,
+        ) = sorting_ret[:7]
+        local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
     elif fused_sort_quant:
         (
             sorted_ids,
@@ -429,24 +523,31 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
             num_local_tokens=num_local_tokens,
         )
     else:
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-            sort.run(
-                topk_ids,
-                topk_weight,
-                c.global_E,
-                model_dim,
-                dtype,
-                block_size_M,
-                expert_mask,
-                num_local_tokens,
-                c["moe_sorting_dispatch_policy"],
-                output,
-                accumulate=not runtime_stage2_reduce,
-            )
+        sorting_ret = sort.run(
+            topk_ids,
+            topk_weight,
+            c.global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            num_local_tokens,
+            c["moe_sorting_dispatch_policy"],
+            output,
+            accumulate=not runtime_stage2_reduce,
+            return_local_topk_ids=need_local_topk_ids,
         )
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            sorting_ret[:5]
+        )
+        if need_local_topk_ids:
+            local_topk_ids = sorting_ret[5]
+    _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
     if after_sort is not None:
         after_sort()
 
+    # fused_moe_2stages, with its `topk_ids` argument.
+    topk_ids = local_topk_ids if local_topk_ids is not None else topk_ids
     token_num, _ = hidden_states.shape
     inter_dim = c.inter_dim
     moe_out = moe_buf
@@ -459,10 +560,9 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
             else torch.empty((token_num, model_dim), dtype=dtype, device=device)
         )
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    beta, linear_beta, swiglu_limit = c["beta"], c["linear_beta"], c["swiglu_limit"]
     config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
-        _normalize_mxfp4_activation_params(
-            c.activation, c["beta"], c["linear_beta"], c["swiglu_limit"]
-        )
+        _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)
     )
     if (
         stage1_func is _mxfp4_a4w4_stage1_fw
@@ -476,14 +576,14 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
     if prequantized_a1 is not None:
         a1, a1_scale = prequantized_a1, prequantized_a1_scale
     else:
-        a1, a1_scale = quant_a1.run_mxfp4(
+        a1, a1_scale = quant_a1_mxfp4(
             metadata,
             hidden_states,
             c["a1_scale"],
             q_dtype_a,
             dtype,
             w1.dtype,
-            c.activation,
+            activation,
             c.gate_mode,
             is_shuffled,
             sorted_ids,
@@ -495,13 +595,45 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
             sorted_weights,
             c.global_E,
         )
-    a2 = torch.empty((token_num, topk, inter_dim), dtype=dtype, device=device)
+    # The a16w4 FlyDSL stage 1 allocates its own sorted intermediate.
+    is_a16w4_port = (
+        dtype in (dtypes.bf16, dtypes.fp16)
+        and w1.dtype == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and stage1_func is _flydsl_stage1_wrapper
+    )
+    a2 = (
+        None
+        if is_a16w4_port
+        else torch.empty((token_num, topk, inter_dim), dtype=dtype, device=device)
+    )
     extra_stage1_args = {}
     extra_stage2_args = {}
-    if stage1_func is _flydsl_stage1_wrapper:
-        extra_stage1_args["swiglu_limit"] = c["swiglu_limit"]
+    if not metadata.run_1stage and need_bias_support:
+        if metadata.has_bias:
+            extra_stage1_args["bias1"] = _normalize_bias_for_kernel(c["bias1"])
+            if stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1):
+                extra_stage1_args["topk_ids"] = topk_ids
+        if metadata.stage2_has_bias:
+            extra_stage2_args["bias2"] = _normalize_bias_for_kernel(c["bias2"])
+    active_silu_limit = (
+        normalize_swiglu_limit(swiglu_limit)
+        if swiglu_limit and activation == ActivationType.Silu
+        else None
+    )
+    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
+        # These clamp silu whenever a finite limit is configured: the caller's limit.
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
+    elif active_silu_limit is not None:
+        if stage1_func in (ck_moe_stage1, asm_stage1):
+            extra_stage1_args["swiglu_limit"] = active_silu_limit
+        elif stage1_func is cktile_moe_stage1:
+            raise NotImplementedError(
+                f"CK-Tile MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
+                "the selected kernel has no clamp."
+            )
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
     if stage1_func is _flydsl_stage1_wrapper:
@@ -511,6 +643,13 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
         # MXMOE's activation comes from its name and betas enter its compile key.
         extra_stage1_args["situ_beta"] = config_situ_beta
         extra_stage1_args["situ_linear_beta"] = config_situ_linear_beta
+    elif stage1_func is _opus_a8w4_stage1_wrapper:
+        if metadata.skip_inter_quant:
+            extra_stage1_args["output_sorted"] = True
+        extra_stage1_args["situ_beta"] = 4.0 if beta is None else float(beta)
+        extra_stage1_args["situ_linear_beta"] = (
+            25.0 if linear_beta is None else float(linear_beta)
+        )
     if (
         stage2_func
         in (_flydsl_stage2_wrapper, _flydsl_v2_stage2_wrapper, _mxfp4_a4w4_stage2_fw)
@@ -541,6 +680,8 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
     ):
         # FP8/FP4 route-output reduction applies the route weights after GEMM2.
         extra_stage2_args["topk_weights"] = topk_weight
+    if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:
+        extra_stage2_args["stage2_fp8_enabled"] = _opus_stage2_fp8_enabled()
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = moe_buf
@@ -582,20 +723,17 @@ def run_mxfp4(c: Call, metadata, plan, q_dtype_a, after_sort=None):
     elif metadata.fuse_quant == "fp8" and isinstance(a2, tuple):
         a2, a2_scale = a2[0], a2[1]
         a2 = a2.view(token_num, topk, -1)
-    elif (
-        dtype in [dtypes.bf16, dtypes.fp16]
-        and w1.dtype == dtypes.fp4x2
-        and (
-            q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and c.activation
-            in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)
-            or (metadata.ksplit > 1 and is_shuffled)
-        )
-    ):
-        a2_scale = None
     else:
-        a2, a2_scale = quant_inter.segment.run_mxfp4(
+        a2, a2_scale = quant_inter_mxfp4(
             a2,
+            a2_scale,
+            a1_scale,
+            metadata,
+            q_dtype_a,
+            dtype,
+            w1.dtype,
+            activation,
+            is_shuffled,
             sorted_ids,
             num_valid_ids,
             token_num,

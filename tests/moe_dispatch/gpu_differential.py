@@ -8,8 +8,8 @@ floating-point tensors within 1 ulp or legacy's own spread), give the same outpu
 the GEMM2 atomics, and log the same dispatch lines on a first call (see
 `differential.run_differential`). Besides plain calls, the cases cover inputs `claims`
 accepts (`_VARIANTS`: all of them for a8w8_pt, `_GENERIC_VARIANTS` for the fp8 per-token,
-blockscale and a4w4 paths); where legacy raises on one (`_RAISES`), v2 must run the call and
-raise the same error.
+blockscale and `per_1x32` paths); where legacy raises on one (`_RAISES`), v2 must run the
+call and raise the same error.
 
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt
     python tests/moe_dispatch/gpu_differential.py --path a16w16 --synth-table
@@ -37,17 +37,24 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 _HERE = pathlib.Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
 
 # (token, model_dim, inter_dim, experts, topk, activation, doweight_stage1, out dtype, ep)
-# and optionally the weight format ("fp8" when absent, "i8", "i4": int4 in uint32, or
-# "fp4"/"fp4u": MXFP4, preshuffled or not) and a dict of call options: "variant" names
-# one of `_VARIANTS`, an input `claims` accepts beyond the plain call.
+# and optionally the weight format ("fp8" when absent, "i8", "i4": int4 in uint32,
+# "fp4"/"fp4u": MXFP4, preshuffled or not, "wi4": `torch.int4` in 1x32 groups, or
+# "mxfp8": fp8 in 1x32 groups) and a dict of call options: "q_a" (the
+# `quant_dtype_a`: "fp4", "fp8", "bf16"), "bias" (fp32 per-expert bias1 and bias2),
+# "swiglu_limit", "g1u0" (gate-only w1), "interleave" (gate/up interleaved w1, a16w4,
+# a8w4 and mxfp8), "std_shuffle" (a16w4/a8w4 "fp4" and "mxfp8" weights shuffled as
+# a4w4's, untagged), "env" (environment variables set for the legacy and the v2 runs),
+# "variant" (one of `_VARIANTS`, an input `claims` accepts beyond the plain call).
 _SWIGLU_0 = {"variant": "swiglu_limit_0"}
 _A8W8_PT_DEFAULT = (
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 64, 256, 1024, 4096)),
@@ -149,6 +156,11 @@ _A8W8_BLOCKSCALE_DEFAULT = (
 # gfx950: shapes of each shipped cu256 row family, untuned shapes (the FlyDSL heuristic on
 # preshuffled weights, CK otherwise), expert-parallel (MXMOE rows fall back to the
 # heuristic), doweight_stage1 (CK) and the generic variants.
+_FP4_A = {"q_a": "fp4"}
+_BIAS = {"bias": True}
+_LIMIT = {"swiglu_limit": 7.0}
+_FP4_A_BIAS = {**_FP4_A, **_BIAS}
+_NO_FLYDSL = {"env": {"AITER_FLYDSL_FORCE": "0"}}
 _A4W4 = (
     # FlyDSL stage 1 + layout-v2 stage 2.
     *((m, 3072, 384, 256, 8, "Silu", False, "bf16", False, "fp4") for m in (1, 64, 1024)),
@@ -168,14 +180,176 @@ _A4W4 = (
     *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4") for m in (5, 200)),
     *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False, "fp4") for m in (40,)),
     *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "fp4") for m in (32,)),
-    # doweight_stage1 outside CK-Tile split-K (`token * topk > experts`), which the path
-    # declines (and which faults on legacy at (8, 4096, 512, 64, 4)).
+    # doweight_stage1 outside CK-Tile split-K (`token * topk > experts`): CK. With a
+    # split-K above 1, CK-Tile faults on legacy and v2 alike (todo 5.5).
     *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False, "fp4") for m in (300, 1024)),
+    # CK-Tile split-K (bf16 activations) without the FlyDSL heuristic; with bias, which
+    # its stage 1 rejects.
+    *((m, 2048, 512, 64, 6, "Silu", False, "bf16", False, "fp4", _NO_FLYDSL) for m in (4,)),
+    *((m, 3072, 512, 128, 4, "Silu", False, "bf16", False, "fp4", _NO_FLYDSL) for m in (1,)),
+    *((m, 2048, 512, 64, 6, "Silu", False, "bf16", False, "fp4", {**_NO_FLYDSL, **_BIAS}) for m in (4,)),
     *((m, 3072, 384, 128, 8, "Silu", False, "bf16", True, "fp4") for m in (16, 512)),
     *((m, 5120, 640, 64, 3, "Silu", False, "bf16", True, "fp4") for m in (64,)),
     # Not preshuffled: CK.
     *((m, 3072, 384, 256, 8, "Silu", False, "bf16", False, "fp4u") for m in (16, 256)),
     *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4u") for m in (5,)),
+    # Bias on Silu: legacy and v2 ignore it.
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4", _BIAS) for m in (64,)),
+    # Silu with swiglu_limit: FlyDSL clamps; CK (no fp4 clamp) and CK-Tile stage 1 raise.
+    *((m, 3072, 384, 256, 8, "Silu", False, "bf16", False, "fp4", _LIMIT) for m in (64,)),
+    *((m, 3072, 384, 256, 8, "Silu", False, "bf16", False, "fp4u", _LIMIT) for m in (16,)),
+    *((m, 2048, 512, 64, 6, "Silu", False, "bf16", False, "fp4", {**_NO_FLYDSL, **_LIMIT}) for m in (4,)),
+    # Swiglu: fp4 activations from 256 tokens (below, with quant_dtype_a). Tuned FlyDSL
+    # + layout-v2 and MXMOE rows; untuned, the FlyDSL heuristic (with the bias it adds
+    # for Swiglu), with bias tensors and swiglu_limit.
+    *((m, 3072, 512, 128, 4, "Swiglu", False, "bf16", False, "fp4") for m in (256, 4096)),
+    *((m, 6144, 768, 129, 5, "Swiglu", False, "bf16", False, "fp4", _FP4_A) for m in (8,)),
+    *((m, 6144, 1536, 129, 5, "Swiglu", False, "bf16", False, "fp4", _FP4_A) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4") for m in (512,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _BIAS) for m in (512,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _LIMIT) for m in (512,)),
+    # Not preshuffled: CK-Tile, which has no fp4-activation instance (todo 5.11).
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4u") for m in (512,)),
+    *((m, 3072, 512, 128, 4, "Swiglu", False, "bf16", False, "fp4u", _FP4_A) for m in (64,)),
+    # SiTUv2 with fp4 activations (quant_dtype_a): tuned FlyDSL + layout-v2 and MXMOE
+    # rows; untuned, the MXMOE heuristic (a shape the MXMOE sort supports), or the
+    # FlyDSL one (with expert_mask, another shape, with bias).
+    *((m, 3584, 3072, 56, 16, "Situv2", False, "bf16", False, "fp4", _FP4_A) for m in (128,)),
+    *((m, 3584, 384, 896, 16, "Situv2", False, "bf16", False, "fp4", _FP4_A) for m in (16,)),
+    *((m, 7168, 256, 256, 8, "Situv2", False, "bf16", False, "fp4", _FP4_A) for m in (1024,)),
+    *((m, 7168, 256, 256, 8, "Situv2", False, "bf16", True, "fp4", _FP4_A) for m in (1024,)),
+    *((m, 4096, 512, 128, 8, "Situv2", False, "bf16", False, "fp4", _FP4_A) for m in (64,)),
+    *((m, 4096, 512, 128, 8, "Situv2", False, "bf16", False, "fp4", _FP4_A_BIAS) for m in (64,)),
+)  # fmt: skip
+
+_G1U0 = {"g1u0": True}
+_INTERLEAVE = {"interleave": True}
+
+# gfx950, bf16 activations into MXFP4 weights: Swiglu below 256 tokens, SiTUv2, Relu2.
+_A16W4 = (
+    # Tuned: the `swiglu_mxfp4_bf16_cktile` rows (CK-Tile split-K with the row's ksplit),
+    # FlyDSL Swiglu and SiTUv2 rows; a 1-stage SwiGLU OAI row legacy discards for bias.
+    *((m, 3072, 512, 128, 4, "Swiglu", False, "bf16", False, "fp4") for m in (1, 16, 128)),
+    *((m, 6144, 768, 129, 5, "Swiglu", False, "bf16", False, "fp4") for m in (64,)),
+    *((m, 6144, 768, 129, 5, "Swiglu", False, "bf16", False, "fp4", _BIAS) for m in (8,)),
+    *((m, 3584, 512, 896, 16, "Situv2", False, "bf16", False, "fp4") for m in (16,)),
+    # Untuned Swiglu: CK-Tile split-K; FlyDSL where CK-Tile's stage 2 is unsafe
+    # (`inter_dim % 256`); not preshuffled, CK-Tile with split-K 2 (ROCM-25478); bias.
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4") for m in (5, 128)),
+    *((128, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", {"variant": v})
+      for v in _GENERIC_VARIANTS),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", True, "fp4") for m in (64,)),
+    *((m, 4096, 384, 128, 8, "Swiglu", False, "bf16", False, "fp4") for m in (32,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4u") for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _BIAS) for m in (64,)),
+    # Gate and up interleaved: the CK-Tile gate-up kernel (split-K 1).
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _INTERLEAVE) for m in (16, 128)),
+    # Untuned SiTUv2: FlyDSL. With expert_mask, bias or routed weights in stage 1,
+    # legacy and v2 both raise (the a16w4 SiTUv2 guard ahead of the kernels).
+    *((m, 4096, 512, 128, 8, "Situv2", False, "bf16", False, "fp4") for m in (64, 1024)),
+    *((m, 4096, 512, 128, 8, "Situv2", False, "bf16", True, "fp4") for m in (64,)),
+    *((m, 4096, 512, 128, 8, "Situv2", False, "bf16", False, "fp4", _BIAS) for m in (64,)),
+    *((m, 2048, 512, 64, 6, "Situv2", True, "bf16", False, "fp4") for m in (4,)),
+    # Relu2 with a gate-only w1: CK-Tile.
+    *((m, 7168, 256, 256, 8, "Relu2", False, "bf16", False, "fp4", _G1U0) for m in (1, 64, 512)),
+)  # fmt: skip
+
+# gfx950 and gfx942, bf16 activations into int4 weights ("wi4"): the tuned rows (gfx950:
+# Kimi-K2, Silu; gfx942: Kimi-K3, SiTUv2) and the untuned fallback.
+_A16WI4 = (
+    *((m, 7168, 256, 384, 8, "Silu", False, "bf16", False, "wi4") for m in (1, 16, 128)),
+    *((m, 3584, 3072, 112, 15, "Situv2", False, "bf16", False, "wi4") for m in (4,)),
+    *((m, 2048, 768, 128, 8, "Silu", False, "bf16", False, "wi4") for m in (5, 300, 2048)),
+    *((300, 2048, 768, 128, 8, "Silu", False, "bf16", False, "wi4", {"variant": v})
+      for v in _GENERIC_VARIANTS),
+    *((m, 2048, 768, 128, 8, "Situv2", False, "bf16", False, "wi4") for m in (64,)),
+    *((m, 2048, 768, 128, 8, "Silu", False, "fp16", False, "wi4") for m in (40,)),
+    *((m, 2048, 768, 128, 8, "Silu", False, "bf16", True, "wi4") for m in (64,)),
+    *((m, 2048, 768, 128, 8, "Silu", False, "bf16", False, "wi4", _BIAS) for m in (64,)),
+)  # fmt: skip
+
+_FP8_A = {"q_a": "fp8"}
+_FP8_A_BIAS = {**_FP8_A, **_BIAS}
+_FP8_A_INTERLEAVE = {**_FP8_A, **_INTERLEAVE}
+_FP8_A_STD = {**_FP8_A, "std_shuffle": True}
+
+# gfx950, mxfp8 activations into MXFP4 weights (quant_dtype_a=fp8).
+_A8W4 = (
+    # Tuned FlyDSL rows: stage 1 quantizing to fp8 into a layout GEMM2 (Silu, Swiglu,
+    # SiTUv2) or a FlyDSL stage 2, a plain stage 1 into a FlyDSL stage 2, a stage 1
+    # quantizing to fp8 into a CK-Tile stage 2; MXMOE stage 1 into a layout GEMM2 (the
+    # first shapes); with expert_mask, where legacy discards the MXMOE row.
+    *((m, 4096, 256, 256, 6, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (8, 128)),
+    *((128, 4096, 256, 256, 6, "Silu", False, "bf16", False, "fp4", {**_FP8_A, "variant": v})
+      for v in _GENERIC_VARIANTS),
+    *((m, 3072, 3072, 128, 4, "Swiglu", False, "bf16", False, "fp4", _FP8_A) for m in (16,)),
+    *((m, 3584, 384, 896, 16, "Situv2", False, "bf16", False, "fp4", _FP8_A) for m in (4,)),
+    *((m, 7168, 3072, 24, 6, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (64,)),
+    *((m, 5120, 640, 128, 3, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (32, 256)),
+    *((m, 3072, 3072, 128, 4, "Swiglu", False, "bf16", False, "fp4", _FP8_A) for m in (128,)),
+    *((m, 4096, 256, 256, 6, "Silu", False, "bf16", True, "fp4", _FP8_A) for m in (128,)),
+    # Tuned Opus rows: Opus stage 1 into a layout GEMM2 or an Opus stage 2 (atomic,
+    # fp8), FlyDSL stage 1 (quantizing or not) into an Opus stage 2 or an Opus layout
+    # one, and ASM stage 1 under a `cktile_*` kernelName1 into an Opus stage 2 (on
+    # weights the FlyDSL heuristic does not take first). Legacy discards them with
+    # expert_mask or weights not preshuffled.
+    *((m, 7168, 384, 385, 7, "Silu", False, "bf16", False, "fp4", _FP8_A_STD) for m in (2048,)),
+    *((m, 7168, 384, 384, 6, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (1, 2, 512, 2048)),
+    *((m, 7168, 384, 384, 6, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (64,)),
+    *((m, 7168, 384, 385, 7, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (16,)),
+    *((m, 3584, 384, 896, 16, "Situv2", False, "bf16", False, "fp4", _FP8_A) for m in (512, 2048)),
+    *((m, 7168, 384, 384, 6, "Silu", False, "bf16", True, "fp4", _FP8_A) for m in (2,)),
+    *((m, 7168, 384, 384, 6, "Silu", False, "bf16", False, "fp4u", _FP8_A) for m in (2,)),
+    # Untuned, gate and up separated: the FlyDSL heuristic on weights tagged with
+    # `gate_up_interleave=False` (as -q 7 builds them; Swiglu with its bias); untagged,
+    # CK (Silu, SiTUv2, with expert_mask), CK-Tile split-K, and CK-Tile for Swiglu
+    # (with bias, not preshuffled).
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Situv2", False, "bf16", False, "fp4", _FP8_A) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4", _FP8_A_STD) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Situv2", False, "bf16", False, "fp4", _FP8_A_STD) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", True, "fp4", _FP8_A_STD) for m in (64,)),
+    *((m, 2048, 768, 128, 8, "Silu", False, "bf16", False, "fp4", _FP8_A_STD) for m in (2,)),
+    *((m, 4096, 384, 128, 8, "Situv2", False, "bf16", False, "fp4", _FP8_A_STD) for m in (4,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _FP8_A) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _FP8_A_BIAS) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _FP8_A_STD) for m in (64, 512)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", {**_FP8_A_STD, **_BIAS}) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4u", _FP8_A) for m in (64,)),
+    # Gate and up interleaved: the FlyDSL heuristic (Silu, SiTUv2), the CK-Tile gate-up
+    # kernel (Swiglu).
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "fp4", _FP8_A_INTERLEAVE) for m in (16, 1024)),
+    *((m, 2048, 256, 64, 6, "Situv2", False, "bf16", False, "fp4", _FP8_A_INTERLEAVE) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4", _FP8_A_INTERLEAVE) for m in (64,)),
+)  # fmt: skip
+
+_STD = {"std_shuffle": True}
+
+# gfx950, mxfp8 activations and weights ("mxfp8", as -q 9 builds them).
+_MXFP8 = (
+    # Tuned FlyDSL rows (GLM5, MiniMax-M3): stage 1 quantizing to fp8 or not into a
+    # layout GEMM2, stage 1 quantizing to fp8 into a FlyDSL stage 2 (Swiglu: the tuned
+    # rule adds no bias with fp8 weights); with expert_mask.
+    *((m, 6144, 512, 257, 9, "Silu", False, "bf16", False, "mxfp8") for m in (1, 128, 4096)),
+    *((128, 6144, 512, 257, 9, "Silu", False, "bf16", False, "mxfp8", {"variant": v})
+      for v in _GENERIC_VARIANTS),
+    *((m, 6144, 256, 257, 9, "Silu", False, "bf16", False, "mxfp8", _FP8_A) for m in (8,)),
+    *((m, 6144, 768, 129, 5, "Swiglu", False, "bf16", False, "mxfp8") for m in (2, 1024)),
+    *((m, 6144, 384, 129, 5, "Swiglu", False, "bf16", False, "mxfp8") for m in (4, 2048)),
+    *((m, 6144, 384, 129, 5, "Swiglu", False, "bf16", False, "mxfp8", _BIAS) for m in (4,)),
+    *((m, 6144, 512, 257, 9, "Silu", False, "bf16", True, "mxfp8") for m in (16,)),
+    # Untuned: the FlyDSL heuristic (gate and up interleaved, or separated with w1
+    # tagged `gate_up_interleave=False`; Swiglu with its bias); untagged, CK (Silu,
+    # Swiglu, `doweight_stage1`, expert_mask).
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "mxfp8", _INTERLEAVE) for m in (16, 1024)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "mxfp8", _INTERLEAVE) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "mxfp8", {**_INTERLEAVE, **_BIAS}) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "mxfp8") for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "mxfp8", _BIAS) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", False, "mxfp8", _STD) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "mxfp8", _STD) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Silu", True, "bf16", False, "mxfp8", _STD) for m in (64,)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "bf16", True, "mxfp8", _STD) for m in (64,)),
 )  # fmt: skip
 
 _CASES = {
@@ -184,6 +358,10 @@ _CASES = {
     "a8w8_ptok": _A8W8_PTOK_DEFAULT,
     "a8w8_blockscale": _A8W8_BLOCKSCALE_DEFAULT,
     "a4w4": _A4W4,
+    "a16w4": _A16W4,
+    "a16wi4": _A16WI4,
+    "a8w4": _A8W4,
+    "mxfp8": _MXFP8,
 }
 # Cases for one (gfx, cu_num) only: the shipped rows they select exist only there.
 _ARCH_CASES = {("a8w8_pt", "gfx942", 80): _A8W8_PT_GFX942_CU80}
@@ -194,6 +372,10 @@ _ROWS = {
     "a8w8_ptok": ("QuantType.per_Token", "float8"),
     "a8w8_blockscale": ("QuantType.per_1x128", "float8"),
     "a4w4": ("QuantType.per_1x32", "float4"),
+    "a16w4": ("QuantType.per_1x32", "float4"),
+    "a16wi4": ("QuantType.per_1x32", "int4"),
+    "a8w4": ("QuantType.per_1x32", "float4"),
+    "mxfp8": ("QuantType.per_1x32", "float8"),
 }
 
 
@@ -214,17 +396,25 @@ def _make_call(path_name, case):
     """Inputs as op_tests/test_moe_2stage.py builds them for `-q 1` (per-tensor fp8,
     path a8w8_pt), `-q 0` (unquantized, path a16w16), `-q 2` (per-token fp8, path
     a8w8_ptok), `-q 3` (per-token int4 weights, path a8w8_ptok), `-q 5` (128x128 fp8
-    blocks, path a8w8_blockscale) or `-q 4` (MXFP4, path a4w4; `--preshuffle` for
-    "fp4"); int8 weights as `-q 1`/`-q 2` with int8.
-    Unlike op_tests, the weights are scaled by 1/sqrt(K) (see `weight`); then the
-    case's variant is applied."""
+    blocks, path a8w8_blockscale), `-q 4` (MXFP4, path a4w4; `--preshuffle` for "fp4")
+    `-q 6` (bf16 into MXFP4, path a16w4), `-q 7` (mxfp8 into MXFP4, path a8w4) or
+    `-q 8` (bf16 into int4, path a16wi4) or `-q 9` (mxfp8, path mxfp8); int8
+    weights as `-q 1`/`-q 2` with int8. Unlike op_tests, the weights are scaled by
+    1/sqrt(K) (see `weight`); then the case's options and variant are applied."""
     import torch
 
     import aiter
     from aiter import ActivationType, QuantType, dtypes
     from aiter.fused_moe import fused_topk
     from aiter.int4_utils import convert_int8_to_uint32_int4, rearrange_4bit_elements
-    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
+    from aiter.ops.shuffle import (
+        pack_int8_to_packed_int4,
+        shuffle_scale_a16w4,
+        shuffle_scale_for_int4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
     from aiter.utility import fp4_utils
 
     token, model_dim, inter_dim, E, topk, act, doweight, out, ep, *rest = case
@@ -241,23 +431,70 @@ def _make_call(path_name, case):
         "a8w8_ptok": QuantType.per_Token,
         "a8w8_blockscale": QuantType.per_128x128,
         "a4w4": QuantType.per_1x32,
+        "a16w4": QuantType.per_1x32,
+        "a16wi4": QuantType.per_1x32,
+        "a8w4": QuantType.per_1x32,
+        "mxfp8": QuantType.per_1x32,
     }.get(path_name, QuantType.No)
 
-    def weight(shape):
+    def weight(shape, first):
         # Quantized one at a time, the bf16 copy freed: the GPU may be shared.
         # Scaled by 1/sqrt(K) so each GEMM keeps values near 1: unscaled, the fp16
         # outputs reach the fp16 limit, and whether a sum overflows then depends on
         # the order of the GEMM2 atomics.
         w = torch.randn(shape, dtype=dtype, device=device) / shape[-1] ** 0.5
+        if weights == "mxfp8":
+            qt, scale = per_1x32_f8_scale_f8_quant(
+                w, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
+            qt = qt.view(shape)
+            del w
+            if options.get("std_shuffle"):
+                return shuffle_weight(qt, layout=(16, 16)), fp4_utils.e8m0_shuffle(
+                    scale
+                )
+            # as -q 9 builds them (tagging w1.gate_up_interleave), with gate and up
+            # interleaved for "interleave"
+            if not first:
+                return shuffle_weight_a16w4(qt, 16, False), fp4_utils.e8m0_shuffle(
+                    scale
+                )
+            gate_up = options.get("interleave", False)
+            return shuffle_weight_a16w4(qt, 16, gate_up), shuffle_scale_a16w4(
+                scale, E, gate_up
+            )
         if weights == "i4":
             qt, scale = aiter.pertoken_quant(w, quant_dtype=dtypes.i8, dtypeMax=7)
             del w
             packed = shuffle_weight(qt, (16, 16), use_int4=True)
             return rearrange_4bit_elements(convert_int8_to_uint32_int4(packed)), scale
+        if weights == "wi4":
+            # -q 8: int4 in [-7, 7] per 32, packed two to a byte after the shuffle.
+            qt, scale = per_1x32_i4_quant(w)
+            del w
+            packed = pack_int8_to_packed_int4(
+                shuffle_weight(qt.view(dtypes.i8), (16, 16))
+            )
+            qt = packed.view(shape[0], shape[1], shape[2] // 2).view(dtypes.i4x2)
+            return (
+                qt,
+                shuffle_scale_for_int4(scale, group_size=32).view(-1).contiguous(),
+            )
         if weights in ("fp4", "fp4u"):
             qt, scale = aiter.get_torch_quant(quant_type)(w, quant_dtype=dtypes.fp4x2)
             qt = qt.view(*shape[:-1], shape[-1] // 2)
             del w
+            if (
+                weights == "fp4"
+                and path_name in ("a16w4", "a8w4")
+                and not options.get("std_shuffle")
+            ):
+                # as -q 6 and -q 7 build them (tagging w1.gate_up_interleave); gate and
+                # up interleaved for w1 with "interleave"
+                gate_up = options.get("interleave", False) and first
+                return shuffle_weight_a16w4(qt, 16, gate_up), shuffle_scale_a16w4(
+                    scale, E, gate_up
+                )
             if weights == "fp4":
                 qt = shuffle_weight(qt, layout=(16, 16))
             return qt, fp4_utils.e8m0_shuffle(scale)
@@ -273,8 +510,10 @@ def _make_call(path_name, case):
         del w
         return shuffle_weight(qt, layout=(16, 16)), scale
 
-    w1_qt, w1_scale = weight((E, inter_dim * 2, model_dim))
-    w2_qt, w2_scale = weight((E, model_dim, inter_dim))
+    w1_qt, w1_scale = weight(
+        (E, inter_dim * (1 if options.get("g1u0") else 2), model_dim), True
+    )
+    w2_qt, w2_scale = weight((E, model_dim, inter_dim), False)
     global_E = 2 * E if ep else E
     score = torch.randn((token, global_E), dtype=dtype, device=device)
     topk_weight, topk_ids = fused_topk(hidden, score, topk, True)
@@ -295,6 +534,20 @@ def _make_call(path_name, case):
         "w1_scale": w1_scale,
         "w2_scale": w2_scale,
     }
+    if options.get("q_a") in ("fp4", "fp8", "bf16"):
+        call["quant_dtype_a"] = {
+            "fp4": dtypes.fp4x2,
+            "fp8": dtypes.fp8,
+            "bf16": dtypes.bf16,
+        }[options["q_a"]]
+    if options.get("bias"):
+        # op_tests/test_moe_2stage.py: in [-1, 1], passed as fp32.
+        call["bias1"] = torch.randn((E, inter_dim * 2), device=device).clamp(-1, 1)
+        call["bias2"] = torch.randn((E, model_dim), device=device).clamp(-1, 1)
+    if "swiglu_limit" in options:
+        call["swiglu_limit"] = options["swiglu_limit"]
+    if options.get("interleave"):
+        call["gate_mode"] = "interleave"
     if variant is not None:
         _VARIANTS[variant](call)
     return call
@@ -402,7 +655,8 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
         parsed = kernel_names.try_parse(name)
         return parsed is None or parsed.family == kernel_names.CK2STAGES
 
-    src = src[src["kernelName1"].map(portable) & src["kernelName2"].map(portable)]
+    keep = src["kernelName1"].map(portable).astype(bool)
+    src = src[keep & src["kernelName2"].map(portable).astype(bool)]
     src["gfx"], src["cu_num"] = gfx, cu_num
     if w_dtype == "float8":
         fp8 = "torch.float8_e4m3fn" if gfx == "gfx950" else "torch.float8_e4m3fnuz"
@@ -508,10 +762,31 @@ def cases(path_name, synth_cases=(), gfx=None, cu_num=None):
 
 def _clear_dispatch_caches():
     import aiter.fused_moe as fm
-    from aiter.moev2.migration import a4w4, a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
+    from aiter.moev2.migration import (
+        a4w4,
+        a8w4,
+        a8w8_blockscale,
+        a8w8_pt,
+        a8w8_ptok,
+        a16w4,
+        a16w16,
+        a16wi4,
+        mxfp8,
+    )
 
     fm.get_2stage_cfgs.cache_clear()
-    for path in (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale, a4w4):
+    paths = (
+        a8w8_pt,
+        a16w16,
+        a8w8_ptok,
+        a8w8_blockscale,
+        a4w4,
+        a16w4,
+        a16wi4,
+        a8w4,
+        mxfp8,
+    )
+    for path in paths:
         for cache in (path.LOCAL.dispatch, path.LOCAL.resolve, path.LOCAL.relookup):
             cache.cache_clear()
 
@@ -553,6 +828,25 @@ def _v2_outcome(path_name, call):
 
 def run_case(path_name, case):
     """Return a problem string, or None when legacy and v2 agree."""
+    env = case[10].get("env", {}) if len(case) > 10 else {}
+    with mock.patch.dict(os.environ, env):
+        return _run_case(path_name, case)
+
+
+def _without_build_output(logs):
+    """A JIT build that fails is retried on every call, so its log is in both runs, not
+    only in the warm-up: compared by module, not by its time or compiler output (in
+    the order ninja ran the jobs)."""
+    stable = []
+    for level, msg in logs:
+        failed = re.search(r"failed jit build \[\w+\]", msg)
+        stable.append(
+            (level, failed.group(0) if failed else re.sub(r"cost [\d.]+s", "", msg))
+        )
+    return stable
+
+
+def _run_case(path_name, case):
     import torch
 
     import aiter.fused_moe as fm
@@ -568,7 +862,7 @@ def run_case(path_name, case):
     _clear_dispatch_caches()
     with moev2_mode(path_name), captured_logs() as v2_logs:
         v2_error = _raised(lambda: fm.fused_moe(**call))
-    if legacy_logs != v2_logs:
+    if _without_build_output(legacy_logs) != _without_build_output(v2_logs):
         return f"{case}: log lines differ\n    legacy: {legacy_logs}\n    v2:     {v2_logs}"
     expected = _RAISES.get(case_variant(case))
     if expected is not None:

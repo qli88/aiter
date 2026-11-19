@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Default ranking: the structure used when no tuned row applies (§3.6 of the plan).
+"""Default ranking: the vocabulary of the table and its checks (§3.6 of the plan).
+
+The table itself, and the rules it must follow, are in `ranking_table.py`.
 
 An `Entry` covers one class of problems, given by `match(...)`: set membership on named
 fields. Its `Region`s split the class by `when(...)`: integer thresholds and set
@@ -9,16 +11,8 @@ class no region covers. Each region lists structures best first; the first feasi
 wins. A region can instead name what the legacy code runs there (`legacy=`), for a
 branch not ported yet: its problems are declined back to the legacy code.
 
-The result never depends on the order of entries or regions: classes are disjoint, and so
-are the regions of one entry. `check_table` verifies that statically, together with dead
-regions, unknown structures and an always-feasible last structure in every list;
-`check_problems` verifies, over a set of problems (the dispatch snapshot key grid in CI),
-that every supported problem lands in exactly one entry and one region whose last
-structure is feasible (or that hands it to the legacy code), and that every region is
-reached.
-
-Each entry is a branch of the legacy `get_2stage_cfgs` default path, translated 1:1 with
-its full condition.
+`check_table` checks the table statically; `check_problems` and `dead_lists` check it
+over a set of problems (the dispatch snapshot key grid in CI).
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See
@@ -34,11 +28,17 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
+from aiter.ops.flydsl.moe_common import GateMode
 
 from ..problem import FrozenMap
 from ..segments.base import Segment
-from ..segments.defaults import BLOCK_SIZE_M, default_ksplit
-from ..segments.flydsl import _flydsl_mxfp4_layout_is_compatible
+from ..segments.ck_tile import (
+    cktile_interleaved_swiglu,
+    cktile_relu2,
+    cktile_split_k,
+    flydsl_mxfp4,
+)
+from ..segments.defaults import BLOCK_SIZE_M
 from . import overrides
 from .ops import Op
 
@@ -157,39 +157,35 @@ def _blockscale_1stage_kernel(p) -> bool:
     return has_kernel == 1
 
 
-def _flydsl_mxfp4(p) -> bool:
-    """The legacy `use_mxfp4_flydsl` for fp4/fp8 activations: the heuristic FlyDSL
-    fallback takes the problem."""
+def _mxmoe_fallback(p) -> bool:
+    """The legacy `_mxmoe_fallback_ok`: the heuristic MXMOE kernels take MXFP4 SiTUv2."""
+    s = p.shape
     return (
-        p.out_dtype in (dtypes.bf16, dtypes.fp16)
+        p.out_dtype == dtypes.bf16
+        and not p.is_ep
         and p.quant_type == QuantType.per_1x32
-        and (
-            p.activation.activation in (ActivationType.Swiglu, ActivationType.Situv2)
-            or overrides.flydsl_force()
-        )
-        and p.act_in.dtype in (dtypes.fp4x2, dtypes.fp8)
-        and p.w1.dtype in (dtypes.fp4x2, dtypes.fp8)
-        and _flydsl_mxfp4_layout_is_compatible(
-            p.act_in.dtype, p.gate_mode, p.layout.gate_up_interleave
-        )
+        and p.activation.activation == ActivationType.Situv2
+        and p.act_in.dtype == dtypes.fp4x2
+        and p.w1.dtype == dtypes.fp4x2
         and p.any_shuffled
         and p.layout.g1u1
         and "doweight_stage1" not in p.features
+        and p.gate_mode != GateMode.INTERLEAVE
+        and not {"bias1", "bias2"} & p.features
+        and p.layout.hidden_pad == 0
+        and p.layout.intermediate_pad == 0
+        and s.model_dim % 256 == 0
+        and s.inter_dim % 128 == 0
+        and aiter.is_mxfp4_moe_shape_supported(
+            s.experts, s.model_dim, s.inter_dim, s.topk
+        )
+        and overrides.mxmoe_fallback()
     )
 
 
-def _shuffled(p) -> bool:
-    """Either weight is marked `is_shuffled` (the legacy `is_shuffled`)."""
-    return p.any_shuffled
-
-
-def _split_k(p) -> bool:
-    """The default split-K of the problem is above 1."""
-    s = p.shape
-    return (
-        default_ksplit(p.quant_type, s.m, s.topk, s.experts, s.inter_dim, s.model_dim)
-        > 1
-    )
+def _padded(p) -> bool:
+    """The hidden or intermediate dimension carries padding."""
+    return bool(p.layout.hidden_pad or p.layout.intermediate_pad)
 
 
 # Named boolean predicates `when(...)` can test (`when(fmoe_1stage=True)`).
@@ -197,9 +193,12 @@ PREDICATES = {
     "fmoe_1stage": _fmoe_1stage,
     "inter_dim_128": _inter_dim_128,
     "blockscale_1stage_kernel": _blockscale_1stage_kernel,
-    "flydsl_mxfp4": _flydsl_mxfp4,
-    "shuffled": _shuffled,
-    "split_k": _split_k,
+    "flydsl_mxfp4": flydsl_mxfp4,
+    "mxmoe_fallback": _mxmoe_fallback,
+    "cktile_split_k": cktile_split_k,
+    "cktile_interleaved_swiglu": cktile_interleaved_swiglu,
+    "cktile_relu2": cktile_relu2,
+    "padded": _padded,
 }
 
 _GETTERS = {**MATCH_FIELDS, **SCALARS}
@@ -396,6 +395,10 @@ class Region:
     # Instead of `prefer`: what the legacy code runs here (not ported yet); the problems
     # of this region are declined back to it.
     legacy: str | None = None
+    # The legacy branch also needs `cfg is None`: with a tuned row kept under
+    # AITER_BYPASS_TUNE_CONFIG it falls through to the next branch, so the problem is
+    # declined.
+    untuned_only: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "prefer", _structures(self.prefer))
@@ -421,10 +424,11 @@ class Entry:
         if self.otherwise:
             yield f"{self.name}[otherwise]", self.otherwise, None
 
-    def region_for(self, p):
+    def region_for(self, p, tuned_row=False):
         """`(label, structures, legacy)` of the region `p` falls in.
 
         `otherwise` when no region holds (empty structures if the entry has none).
+        `tuned_row`: a tuned row is kept although AITER_BYPASS_TUNE_CONFIG ignores it.
         """
         hits = [r for r in self.regions if r.when.holds(p)]
         if len(hits) > 1:
@@ -432,136 +436,40 @@ class Entry:
                 f"{self.name}: overlapping regions {[str(r.when) for r in hits]}"
             )
         if hits:
-            return f"{self.name}[{hits[0].when}]", hits[0].prefer, hits[0].legacy
+            r = hits[0]
+            label = f"{self.name}[{r.when}]"
+            if tuned_row and r.untuned_only:
+                return label, (), "the next branch (a tuned row is bypassed)"
+            return label, r.prefer, r.legacy
         return f"{self.name}[otherwise]", self.otherwise, None
 
 
-FP8 = frozenset({torch.float8_e4m3fn, torch.float8_e4m3fnuz})
-B16 = frozenset({torch.bfloat16, torch.float16})
-CK_2STAGE = "sort | quant.a1 | ck.gemm1 | quant.inter | ck.gemm2"
-ASM_2STAGE = "sort | quant.a1 | asm.stage1 | quant.inter | ck.gemm2"
-FLYDSL_2STAGE = "sort | quant.a1 | flydsl.gemm1 | quant.inter | flydsl.gemm2"
+def _default_table():
+    from .ranking_table import RANKING
 
-RANKING = (
-    # get_2stage_cfgs without a tuned row: fused_moe_1stage_dict has no per-tensor
-    # entry (run_1stage stays False), and fp8 weights with an empty kernelName1 take
-    # the CK branch (`not kernelName1 and q_dtype_w in [..., fp8]`).
-    Entry(
-        "fp8_per_tensor",
-        match(quant_type=QuantType.per_Tensor, w1_dtype=FP8),
-        otherwise=[CK_2STAGE],
-    ),
-    # get_2stage_cfgs without a tuned row: bf16/fp16 weights with an empty kernelName1
-    # take the CK branch. The QuantType.No keys of fused_moe_1stage_dict (1-stage ASM
-    # `fmoe` under 256 tokens) are all g1u0, which no segment here runs (CK stage 1 is
-    # g1u1 only), so the local paths do not claim them.
-    Entry(
-        "a16w16",
-        match(quant_type=QuantType.No, w1_dtype=B16),
-        otherwise=[CK_2STAGE],
-    ),
-    # get_2stage_cfgs without a tuned row, per-token fp8 weights: keys in
-    # fused_moe_1stage_dict run 1-stage ASM `fmoe` when `token > 16 or inter_dim % 128`;
-    # everything else takes the CK branch (fp8 weights, empty kernelName1).
-    Entry(
-        "fp8_per_token",
-        match(quant_type=QuantType.per_Token, w1_dtype=FP8),
-        regions=[
-            Region(when(fmoe_1stage=True, m__gt=16), legacy="1-stage ASM fmoe"),
-            Region(
-                when(fmoe_1stage=True, m__le=16, inter_dim_128=False),
-                legacy="1-stage ASM fmoe",
-            ),
-        ],
-        otherwise=[CK_2STAGE],
-    ),
-    # get_2stage_cfgs without a tuned row, 1x128 fp8: keys in fused_moe_1stage_dict run
-    # 1-stage ASM `fmoe_fp8_blockscale_g1u1` when `token > 32`, `inter_dim % 128 == 0`
-    # and the kernel library has a kernel for the shape; everything else takes the CK
-    # branch, with the 1x128 block_m and split-K defaults. Legacy also requires no
-    # clamping swiglu_limit there, which holds for every key a local path takes.
-    Entry(
-        "fp8_blockscale",
-        match(quant_type=QuantType.per_1x128, w1_dtype=FP8),
-        regions=[
-            Region(
-                when(
-                    fmoe_1stage=True,
-                    m__gt=32,
-                    inter_dim_128=True,
-                    blockscale_1stage_kernel=True,
-                ),
-                legacy="1-stage ASM fmoe_fp8_blockscale_g1u1",
-            ),
-        ],
-        otherwise=[CK_2STAGE],
-    ),
-    # get_2stage_cfgs without a tuned row, int8 weights: per-token keys in
-    # fused_moe_1stage_dict run 1-stage ASM `fmoe` when `token > 32`; everything else
-    # takes the ASM branch (int8 is not in the CK branch's weight list), with block_m
-    # rounded up to a CK stage 2 size.
-    Entry(
-        "int8_per_token",
-        match(quant_type=QuantType.per_Token, w1_dtype=dtypes.i8),
-        regions=[Region(when(fmoe_1stage=True, m__gt=32), legacy="1-stage ASM fmoe")],
-        otherwise=[ASM_2STAGE],
-    ),
-    Entry(
-        "int8_per_tensor",
-        match(quant_type=QuantType.per_Tensor, w1_dtype=dtypes.i8),
-        otherwise=[ASM_2STAGE],
-    ),
-    # get_2stage_cfgs without a tuned row, int4 weights packed in uint32: no key of
-    # fused_moe_1stage_dict (its int4 key has the `torch.int4` dtype), and uint32
-    # weights with an empty kernelName1 take the CK branch.
-    Entry(
-        "int4_per_token",
-        match(quant_type=QuantType.per_Token, w1_dtype=torch.uint32),
-        otherwise=[CK_2STAGE],
-    ),
-    # get_2stage_cfgs without a tuned row, MXFP4 activations and weights, Silu or Gelu
-    # (its Swiglu, SiTUv2 and Relu2 branches come first and are not translated; no
-    # per_1x32 key runs 1-stage by default): the heuristic FlyDSL fallback when
-    # `use_mxfp4_flydsl` holds; else CK-Tile split-K for shuffled weights with a split-K
-    # above 1; else the CK branch (fp4 weights, empty kernelName1).
-    Entry(
-        "a4w4",
-        match(
-            quant_type=QuantType.per_1x32,
-            act_dtype=dtypes.fp4x2,
-            w1_dtype=dtypes.fp4x2,
-            activation={"silu", "gelu"},
-        ),
-        regions=[
-            Region(when(flydsl_mxfp4=True), prefer=[FLYDSL_2STAGE]),
-            Region(
-                when(flydsl_mxfp4=False, shuffled=True, split_k=True),
-                legacy="CK-Tile split-K MXFP4",
-            ),
-        ],
-        otherwise=[CK_2STAGE],
-    ),
-)
+    return RANKING
 
 
-def entry_for(p, table=RANKING):
+def entry_for(p, table=None):
+    table = _default_table() if table is None else table
     hits = [e for e in table if e.match.holds(p)]
     if len(hits) > 1:
         raise RuntimeError(f"overlapping ranking entries {[e.name for e in hits]}")
     return hits[0] if hits else None
 
 
-def best(problem, plans, table=RANKING):
+def best(problem, plans, table=None, tuned_row=False):
     """`(label, plan, legacy)` for `problem`'s region, or None when no entry applies.
 
     `plan`: the first feasible structure of the region, from `plans` (the feasible
     segment tuples), None if none is; `label` names the entry and region. A region that
-    hands the problem to the legacy code gives `(label, None, legacy)`.
+    hands the problem to the legacy code gives `(label, None, legacy)`. `tuned_row`: see
+    `Entry.region_for`.
     """
     entry = entry_for(problem, table)
     if entry is None:
         return None
-    label, prefer, legacy = entry.region_for(problem)
+    label, prefer, legacy = entry.region_for(problem, tuned_row)
     if legacy is not None:
         return label, None, legacy
     by_names = {tuple(s.name for s in plan): plan for plan in plans}
@@ -646,7 +554,7 @@ def check_table(table, segments) -> list:
     return errors
 
 
-def check_problems(problems, paths, table=RANKING):
+def check_problems(problems, paths, table=None):
     """`(errors, hits)` over `(label, problem)` pairs.
 
     A problem is supported by a path (with `takes` and `segments`) when the path takes it
@@ -656,6 +564,7 @@ def check_problems(problems, paths, table=RANKING):
     """
     from .resolver import feasible_plans
 
+    table = _default_table() if table is None else table
     errors, hits = [], Counter()
     for label, p in problems:
         for path in paths:
@@ -691,8 +600,9 @@ def check_problems(problems, paths, table=RANKING):
     return errors, hits
 
 
-def dead_lists(hits, table=RANKING) -> list:
+def dead_lists(hits, table=None) -> list:
     """Regions (and non-empty `otherwise` lists) no supported problem reached."""
+    table = _default_table() if table is None else table
     return [
         f"{label}: dead, no supported problem lands here"
         for e in table

@@ -9,7 +9,9 @@ A key is the full argument set of one `get_2stage_cfgs` call, built the way
   variants (`base`, `ep`, `unshuffled`);
 - `fhmoe`: one key per row of the dedicated FHMoE table (`config_file=` path);
 - `grid`: the quant combinations found in any tuned table (fp8 mapped to the arch's
-  fp8), times `GRID_SHAPES`, times `GRID_M`, in the `base` and `ep` variants.
+  fp8), times `GRID_SHAPES`, times `GRID_M`, in the `base` and `ep` variants; the
+  `per_1x32` combinations also on `MXFP4_SHAPES` and in the `MXFP4_VARIANTS`, for
+  `MXFP4_VARIANT_M`.
 
 The `base` tuned and grid keys of the quant types in `FEATURE_QUANT_TYPES` also come in
 feature variants (`feature_keys`): the same call with one more `get_2stage_cfgs` feature
@@ -81,12 +83,30 @@ EXTRA_COMBOS = (
         True,
         True,
     ),
+    # bf16 into MXFP4 SiTUv2 with routed weights in stage 1: not FlyDSL, CK-Tile split-K.
+    (
+        "Situv2",
+        "bfloat16",
+        "bfloat16",
+        "float4_e2m1fn_x2",
+        "per_1x32",
+        True,
+        True,
+    ),
 )
 
 TUNED_VARIANTS = ("base", "ep", "unshuffled")
 GRID_VARIANTS = ("base", "ep")
 # Quant types whose keys get the feature variants; a v2 path adds its quant type.
 FEATURE_QUANT_TYPES = ("per_Tensor", "No", "per_Token", "per_1x128", "per_1x32")
+# Call features only the per_1x32 branches read: per-expert bias, gate/up interleaved
+# (`w1.gate_up_interleave=True`), separated and tagged so (`w1.gate_up_interleave=False`,
+# as `shuffle_weight_a16w4` leaves it), hidden and intermediate padding (2880 -> 3072).
+MXFP4_VARIANTS = ("bias", "interleave", "standard", "pad")
+MXFP4_VARIANT_M = (1, 256, 512, 2048, 4096, 16384)
+MXFP4_PADS = (192, 192)
+# per_1x32 only: inter_dim 128- but not 256-aligned, where FlyDSL takes over from CK-Tile.
+MXFP4_SHAPES = ((4096, 384, 128, 8),)  # Qwen3-235B, TP4
 
 _FP8_NAMES = ("float8_e4m3fn", "float8_e4m3fnuz")
 
@@ -164,15 +184,18 @@ def _variant_kwargs(variant, activation):
     from aiter.ops.flydsl.moe_common import GateMode
 
     shuffled = variant != "unshuffled"
+    interleave = variant == "interleave"
     return {
         "is_shuffled": shuffled,
-        "gate_mode": GateMode.SEPARATED,
+        "gate_mode": GateMode.INTERLEAVE if interleave else GateMode.SEPARATED,
         "is_ep": variant == "ep",
-        "has_stage1_bias": False,
-        "has_stage2_bias": False,
+        "has_stage1_bias": variant == "bias",
+        "has_stage2_bias": variant == "bias",
         **_activation_kwargs(activation),
         "opus_weights_shuffled": shuffled,
-        "gate_up_interleave": None,
+        "gate_up_interleave": (
+            True if interleave else False if variant == "standard" else None
+        ),
     }
 
 
@@ -305,13 +328,22 @@ def grid_combos(arch_fp8, table=None):
 
 
 def grid_keys(arch_fp8, table=None):
+    from aiter import QuantType
+
     keys = []
     for combo in grid_combos(arch_fp8, table):
-        for model_dim, inter_dim, expert, topk in GRID_SHAPES:
+        mxfp4 = combo[4] == QuantType.per_1x32
+        shapes = GRID_SHAPES + (MXFP4_SHAPES if mxfp4 else ())
+        for model_dim, inter_dim, expert, topk in shapes:
             for token in GRID_M:
+                shape = (token, model_dim, inter_dim, expert, topk)
                 for variant in GRID_VARIANTS:
-                    shape = (token, model_dim, inter_dim, expert, topk)
                     keys.append(_make_key("grid", variant, shape, combo))
+                if not mxfp4 or token not in MXFP4_VARIANT_M:
+                    continue
+                for variant in MXFP4_VARIANTS:
+                    padded = (*combo[:-1], MXFP4_PADS) if variant == "pad" else combo
+                    keys.append(_make_key("grid", variant, shape, padded))
     return keys
 
 

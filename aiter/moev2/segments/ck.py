@@ -216,9 +216,40 @@ def a4w4_caps():
     )
 
 
+def a8w4_caps():
+    """mxfp8 activations into MXFP4 weights, as the a8w4 path runs them: gfx950, gate
+    and up separated."""
+    from .mxfp4 import a8w4_caps
+
+    return tuple(
+        replace(
+            cap,
+            gate_mode=frozenset({"separated"}),
+            features=cap.features | {"doweight_stage1"},
+        )
+        for cap in a8w4_caps()
+    )
+
+
+def mxfp8_caps():
+    """mxfp8 activations and weights, gate and up separated: legacy's CK branch takes
+    them, though `gen_instances.py` builds no f8 1x32 instance ahead of time."""
+    from .mxfp4 import mxfp8_caps
+
+    return tuple(
+        replace(
+            cap,
+            gate_mode=frozenset({"separated"}),
+            features=cap.features | {"doweight_stage1"},
+        )
+        for cap in mxfp8_caps()
+    )
+
+
 def ck_2stage_caps():
     """The `gen_instances.py` build list: f8 and i8 (and f8 x i4) per-tensor/per-token,
-    f8 1x128, fp4 1x32, and unquantized f16/b16."""
+    f8 1x128, fp4 1x32 (fp4 or fp8 activations), and unquantized f16/b16; and the f8
+    1x32 calls legacy hands the CK branch."""
     return (
         a8w8_per_tensor_caps()
         + a8w8_per_token_caps()
@@ -227,6 +258,8 @@ def ck_2stage_caps():
         + int8_per_token_caps()
         + int4_per_token_caps()
         + a4w4_caps()
+        + a8w4_caps()
+        + mxfp8_caps()
         + a16w16_caps()
     )
 
