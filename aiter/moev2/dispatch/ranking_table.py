@@ -69,6 +69,11 @@ ASM_2STAGE = "sort | quant.a1 | asm.stage1 | quant.inter | ck.gemm2"
 FLYDSL_2STAGE = "sort | quant.a1 | flydsl.gemm1 | quant.inter | flydsl.gemm2"
 MXMOE_2STAGE = "sort.aux | quant.a1 | mxmoe.gemm1 | mxmoe.gemm2"
 CKTILE_2STAGE = "sort | quant.a1 | cktile.gemm1 | quant.inter | cktile.gemm2"
+ASM_1STAGE = "sort | asm.fmoe_1stage"
+# The legacy 2-stage branches of g1u0 weights: their stage 1 kernels read `w1` as gate
+# and up (todo 5.3).
+CK_G1U0 = "CK 2-stage g1u0"
+ASM_G1U0 = "ASM stage 1 + CK stage 2 g1u0"
 
 RANKING = (
     # get_2stage_cfgs without a tuned row: fused_moe_1stage_dict has no per-tensor
@@ -80,13 +85,22 @@ RANKING = (
         otherwise=[CK_2STAGE],
     ),
     # get_2stage_cfgs without a tuned row: bf16/fp16 weights with an empty kernelName1
-    # take the CK branch. The QuantType.No keys of fused_moe_1stage_dict (1-stage ASM
-    # `fmoe` under 256 tokens) are all g1u0, which no segment here runs (CK stage 1 is
-    # g1u1 only), so the local paths do not claim them.
+    # take the CK branch. The QuantType.No keys of fused_moe_1stage_dict are all g1u0.
     Entry(
         "a16w16",
-        match(quant_type=QuantType.No, w1_dtype=B16),
+        match(quant_type=QuantType.No, w1_dtype=B16, g1u1=True),
         otherwise=[CK_2STAGE],
+    ),
+    # g1u0: keys in fused_moe_1stage_dict (gfx942, Silu) run 1-stage ASM `fmoe` when
+    # `token < 256`; everything else takes the CK branch (no segment runs g1u0 there,
+    # so the other keys have no feasible plan and are declined).
+    Entry(
+        "a16w16_g1u0",
+        match(quant_type=QuantType.No, w1_dtype=B16, g1u1=False),
+        regions=[
+            Region(when(fmoe_1stage=True, m__lt=256), prefer=[ASM_1STAGE]),
+            Region(when(fmoe_1stage=True, m__ge=256), legacy=CK_G1U0),
+        ],
     ),
     # get_2stage_cfgs without a tuned row, per-token fp8 weights: keys in
     # fused_moe_1stage_dict run 1-stage ASM `fmoe` when `token > 16 or inter_dim % 128`;
@@ -95,10 +109,10 @@ RANKING = (
         "fp8_per_token",
         match(quant_type=QuantType.per_Token, w1_dtype=FP8),
         regions=[
-            Region(when(fmoe_1stage=True, m__gt=16), legacy="1-stage ASM fmoe"),
+            Region(when(fmoe_1stage=True, m__gt=16), prefer=[ASM_1STAGE]),
             Region(
                 when(fmoe_1stage=True, m__le=16, inter_dim_128=False),
-                legacy="1-stage ASM fmoe",
+                prefer=[ASM_1STAGE],
             ),
         ],
         otherwise=[CK_2STAGE],
@@ -119,7 +133,7 @@ RANKING = (
                     inter_dim_128=True,
                     blockscale_1stage_kernel=True,
                 ),
-                legacy="1-stage ASM fmoe_fp8_blockscale_g1u1",
+                prefer=[ASM_1STAGE],
             ),
         ],
         otherwise=[CK_2STAGE],
@@ -130,9 +144,20 @@ RANKING = (
     # rounded up to a CK stage 2 size.
     Entry(
         "int8_per_token",
-        match(quant_type=QuantType.per_Token, w1_dtype=dtypes.i8),
-        regions=[Region(when(fmoe_1stage=True, m__gt=32), legacy="1-stage ASM fmoe")],
+        match(quant_type=QuantType.per_Token, w1_dtype=dtypes.i8, g1u1=True),
+        regions=[Region(when(fmoe_1stage=True, m__gt=32), prefer=[ASM_1STAGE])],
         otherwise=[ASM_2STAGE],
+    ),
+    # g1u0: keys in fused_moe_1stage_dict (gfx942, Silu and Gelu) run 1-stage ASM
+    # `fmoe_int8_g1u0` when `token > 32`; everything else takes the ASM branch (as for
+    # a16w16_g1u0, the other keys have no feasible plan).
+    Entry(
+        "int8_per_token_g1u0",
+        match(quant_type=QuantType.per_Token, w1_dtype=dtypes.i8, g1u1=False),
+        regions=[
+            Region(when(fmoe_1stage=True, m__gt=32), prefer=[ASM_1STAGE]),
+            Region(when(fmoe_1stage=True, m__le=32), legacy=ASM_G1U0),
+        ],
     ),
     Entry(
         "int8_per_tensor",

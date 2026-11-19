@@ -560,9 +560,11 @@ def check_problems(problems, paths, table=None):
     A problem is supported by a path (with `takes` and `segments`) when the path takes it
     and it has a rankable feasible plan there; it must land in exactly one entry and one
     region (or `otherwise`) whose last structure is feasible, or that hands it to the
-    legacy code. `hits` counts problems per region label, for `dead_lists`.
+    legacy code. A 1-stage plan its entry lists nowhere does not count: legacy reaches
+    1-stage there through tuned rows only. `hits` counts problems per region label, for
+    `dead_lists`.
     """
-    from .resolver import feasible_plans
+    from .resolver import _one_stage, feasible_plans
 
     table = _default_table() if table is None else table
     errors, hits = [], Counter()
@@ -579,6 +581,14 @@ def check_problems(problems, paths, table=None):
                 errors.append(f"{label}: lands in {len(entries)} entries {names}")
                 continue
             entry = entries[0]
+            listed = {s for _, structures, _ in entry.lists() for s in structures}
+            plans = [
+                plan
+                for plan in plans
+                if _one_stage(plan) is None or tuple(s.name for s in plan) in listed
+            ]
+            if not plans:
+                continue
             regions = [r for r in entry.regions if r.when.holds(p)]
             if len(regions) > 1:
                 shown = [str(r.when) for r in regions]

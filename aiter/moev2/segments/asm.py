@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""ASM stage-1 kernels (`_ZN5aiter...fmoe_stage1...E`).
+"""ASM kernels: stage 1 (`_ZN5aiter...fmoe_stage1...E`) and the 1-stage `fmoe` family.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
-`asm_stage1` moved here from aiter/fused_moe.py and is shared with the legacy MoE path
-(re-exported from aiter.fused_moe, run by legacy MoE calls): changes to it must keep
-legacy behavior (`python tests/moe_dispatch/snapshot.py --check`). Please coordinate any
-change in this module with the moev2 owners (@qli88). See aiter/moev2/README.md.
+`asm_stage1`, `fused_moe_1stage` and its activation helpers moved here from
+aiter/fused_moe.py and are shared with the legacy MoE path (re-exported from
+aiter.fused_moe, run by legacy MoE calls): changes to them must keep legacy behavior
+(`python tests/moe_dispatch/snapshot.py --check`). Please coordinate any change in this
+module with the moev2 owners (@qli88). See aiter/moev2/README.md.
 """
 
 import functools
@@ -15,15 +16,17 @@ from dataclasses import replace
 import torch
 
 import aiter
-from aiter import ActivationType, QuantType, dtypes
+from aiter import ActivationType, QuantType, dtypes, mxfp4_moe_sort_fwd
+from aiter import get_hip_quant as get_quant
 from aiter.ops.moe_limits import normalize_swiglu_limit
 
 from ..dispatch import kernel_names
-from ..dispatch.buf import Buf
+from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
-from ..problem import ScaleSpec
+from ..execute.metadata import AsmMoeMode
+from ..problem import ScaleSpec, scale_spec
 from ..shapes import get_inter_dim
-from .base import Segment
+from .base import Cap, Segment
 from .ck import (
     a8w8_blockscale_caps,
     a8w8_per_tensor_caps,
@@ -31,6 +34,7 @@ from .ck import (
     int8_per_tensor_caps,
     int8_per_token_caps,
 )
+from .flydsl import _get_flydsl_moe_kernels
 
 
 def asm_stage1(
@@ -118,6 +122,238 @@ def asm_stage1(
     return out
 
 
+def fused_moe_1stage(
+    hidden_states,
+    w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+    w2,  # [expert(local_expert:EP), dim, inter_dim]
+    topk,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    moe_buf,
+    isG1U1,
+    block_size_M=32,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    xbf16=False,
+    kernelName: str = "",
+    # following for quant
+    q_dtype_a=None,
+    q_dtype_w=None,
+    w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    num_local_tokens: torch.Tensor | None = None,
+    M: int | None = None,
+    device=None,
+    doweight_stage1: bool | None = None,
+    flat: AsmMoeMode | int = AsmMoeMode.SORTED,
+    expert_mask: torch.Tensor | None = None,
+):
+    asm_mode = AsmMoeMode(flat)
+    if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
+        # pure bf16
+        aiter.fmoe(
+            moe_buf,
+            hidden_states,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+        )
+    elif quant_type == QuantType.per_Token and doweight_stage1 and isG1U1:
+        a8_type = w1.dtype
+        _, model_dim, _ = w2.shape
+
+        a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
+        a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
+        aiter.dynamic_per_token_scaled_quant(a8, hidden_states, a8_scale)
+
+        aiter.fmoe_g1u1_tkw1(
+            moe_buf,
+            a8,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+            a8_scale,
+            w1_scale,
+            w2_scale,
+            kernelName,
+            a2_scale,
+            activation,
+        )
+    else:
+        if xbf16:
+            # xquant happens inside the asm kernel for per_1x128
+            a1 = hidden_states
+            a1_scale = torch.empty(0, device="cuda")
+        else:
+            quant_func = get_quant(quant_type)
+            if hidden_states.dtype != q_dtype_a:
+                if quant_type == QuantType.per_1x128:
+                    quant_func = functools.partial(quant_func, transpose_scale=True)
+                a1, a1_scale = quant_func(
+                    hidden_states,
+                    scale=a1_scale,
+                    quant_dtype=q_dtype_a,
+                    num_rows=num_local_tokens,
+                )
+            else:
+                assert (
+                    a1_scale is not None or quant_type == QuantType.No
+                ), "a1_scale must be provided for quantized input for fused_moe"
+                a1 = hidden_states
+                if quant_type == QuantType.per_1x128:
+                    scale_t = torch.empty_like(a1_scale)
+                    aiter.partial_transpose(
+                        scale_t, a1_scale, num_rows=num_local_tokens
+                    )
+                    a1_scale = scale_t
+
+        token_num = hidden_states.shape[0]
+        E, model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
+        if quant_type == QuantType.per_1x32:
+            # FLAT per_1x32 kernels are always xbf16: X stays bf16 and is
+            # dynamic-quantized to MXFP4 inside the kernel, so there is no host
+            # activation e8m0 scale to pack. Only the (not-yet-enabled) non-flat
+            # pre-quantized fp4 path carries a host scale that needs sorting.
+            if not xbf16:
+                a1_scale = mxfp4_moe_sort_fwd(
+                    a1_scale,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token_num,
+                    cols=model_dim,
+                )
+            w1_scale = w1_scale.view(E, -1)
+            w2_scale = w2_scale.view(E, -1)
+
+        if quant_type == QuantType.per_1x128:
+            fmoe_func = functools.partial(
+                aiter.fmoe_fp8_blockscale_g1u1,
+                fc_scale_blkn=128,
+                fc_scale_blkk=128,
+                block_size_M=block_size_M,
+            )
+        elif isG1U1 and asm_mode is AsmMoeMode.POST_REDUCE:
+            # The by-name launcher lookup does not check the sorted tile size.
+            if int(block_size_M) != 256:
+                raise ValueError(
+                    f"{kernelName} needs block_size_M=256, got {block_size_M}"
+                )
+            if a2_scale is not None:
+                raise ValueError("Q256 does not support caller-provided hidden scales")
+            # The ASM stores one weighted BF16 row per token/topk slot.
+            # These partials are consumed once by the FP32 reduction.
+            covers_all_slots = expert_mask is None and num_local_tokens is None
+            partials = (torch.empty if covers_all_slots else torch.zeros)(
+                (token_num, topk, model_dim),
+                dtype=moe_buf.dtype,
+                device=moe_buf.device,
+            )
+            aiter.fmoe_g1u1(
+                partials.view(token_num, -1),
+                a1,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                a1_scale,
+                w1_scale,
+                w2_scale,
+                kernelName,
+                fc2_smooth_scale=None,
+                activation=activation,
+            )
+            _get_flydsl_moe_kernels()._run_moe_reduction(
+                partials, moe_buf, token_num, topk, model_dim, streaming_loads=True
+            )
+            return moe_buf
+        elif isG1U1:
+            fmoe_func = aiter.fmoe_g1u1
+        else:
+            aiter.fmoe_int8_g1u0(
+                moe_buf,
+                a1,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                a1_scale,
+                w1_scale,
+                w2_scale,
+                fc2_smooth_scale=None,
+                activation=activation,
+            )
+            return moe_buf
+
+        fmoe_func(
+            moe_buf,
+            a1,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+            a1_scale,
+            w1_scale,
+            w2_scale,
+            kernelName,
+            fc2_smooth_scale=None,
+            activation=activation,
+        )
+    return moe_buf
+
+
+# Itanium symbols encode the activation (`_silu_` / `_gelu_` / `_situv2_`).
+# SiLU and GELU are the same length, so swapping the tag keeps the mangled
+# name valid and names the twin kernel in the other activation's cfg map.
+_ASM_ACT_TAG = {
+    ActivationType.Silu: "_silu_",
+    ActivationType.Gelu: "_gelu_",
+    ActivationType.Situv2: "_situv2_",
+}
+
+
+def _retarget_asm_activation(kernel_name, activation):
+    """Point a 1-stage asm symbol at the kernel for `activation`.
+
+    A tuned row is stored under one activation. The act-type-disabled fallback
+    can hand that symbol to a different activation. SiLU/GELU twins share the
+    mangled length, so the tag is swapped in place. A length-changing tag is
+    dropped and the activation's own cfg map selects a kernel.
+    """
+    if not isinstance(kernel_name, str) or not kernel_name:
+        return kernel_name
+    want = _ASM_ACT_TAG.get(activation)
+    if want is None or want in kernel_name:
+        return kernel_name
+    for other in _ASM_ACT_TAG.values():
+        if other not in kernel_name:
+            continue
+        if len(other) == len(want):
+            return kernel_name.replace(other, want, 1)
+        return ""
+    return kernel_name
+
+
 def stage2_block_m(block_m):
     """Round a tuned block_m up to one CK stage 2 supports (16, 32, 64 or 128)."""
     # TODO: remove when stage2 support more size
@@ -135,12 +371,13 @@ class AsmStage1(Segment):
     @property
     def capabilities(self):
         # The kernel tables (`get_cfg` in asm_moe_2stage.cu): fp8 with or without
-        # doweight, int8 without; per-tensor runs as per-token.
+        # doweight, int8 without; per-tensor runs as per-token; g1u1 only.
         int8 = tuple(
             replace(cap, features=cap.features - {"doweight_stage1"})
             for cap in int8_per_tensor_caps() + int8_per_token_caps()
         )
-        return a8w8_per_tensor_caps() + a8w8_per_token_caps() + int8
+        caps = a8w8_per_tensor_caps() + a8w8_per_token_caps() + int8
+        return tuple(replace(cap, g1u1=frozenset({True})) for cap in caps)
 
     def reads(self, p):
         return (Buf("sorted", None), Buf("tokens", p.act_in))
@@ -232,3 +469,78 @@ class AsmStage1Cktile(AsmStage1):
         if flydsl_mxfp4(p) or cktile_branch(p, ksplit, tuned_row=True) is not None:
             return "a default MXFP4 branch takes the cktile_* row"
         return None
+
+
+def fmoe_1stage_caps():
+    """One `Cap` per key of the legacy `fused_moe_1stage_dict`: the formats 1-stage
+    `fmoe` runs, on the arch that lists them."""
+    from ..dispatch.ranking import fmoe_1stage_keys
+
+    caps = []
+    for arch in ("gfx942", "gfx950"):
+        for key in sorted(fmoe_1stage_keys(arch), key=str):
+            activation, quant_type, out_dtype, q_dtype_a, q_dtype_w, g1u1, doweight = (
+                key
+            )
+            weights = frozenset({scale_spec(quant_type, q_dtype_w)})
+            features = {"ep_mask", "num_local_tokens", "act_scales", "a1_scale"}
+            if doweight:
+                features.add("doweight_stage1")
+            caps.append(
+                Cap(
+                    arch=frozenset({arch}),
+                    act_in=frozenset({scale_spec(quant_type, q_dtype_a)}),
+                    w1=weights,
+                    w2=weights,
+                    out_dtype=frozenset({out_dtype}),
+                    activation=frozenset({activation.name.lower()}),
+                    gate_mode=frozenset({"separated"}),
+                    g1u1=frozenset({g1u1}),
+                    features=frozenset(features),
+                )
+            )
+    return tuple(caps)
+
+
+class AsmFmoe1Stage(Segment):
+    """1-stage ASM `fmoe` (`fused_moe_1stage`): the activation quant, both GEMMs and the
+    weighted sum in one launch, into the sort's output buffer."""
+
+    name = "asm.fmoe_1stage"
+    prefixes = (kernel_names.ASM,)
+    covers = (Op.QUANT_A1, Op.REDUCE)
+
+    @property
+    def capabilities(self):
+        return fmoe_1stage_caps()
+
+    def owns(self, kernel) -> bool:
+        return super().owns(kernel) and kernel.stage is None
+
+    def reads(self, p):
+        # The plain sort, or the FLAT pass-through for FLAT rows.
+        return (Buf("sorted", None, frozenset({"default", "unsorted"})), CALL_INPUT)
+
+    def produces(self, p, params):
+        return Buf("out", ScaleSpec(p.out_dtype))
+
+    @staticmethod
+    def default_xbf16(p) -> bool:
+        """Legacy's default `xbf16`: the gfx950 1x128 kernels under AITER_XBFLOAT16=1."""
+        from ..dispatch import overrides
+
+        return (
+            p.quant_type == QuantType.per_1x128
+            and p.arch == "gfx950"
+            and overrides.xbf16()
+        )
+
+    def build(self, p, params):
+        return functools.partial(
+            fused_moe_1stage,
+            kernelName=params.get("kernel", ""),
+            activation=p.activation.activation,
+            quant_type=p.quant_type,
+            xbf16=params.get("xbf16", False),
+            flat=params.get("flat", 0),
+        )

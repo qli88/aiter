@@ -17,6 +17,7 @@ aiter/moev2/README.md.
 """
 
 import logging
+import math
 from dataclasses import dataclass
 
 from aiter import ActivationType, QuantType, dtypes, logger
@@ -25,9 +26,10 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.moe_limits import normalize_swiglu_limit
 
 from ..execute.metadata import AsmMoeMode, MOEMetadata
-from ..segments.asm import stage2_block_m
+from ..segments.asm import _retarget_asm_activation, stage2_block_m
 from ..segments.base import NO_OPTIONS, Params
 from ..segments.ck import _require_shuffled_gfx950_fp8
 from ..segments.defaults import (
@@ -219,15 +221,47 @@ def _discards_post_reduction(problem, row) -> bool:
     )
 
 
+def _silu_limit_1stage(problem) -> bool:
+    """Legacy `_fused_moe_impl` raises for a 1-stage plan with a finite SiLU limit."""
+    limit = problem.activation.swiglu_limit
+    return (
+        problem.activation.activation == ActivationType.Silu
+        and limit not in (None, 0, math.inf)
+        and normalize_swiglu_limit(limit) is not None
+    )
+
+
 def match_row(plans, row):
     """The plan structure that runs tuned `row`, or a decline reason (str)."""
-    if row.get("run_1stage", False):
-        return "1-stage tuned row"
     if row.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE:
         return "post-reduction tuned row"
     k1 = _owned_kernel(row.get("kernelName1", ""))
     if isinstance(k1, str):
         return k1
+    if row.get("run_1stage", False):
+        if k1 is None or not _plain_asm_1stage_row(row):
+            return (
+                f"1-stage row with kernelName1={k1}, "
+                f"kernelName2={row.get('kernelName2', '')!r}"
+            )
+        try:
+            mode = AsmMoeMode(int(row.get("flat", AsmMoeMode.SORTED)))
+        except (TypeError, ValueError):  # legacy raises on the cell
+            return f"1-stage row with flat={row.get('flat')!r}"
+        try:
+            int(row.get("xbf16", 0))
+        except (TypeError, ValueError):  # legacy raises on the cell
+            return f"1-stage row with xbf16={row.get('xbf16')!r}"
+        flat = not mode.requires_host_sort
+        for structure in plans:
+            one_stage = _one_stage(structure)
+            if (
+                one_stage is not None
+                and one_stage.owns(k1)
+                and getattr(structure[0], "flat", False) == flat
+            ):
+                return structure
+        return f"no segment runs 1-stage {k1}{' (FLAT)' if flat else ''}"
     if k1 is not None and k1.family == kernel_names.IMPL:
         for structure in plans:
             if len(structure) == 1 and structure[0].owns(k1):
@@ -242,6 +276,52 @@ def match_row(plans, row):
         if gemm1 and gemm2 and gemm1[0].owns(k1) and gemm2[0].owns(k2):
             return structure
     return f"no segments run kernelName1={k1}, kernelName2={k2}"
+
+
+def _one_stage(structure):
+    """The segment of `structure` that runs both GEMMs in one launch, or None."""
+    if len(structure) == 1:
+        return None
+    return next(
+        (s for s in structure if s.covers[0] <= Op.GEMM1 and s.covers[1] >= Op.GEMM2),
+        None,
+    )
+
+
+def _one_stage_plan(
+    problem,
+    structure,
+    source,
+    kernelName1,
+    block_m,
+    ksplit,
+    xbf16,
+    run_1stage=True,
+    flat=AsmMoeMode.SORTED,
+):
+    """The plan and the legacy `fused_moe_1stage` metadata of a 1-stage structure.
+    `run_1stage`: the tuned row's value as legacy passes it on."""
+    one_stage = _one_stage(structure)
+    params = Params(kernel=kernelName1, xbf16=xbf16, flat=flat)
+    choices = tuple(
+        SegmentChoice(segment, params if segment is one_stage else Params())
+        for segment in structure
+    )
+    plan = MoePlan(
+        choices,
+        source,
+        Params(block_m=block_m, ksplit=ksplit),
+        tuple(c.segment.produces(problem, c.params) for c in choices[:-1]),
+    )
+    metadata = MOEMetadata(
+        one_stage.build(problem, params),
+        None,
+        block_m,
+        ksplit,
+        run_1stage,
+        flat=flat,
+    )
+    return plan, metadata
 
 
 def _two_stage_plan(
@@ -485,11 +565,13 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
             return declined(f"ranking {region}: no listed structure is feasible")
         kernelName1 = ""
         kernelName2 = ""
-        run_1stage = False
-        run_1stage_xbf16 = False
+        one_stage = _one_stage(structure)
+        run_1stage = one_stage is not None
+        run_1stage_xbf16 = run_1stage and one_stage.default_xbf16(problem)
+        flat = AsmMoeMode.SORTED
         dims = (q_type, s.m, s.topk, s.experts, s.inter_dim, s.model_dim)
-        block_m = default_block_m(*dims)
-        ksplit = default_ksplit(*dims)
+        block_m = BLOCK_SIZE_M if run_1stage else default_block_m(*dims)
+        ksplit = 0 if run_1stage else default_ksplit(*dims)
         use_non_temporal_load = use_nt(s.m, s.topk, s.experts)
         logs.append(
             (
@@ -524,6 +606,24 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        if run_1stage:
+            activation = problem.activation.activation
+            retargeted = _retarget_asm_activation(kernelName1, activation)
+            if retargeted != kernelName1:
+                message = (
+                    f"[fused_moe] 1-stage kernel {kernelName1!r} is for a "
+                    f"different activation; using {retargeted!r} for {activation}"
+                )
+                logs.append((INFO, message))
+                kernelName1 = retargeted
+        if "xbf16" in cfg:
+            run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
+        else:
+            run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
+        if "flat" in cfg:
+            flat = AsmMoeMode(int(cfg["flat"])) if run_1stage else AsmMoeMode.SORTED
+        else:
+            flat = AsmMoeMode.SORTED
         if not problem.any_shuffled and not run_1stage:
             message = (
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
@@ -532,6 +632,30 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
             )
             logs.append((WARNING, message))
         source = "tuned"
+    if run_1stage:
+        if _silu_limit_1stage(problem):
+            return declined("1-stage plan with a SiLU limit (legacy raises)")
+        tag = f"({kernelName1=}, {kernelName2=})"
+        xbf16 = " xbf16" if run_1stage_xbf16 else ""
+        logs.append(
+            (
+                INFO,
+                f"[fused_moe] using 1stage{xbf16} {'default' if cfg is None else tag} for {keys} ",
+            )
+        )
+        plan, metadata = _one_stage_plan(
+            problem,
+            structure,
+            source,
+            kernelName1,
+            block_m,
+            ksplit,
+            run_1stage_xbf16,
+            run_1stage,
+            flat,
+        )
+        note(f"selected {plan.describe()}")
+        return Resolution(plan, metadata, tuple(logs), explain=tuple(explain or ()))
     gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
     gemm2 = next(s for s in structure if s.covers[0] == Op.GEMM2)
     kernelName2 = gemm2.stage2_kernel(problem, kernelName1, kernelName2)

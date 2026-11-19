@@ -12,12 +12,14 @@ weights), CK 2-stage (Silu and SiTUv2 otherwise, which ignores the padding), or 
 FlyDSL, MXMOE or Opus row (FlyDSL, layout-v2, Opus or CK-Tile stage 2), or a tuned row
 with a `cktile_*` kernelName1, which legacy runs as ASM stage 1 under that name (Opus or
 CK-Tile stage 2) when no default MXFP4 branch takes it; legacy discards Opus rows for
-weights not both preshuffled, with expert_mask or a stage 2 bias, and MXMOE rows with
-expert_mask. Interleaved calls while the gfx1250 grouped path is enabled
-(AITER_USE_GROUPED_GEMM), interleaved keys outside the FlyDSL heuristic and the CK-Tile
-interleaved Swiglu branch, the padded CK default, Opus rows with padding, `cktile_*`
-rows with bias or a FlyDSL stage 2, and any other tuned row are declined back to the
-legacy code.
+weights not both preshuffled, with expert_mask or a stage 2 bias, and MXMOE rows under
+EP that are BM16, not SiTUv2, or without a layout GEMM2. Interleaved keys outside the
+FlyDSL heuristic and the CK-Tile interleaved Swiglu branch, the padded CK default, Opus
+rows with padding, `cktile_*` rows with bias or a FlyDSL stage 2, and any other tuned row
+are declined back to the legacy code. Interleaved calls that legacy's grouped gfx1250
+branch takes (a gfx1250 build, or AITER_USE_GROUPED_GEMM with gfx1250 named by the build
+variables; both weight scales set, and not expert_mask with `doweight_stage1`; todo
+5.26) are not claimed.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See
@@ -27,6 +29,7 @@ aiter/moev2/README.md.
 import os
 
 from aiter import ActivationType, QuantType, dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import paths
@@ -84,28 +87,9 @@ ACTIVATIONS = (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2
 GATE_MODES = (GateMode.SEPARATED, GateMode.INTERLEAVE)
 
 
-def _grouped_gfx1250_enabled() -> bool:
-    """Legacy hands interleaved a8w4 calls to `grouped_gemm_gfx1250_a8w4` before
-    dispatch; with these switches it may run there (off gfx1250 under arch overrides).
-    """
-    from aiter.ops.flydsl.grouped_moe_gfx1250 import _use_grouped_gemm_enabled
-
-    return (
-        _use_grouped_gemm_enabled()
-        and os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") != "1"
-    )
-
-
 def why_not(call):
     """Why this path does not claim the `fused_moe_` call, or None if it does."""
-    if (
-        GateMode(call["gate_mode"]) == GateMode.INTERLEAVE
-        and _grouped_gfx1250_enabled()
-    ):
-        return (
-            "interleaved gate/up with the gfx1250 grouped path (AITER_USE_GROUPED_GEMM)"
-        )
-    return local.why_not(
+    reason = local.why_not(
         call,
         (QuantType.per_1x32,),
         ARCHS,
@@ -117,6 +101,35 @@ def why_not(call):
         bias=True,
         act_params=True,
         pads=True,
+    )
+    if reason is None and _legacy_grouped_gfx1250(call):
+        reason = "interleaved gate/up on legacy's grouped gfx1250 path"
+    return reason
+
+
+def _legacy_grouped_gfx1250(call) -> bool:
+    """`grouped_gemm_gfx1250_a8w4` runs the call instead of returning None (its checks
+    before the launch, for a call `why_not` already accepted)."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    if GateMode(call["gate_mode"]) != GateMode.INTERLEAVE:
+        return False
+    if not grouped._use_grouped_gemm_enabled():
+        return False
+    if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
+        return False
+    if call["w1_scale"] is None or call["w2_scale"] is None:
+        return False
+    if call["expert_mask"] is not None and call["doweight_stage1"]:
+        return False
+    gfx_env = ";".join(
+        str(os.environ.get(k, "")).lower()
+        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
+    )
+    return (
+        get_gfx() in ("gfx1250", "gfx1250-strict")
+        or "gfx1250" in gfx_env
+        or os.environ.get("AITER_FORCE_GFX1250", "0") in grouped._TRUTHY_ENV
     )
 
 

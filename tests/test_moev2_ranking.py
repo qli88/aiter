@@ -216,6 +216,23 @@ def test_a_legacy_region_hands_its_problems_back(monkeypatch):
     assert res.declined == "ranking a[m<=64]: 1-stage ASM is not ported"
 
 
+def test_a_1stage_plan_only_tuned_rows_reach_is_not_ranked():
+    from aiter.moev2.dispatch import resolver
+    from aiter.moev2.migration import a16w4
+
+    args = (1, 7168, 256, 256, 8, dtypes.bf16, dtypes.bf16, dtypes.fp4x2)
+    args += (QuantType.per_1x32, True, ActivationType.Swiglu, False, 0, 0)
+    p = MoeProblem.from_legacy_key(
+        *args, has_activation_scales=True, arch="gfx950", cu_num=256
+    )
+    plans = ranking.rankable(resolver.feasible_plans(p, a16w4.SEGMENTS)[0])
+    assert {tuple(s.name for s in plan) for plan in plans} == {
+        ("sort", "asm.fmoe_1stage"),
+        ("sort.flat", "asm.fmoe_1stage"),
+    }
+    assert ranking.check_problems([("k", p)], [a16w4.PATH]) == ([], {})
+
+
 def test_overlapping_entries_fail():
     table = (
         Entry("a", PER_TENSOR, otherwise=[CK]),

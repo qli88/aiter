@@ -101,9 +101,18 @@ _A16W16_DEFAULT = (
 # Variants that do not depend on the quant format (no static per-tensor scales).
 _GENERIC_VARIANTS = ("output", "noncontiguous", "swiglu_limit_0", "swiglu_limit_inf")
 
-# Outside gfx950's default 1-stage ASM region (`token > 16 or inter_dim % 128`, bf16
-# output, Silu or Gelu, Silu only with doweight_stage1), which the path declines.
+# gfx950's default 1-stage ASM region is `token > 16 or inter_dim % 128` (bf16 output,
+# Silu or Gelu, Silu only with doweight_stage1); most cases are outside it.
 _A8W8_PTOK_DEFAULT = (
+    # Default 1-stage ASM `fmoe` (`fmoe_g1u1`, `fmoe_g1u1_tkw1` with doweight_stage1).
+    *((m, 4096, 384, 128, 8, "Silu", False, "bf16", False) for m in (64,)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (512,)),
+    *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False) for m in (300,)),
+    *((m, 4096, 320, 64, 4, "Silu", False, "bf16", False) for m in (8,)),
+    *((m, 2048, 256, 64, 8, "Silu", False, "bf16", True) for m in (256,)),
+    # Shipped gfx950 cu256 1-stage rows (`fmoe_g1u1`, `fmoe_g1u1_tkw1`).
+    *((m, 5120, 1536, 40, 8, "Silu", False, "bf16", False) for m in (4, 8)),
+    *((m, 5120, 1024, 128, 1, "Silu", True, "bf16", False) for m in (1, 16)),
     # fp16 shapes stay small: larger ones overflow, and where the infinities land
     # differs between two legacy runs (GEMM2 atomics).
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16)),
@@ -133,9 +142,21 @@ _A8W8_PTOK_DEFAULT = (
     (300, 4096, 512, 64, 4, "Gelu", True, "bf16", False, "fp8", _SWIGLU_0),
 )  # fmt: skip
 
-# Outside gfx950's default 1-stage ASM region (`token > 32`, bf16 output, no
-# doweight_stage1, a kernel for the shape); token <= 32 runs CK with split-K.
+# gfx950's default 1-stage ASM region is `token > 32` (bf16 output, no doweight_stage1,
+# `inter_dim % 128 == 0`, a kernel for the shape); token <= 32 runs CK with split-K.
+_XBF16 = {"env": {"AITER_XBFLOAT16": "1"}}
 _A8W8_BLOCKSCALE_DEFAULT = (
+    # Default 1-stage ASM `fmoe_fp8_blockscale_g1u1`, also its xbf16 variant.
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (512,)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (256,)),
+    *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True) for m in (512,)),
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False, "fp8", _XBF16) for m in (512,)),
+    # Shipped gfx950 cu256 1-stage rows, fp8 and xbf16 (`blockscaleBf16`) kernels.
+    *((m, 6144, 256, 257, 9, "Silu", False, "bf16", False) for m in (16,)),
+    *((m, 6144, 256, 257, 9, "Silu", False, "bf16", True) for m in (16,)),
+    *((m, 4096, 384, 128, 8, "Silu", False, "bf16", False) for m in (64,)),
+    *((m, 4096, 1024, 288, 8, "Silu", False, "bf16", False) for m in (2,)),
+    *((m, 2048, 128, 513, 11, "Silu", False, "bf16", False) for m in (512,)),
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 32)),
     # The shape's shipped gfx950 1-stage Silu rows (4 to 128 tokens) serve Gelu too.
     *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 2)),
@@ -151,6 +172,10 @@ _A8W8_BLOCKSCALE_DEFAULT = (
     *((16, 7168, 256, 256, 8, "Silu", False, "bf16", False, "fp8", {"variant": v})
       for v in _GENERIC_VARIANTS),
     (2, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "fp8", _SWIGLU_0),
+    # FLAT 1-stage rows (unsorted topk, in-kernel routing). Not with expert_mask, which
+    # the FLAT kernels ignore (todo 5.25).
+    *((m, 4096, 1024, 288, 8, "Silu", False, "bf16", False) for m in (4,)),
+    *((m, 2048, 512, 512, 10, "Silu", False, "bf16", False) for m in (1,)),
 )  # fmt: skip
 
 # gfx950: shapes of each shipped cu256 row family, untuned shapes (the FlyDSL heuristic on
@@ -220,6 +245,11 @@ _A4W4 = (
     *((m, 7168, 256, 256, 8, "Situv2", False, "bf16", True, "fp4", _FP4_A) for m in (1024,)),
     *((m, 4096, 512, 128, 8, "Situv2", False, "bf16", False, "fp4", _FP4_A) for m in (64,)),
     *((m, 4096, 512, 128, 8, "Situv2", False, "bf16", False, "fp4", _FP4_A_BIAS) for m in (64,)),
+    # FLAT 1-stage rows (unsorted topk, in-kernel routing). Not with expert_mask, which
+    # the FLAT kernels ignore (todo 5.25).
+    *((m, 8192, 256, 512, 10, "Silu", False, "bf16", False, "fp4") for m in (1,)),
+    *((m, 4096, 512, 256, 1, "Silu", False, "bf16", False, "fp4") for m in (8,)),
+    *((m, 4096, 512, 513, 11, "Silu", False, "bf16", False, "fp4") for m in (4,)),
 )  # fmt: skip
 
 _G1U0 = {"g1u0": True}
@@ -233,6 +263,11 @@ _A16W4 = (
     *((m, 6144, 768, 129, 5, "Swiglu", False, "bf16", False, "fp4") for m in (64,)),
     *((m, 6144, 768, 129, 5, "Swiglu", False, "bf16", False, "fp4", _BIAS) for m in (8,)),
     *((m, 3584, 512, 896, 16, "Situv2", False, "bf16", False, "fp4") for m in (16,)),
+    # Keys with tuned FLAT SiTUv2 1-stage rows (flat 1 and 2), which legacy discards on
+    # preshuffled weights; with expert_mask, legacy and v2 both raise (the a16w4 SiTUv2
+    # guard).
+    *((m, 3584, 384, 896, 16, "Situv2", False, "bf16", False, "fp4") for m in (1, 16)),
+    *((m, 3584, 384, 896, 16, "Situv2", False, "bf16", True, "fp4") for m in (16,)),
     # Untuned Swiglu: CK-Tile split-K; FlyDSL where CK-Tile's stage 2 is unsafe
     # (`inter_dim % 256`); not preshuffled, CK-Tile with split-K 2 (ROCM-25478); bias.
     *((m, 2048, 256, 64, 6, "Swiglu", False, "bf16", False, "fp4") for m in (5, 128)),

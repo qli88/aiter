@@ -63,6 +63,7 @@ from ..segments.sort import (
     _is_fused_decode_sort_quant_enabled,
 )
 from ..shapes import _is_row_major_2d, get_inter_dim
+from .metadata import AsmMoeMode
 from .output import (
     _return_output,
     _validate_output_buffer_metadata,
@@ -209,6 +210,68 @@ def _e8m0_view(w, scale):
         and scale.element_size() == 1
         else scale
     )
+
+
+def run_one_stage(c: Call, metadata, plan, q_dtype_a):
+    """Sort, then the 1-stage kernel: `_fused_moe_impl` with `metadata.run_1stage`."""
+    block_size_M = metadata.block_m if c.block_size_M is None else c.block_size_M
+    if block_size_M is not None:
+        block_size_M = int(block_size_M)
+    asm_mode = AsmMoeMode(metadata.flat)
+    assert asm_mode.requires_host_sort or get_gfx() in (
+        "gfx942",
+        "gfx950",
+    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    if not c["hidden_states"].is_contiguous():
+        c = replace(
+            c, args={**c.args, "hidden_states": c["hidden_states"].contiguous()}
+        )
+    sort = plan.segments[0].segment
+    hidden_states, w1, w2 = c["hidden_states"], c["w1"], c["w2"]
+    topk_ids = c["topk_ids"]
+    num_local_tokens = c["num_local_tokens"]
+    output = c["output"]
+    flat = {} if asm_mode.requires_host_sort else {"flat": asm_mode}
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = sort.run(
+        topk_ids,
+        c["topk_weight"],
+        c.global_E,
+        c.model_dim,
+        c.dtype,
+        block_size_M,
+        c["expert_mask"],
+        num_local_tokens,
+        c["moe_sorting_dispatch_policy"],
+        output if asm_mode.requires_host_sort else None,
+        **flat,
+    )
+    _stage1_call = functools.partial(
+        metadata.stage1,
+        hidden_states,
+        w1,
+        w2,
+        c.topk,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        c.isG1U1,
+        block_size_M,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=w1.dtype,
+        w1_scale=c["w1_scale"],
+        w2_scale=c["w2_scale"],
+        a1_scale=c["a1_scale"],
+        a2_scale=c["a2_scale"],
+        num_local_tokens=num_local_tokens,
+        M=c.M,
+        device=topk_ids.device,
+        doweight_stage1=c["doweight_stage1"],
+        expert_mask=c["expert_mask"],
+    )
+    hooks.record_kernel("stage1", _stage1_call)
+    return _return_output(_stage1_call(), output)
 
 
 def run_two_stage(c: Call, metadata, plan, q_dtype_a, after_sort=None):

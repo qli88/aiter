@@ -6,7 +6,7 @@ A local path supplies its segments and `takes(problem)`, the problems it runs (i
 segments may accept more: a CK segment serves several quant formats, each in its own
 path). `LocalDispatch` resolves each legacy dispatch key once, as the cached legacy
 `get_2stage_cfgs` does, and runs the plan with `executor.run_two_stage` (`run_mxfp4` for
-`per_1x32`).
+`per_1x32`, `run_one_stage` for a 1-stage plan, which has no second lookup).
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See
@@ -161,9 +161,8 @@ def why_not(
     _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
     if w1.shape[1] not in (inter_dim, 2 * inter_dim):
         return f"w1 {tuple(w1.shape)} does not match w2 {tuple(w2.shape)}"
-    # g1u0 stays on legacy unless the path runs it: CK stage 1 always reads w1 as gate
-    # and up, and the 1-stage ASM `fmoe` that legacy runs for some g1u0 keys is not
-    # ported.
+    # g1u0 stays on legacy unless the path runs it: CK and ASM stage 1 always read w1
+    # as gate and up, so only the 1-stage ASM `fmoe` keys have a plan.
     if not g1u0 and w1.shape[1] == inter_dim:
         return f"w1 {tuple(w1.shape)} is g1u0 (no separate up projection)"
     hidden_states = call["hidden_states"]
@@ -253,7 +252,12 @@ class LocalDispatch:
         declines.
         """
         first = self.peek(problem)
-        if first is None or first.plan is None or first.metadata.full_impl is not None:
+        if (
+            first is None
+            or first.plan is None
+            or first.metadata.full_impl is not None
+            or first.metadata.run_1stage
+        ):
             return None
         second = self.peek(_relookup_problem(problem, token))
         if second is None:
@@ -332,6 +336,10 @@ class LocalDispatch:
                     f"resolved backend requires block_m={block_m}"
                 )
         resolution, problem = dispatched
+        if resolution.metadata.run_1stage:
+            return executor.run_one_stage(
+                c, resolution.metadata, resolution.plan, q_dtype_a
+            )
         after_sort = None
         if problem is not None:
             after_sort = functools.partial(self.relookup, problem, token)

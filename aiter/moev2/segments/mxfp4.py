@@ -475,7 +475,10 @@ class FlydslGemm1Layout(_FlydslStage1):
         )
 
     def reads(self, p):
-        return (Buf("sorted", None, None), Buf("tokens", p.act_in))
+        return (
+            Buf("sorted", None, frozenset({"default", "aux_sorted"})),
+            Buf("tokens", p.act_in),
+        )
 
     def produces(self, p, params):
         # fp4 or fp8, as the GEMM2 name says.

@@ -97,7 +97,10 @@ class OpusGemm1Layout(_OpusStage1):
     covers = (Op.GEMM1, Op.QUANT_INTER)
 
     def reads(self, p):
-        return (Buf("sorted", None, None), Buf("tokens", p.act_in))
+        return (
+            Buf("sorted", None, frozenset({"default", "aux_sorted"})),
+            Buf("tokens", p.act_in),
+        )
 
     def produces(self, p, params):
         return Buf("inter", None, "v2_sorted")

@@ -14,9 +14,10 @@ tuned FlyDSL a16w4 row or `swiglu_mxfp4_bf16_cktile` row. The CK branch (gfx942 
 and SiTUv2 outside FlyDSL and CK-Tile), interleaved calls outside the CK-Tile
 interleaved branch (legacy runs FlyDSL kernels for separated weights there, todo 5.8),
 Relu2 with g1u1, bias or `doweight_stage1` (legacy raises), the alias rows outside the
-CK-Tile branches (ASM stage 1 + CK stage 2), 1-stage tuned rows legacy keeps (the ones
-it discards, v2 discards too) and any other tuned row are declined back to the legacy
-code.
+CK-Tile branches (ASM stage 1 + CK stage 2) and any other tuned row are declined back to
+the legacy code. Tuned Swiglu 1-stage rows (all FLAT) run 1-stage ASM `fmoe`; the SiTUv2
+ones never run: legacy discards them on preshuffled weights, as v2 does, and raises
+before the dispatch on unshuffled ones, which v2 declines.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See
@@ -27,10 +28,11 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import paths
+from ..segments.asm import AsmFmoe1Stage
 from ..segments.ck_tile import CktileGemm1, CktileGemm2, cktile_interleaved_swiglu
 from ..segments.mxfp4 import FlydslGemm1, FlydslGemm2, a16w4, mxfp4
 from ..segments.quant import QuantA1, QuantInter
-from ..segments.sort import Sort
+from ..segments.sort import Sort, SortFlat
 from ..shapes import get_inter_dim
 from . import local
 
@@ -38,12 +40,14 @@ NAME = "a16w4"
 ARCHS = ("gfx942", "gfx950")
 SEGMENTS = (
     Sort(),
+    SortFlat(),
     QuantA1(),
     CktileGemm1(),
     FlydslGemm1(),
     QuantInter(),
     CktileGemm2(),
     FlydslGemm2(),
+    AsmFmoe1Stage(),
 )
 
 ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)

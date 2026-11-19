@@ -7,12 +7,12 @@ imports it with its helpers: the backend comes from the same environment variabl
 (Opus by default, CK with AITER_USE_CK_MOE_SORTING=1, FlyDSL with
 AITER_USE_FLYDSL_MOE_SORTING=1), and it also runs the local topk ids, the auxiliary
 outputs (the adaptive sort) and FLAT's unsorted input. Segment `sort` runs the plain
-sort through it and segment `sort.aux` the auxiliary sort of the MXFP4 kernels;
-`hooks.set_sort_impl` replaces it there. `_fused_decode_sort_quant` is the decode sort
-fused with the MXFP4 activation quant. Its legacy gate
-`_is_fused_decode_sort_quant_enabled` stays in aiter/fused_moe.py, where tests patch
-its globals; v2 checks the copy here, which `hooks.disable_fused_decode_sort_quant`
-turns off.
+sort through it, segment `sort.aux` the auxiliary sort of the MXFP4 kernels and segment
+`sort.flat` the pass-through of the 1-stage FLAT kernels; `hooks.set_sort_impl` replaces
+it there. `_fused_decode_sort_quant` is the decode sort fused with the MXFP4 activation
+quant. Its legacy gate `_is_fused_decode_sort_quant_enabled` stays in
+aiter/fused_moe.py, where tests patch its globals; v2 checks the copy here, which
+`hooks.disable_fused_decode_sort_quant` turns off.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 `moe_sorting` and the helpers aiter.fused_moe imports from here are shared with the
@@ -651,6 +651,7 @@ def _empty_bf16(device):
 
 class Sort(Segment):
     name = "sort"
+    flat = False  # the FLAT pass-through (`SortFlat`)
     covers = (Op.SORT, Op.SORT)
     structure_params = frozenset({"block_m"})
     capabilities = (
@@ -746,4 +747,46 @@ class SortAux(Sort):
             output_aux=output_aux,
             output=output,
             **kwargs,
+        )
+
+
+class SortFlat(Sort):
+    """The FLAT pass-through: the 1-stage FLAT kernels route in the kernel, so the topk
+    ids and weights go in the sorted slots and `moe_buf` has 8 spare bytes. Like the
+    legacy FLAT sort, it drops `expert_mask` (todo 5.25); a CUDA `num_local_tokens`
+    goes in the `num_valid_ids` slot.
+    """
+
+    name = "sort.flat"
+    flat = True
+
+    def produces(self, p, params):
+        return Buf("sorted", None, "unsorted", block_m=params.get("block_m"))
+
+    def run(
+        self,
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size,
+        expert_mask,
+        num_local_tokens,
+        dispatch_policy,
+        output,
+        flat=AsmMoeMode.NO_SORT,
+    ):
+        return hooks.sort_impl(moe_sorting)(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            dispatch_policy,
+            flat=flat,
+            output=output,
         )
