@@ -37,7 +37,9 @@ def ranked_paths():
 
 
 def grid_problems(arch):
-    """`(label, MoeProblem)` for every snapshot key of `arch`; call in its simulation."""
+    """`(label, MoeProblem)` for every snapshot key of `arch`, and for the key as `fhmoe_`
+    dispatches it (the shared expert added, label ending in `|fhmoe`); call in its
+    simulation."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from aiter.moev2 import api
     from moe_dispatch import snapshot
@@ -49,6 +51,7 @@ def grid_problems(arch):
         except Exception:  # noqa: BLE001, S112 - key_checks.py reports these
             continue
         yield f"{arch} {key.label()}", problem
+        yield f"{arch} {key.label()}|fhmoe", api.fhmoe_problem(problem)
 
 
 def main(argv=None):

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Dispatch and execution shared by the local paths (one GPU, the `fused_moe_` entry).
+"""Dispatch and execution shared by the local paths (one GPU, the `fused_moe_` entry;
+FHMoE's `fhmoe_` adds its shared expert to the key with `fhmoe=True`).
 
 A local path supplies its segments and `takes(problem)`, the problems it runs (its
 segments may accept more: a CK segment serves several quant formats, each in its own
@@ -15,10 +16,11 @@ aiter/moev2/README.md.
 
 import functools
 import math
+import os
 from dataclasses import replace
 
 from aiter import ActivationType, QuantType, dtypes, logger, presorted_moe
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import api, paths
@@ -81,6 +83,11 @@ def activation_dtype(call):
     )
 
 
+def presort_registered() -> bool:
+    """The legacy code consumes a registered presort on every call; the paths do not."""
+    return getattr(presorted_moe._PRESORTED_MOE, "aux", None) is not None
+
+
 def why_not(
     call,
     quant_types,
@@ -115,8 +122,7 @@ def why_not(
         return "HERD routing (herd_topk)"
     if call["deterministic"]:
         return "deterministic=True"
-    # The legacy code consumes a registered presort on every call; the local paths do not.
-    if getattr(presorted_moe._PRESORTED_MOE, "aux", None) is not None:
+    if presort_registered():
         return "a registered presort"
     quant_type = QuantType(call["quant_type"])
     if quant_type not in quant_types:
@@ -179,6 +185,33 @@ def why_not(
     return None
 
 
+def legacy_grouped_gfx1250(call) -> bool:
+    """`grouped_gemm_gfx1250_a8w4` runs the call instead of returning None (its checks
+    before the launch, for a per_1x32 g1u1 call of fp8 activations into MXFP4 weights
+    with Silu, Swiglu or SiTUv2, or a call legacy rejects before that branch)."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    if GateMode(call["gate_mode"]) != GateMode.INTERLEAVE:
+        return False
+    if not grouped._use_grouped_gemm_enabled():
+        return False
+    if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
+        return False
+    if call["w1_scale"] is None or call["w2_scale"] is None:
+        return False
+    if call["expert_mask"] is not None and call["doweight_stage1"]:
+        return False
+    gfx_env = ";".join(
+        str(os.environ.get(k, "")).lower()
+        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
+    )
+    return (
+        get_gfx() in ("gfx1250", "gfx1250-strict")
+        or "gfx1250" in gfx_env
+        or os.environ.get("AITER_FORCE_GFX1250", "0") in grouped._TRUTHY_ENV
+    )
+
+
 def key_args_supported(
     problem,
     *,
@@ -186,12 +219,16 @@ def key_args_supported(
     gate_modes=SEPARATED,
     act_params=False,
     g1u0=False,
+    shared=None,
 ) -> bool:
     """False for keys with arguments or a layout the path does not support (see
-    `why_not`; bias and padding are left to the segments' `Cap`s)."""
+    `why_not`; bias and padding are left to the segments' `Cap`s). `shared`: the
+    placement of the shared expert the path runs (None: no shared expert)."""
     activation = problem.activation
+    placement = None if problem.shared is None else problem.shared.placement
     return (
-        (g1u0 or problem.layout.g1u1)
+        placement == shared
+        and (g1u0 or problem.layout.g1u1)
         and activation.kind in activations
         and problem.gate_mode in gate_modes
         and problem.inter is None
@@ -218,9 +255,13 @@ def _relookup_problem(problem, token):
 
 
 class LocalDispatch:
-    def __init__(self, segments, takes):
+    """`fhmoe`: the calls come from `fhmoe_` (the shared expert in the problem, the
+    selected block size enforced)."""
+
+    def __init__(self, segments, takes, fhmoe=False):
         self.segments = tuple(segments)
         self.takes = takes
+        self.fhmoe = fhmoe
         self.peek = tuned.cached(maxsize=2048)(self._peek)
         self.resolve = tuned.cached(maxsize=2048)(self._resolve)
         self.relookup = tuned.cached(maxsize=2048)(self._relookup)
@@ -266,17 +307,20 @@ class LocalDispatch:
             return f"the lookup after the sort declines ({second.declined})"
         return None
 
-    def _dispatch(self, args, kwargs_items, arch, cu_num, token, emit=True):
+    def _dispatch(self, args, kwargs_items, arch, cu_num, token=None, emit=True):
         """`(resolution, problem)` for a key, or None when not taken or declined.
 
-        `token` is the bucketed `hidden_states` row count. `problem` is None when no
-        second lookup follows (whole-graph plans). With `emit` False nothing is logged,
-        and a key whose resolution raises gives `_UNRESOLVED`.
+        `token` is the bucketed `hidden_states` row count; None for a lookup that no
+        call follows (the FHMoE capability checks). `problem` is None when no second
+        lookup follows (whole-graph plans). With `emit` False nothing is logged, and a
+        key whose resolution raises gives `_UNRESOLVED`.
         """
-        problem = api.problem_from_key(args, dict(kwargs_items), arch, cu_num)
+        problem = api.problem_from_key(
+            args, dict(kwargs_items), arch, cu_num, self.fhmoe
+        )
         if not self.takes(problem):
             return None
-        reason = self.relookup_decline(problem, token)
+        reason = None if token is None else self.relookup_decline(problem, token)
         if reason is not None:
             if emit and overrides.explain():
                 line = f"declined: {reason}; the legacy code runs this call"
@@ -291,10 +335,12 @@ class LocalDispatch:
             return primary, None
         return primary, problem
 
-    def run(self, call):
+    def run(self, call, q_dtype_a=None, config_file=None):
+        """`q_dtype_a`, `config_file`: as `api.dispatch_key` takes them."""
+        forced = (q_dtype_a, config_file)
         # A declined call goes back to legacy before the prologue copies anything.
         preview = executor.prologue(call, quant_remap, prepare=False)
-        args, kwargs, q_dtype_a = api.dispatch_key(preview)
+        args, kwargs, q_dtype_a = api.dispatch_key(preview, *forced)
         if executor.a16w4_unsupported(preview, q_dtype_a) is not None:
             # Legacy raises NotImplementedError before its dispatch.
             return paths.DECLINED
@@ -313,7 +359,7 @@ class LocalDispatch:
                 return paths.DECLINED
 
         c = executor.prologue(call, quant_remap)
-        args, kwargs, q_dtype_a = api.dispatch_key(c)
+        args, kwargs, q_dtype_a = api.dispatch_key(c, *forced)
         dispatched = self.dispatch(
             args, tuple(kwargs.items()), arch, cu_num, token, emit=True
         )
@@ -336,6 +382,15 @@ class LocalDispatch:
                     f"resolved backend requires block_m={block_m}"
                 )
         resolution, problem = dispatched
+        if (
+            self.fhmoe
+            and c.block_size_M is not None
+            and int(c.block_size_M) != int(resolution.metadata.block_m)
+        ):
+            raise ValueError(
+                f"FHMoE block_size_M={c.block_size_M} does not match the selected "
+                f"kernel block size {resolution.metadata.block_m}"
+            )
         if resolution.metadata.run_1stage:
             return executor.run_one_stage(
                 c, resolution.metadata, resolution.plan, q_dtype_a
@@ -432,7 +487,7 @@ class LocalDispatch:
     def _peek_key(self, args, kwargs, arch, cu_num, token):
         """A key's first resolution, with nothing emitted: DECLINED where `dispatch`
         declines the key, None where it raises."""
-        problem = api.problem_from_key(args, kwargs, arch, cu_num)
+        problem = api.problem_from_key(args, kwargs, arch, cu_num, self.fhmoe)
         if not self.takes(problem) or self.relookup_decline(problem, token):
             return paths.DECLINED
         first = self.peek(problem)
@@ -446,7 +501,7 @@ class LocalDispatch:
         Declines a key whose second lookup after the sort would raise or be declined,
         as `run` does.
         """
-        problem = api.problem_from_key(args, kwargs)
+        problem = api.problem_from_key(args, kwargs, fhmoe=self.fhmoe)
         if not self.takes(problem):
             return None
         if self.relookup_decline(problem, problem.shape.m) is not None:

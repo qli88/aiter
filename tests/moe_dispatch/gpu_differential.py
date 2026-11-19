@@ -387,6 +387,29 @@ _MXFP8 = (
     *((m, 2048, 256, 64, 6, "Silu", False, "bf16", True, "mxfp8", _STD) for m in (64,)),
 )  # fmt: skip
 
+# gfx950, FHMoE (calls with the shared expert, as op_tests/test_fhmoe.py builds them;
+# `E` counts the shared row, `topk` does not): options "interleave" (default True),
+# "clamp_shared", "block_size_M".
+_SEPARATED = {"interleave": False}
+_UNCLAMPED = {"clamp_shared": False}
+_FHMOE = (
+    # MXFP4 routed weights, the main table: fp8 activations into interleaved gate/up,
+    # fp4 into separated; the FlyDSL heuristic.
+    *((m, 256, 128, 9, 2, "Silu", False, "bf16", False, "fp4") for m in (4, 64)),
+    *((m, 256, 128, 9, 2, "Silu", False, "bf16", False, "fp4", _SEPARATED) for m in (4, 64)),
+    # DSV4 I384, the dedicated table: tuned token counts; beyond its last row, both raise.
+    *((m, 7168, 384, 385, 6, "Silu", False, "bf16", False, "fp4") for m in (1, 128, 2048, 4096)),
+    # MXFP8 routed weights: HY4 in the dedicated table (shared expert unclamped or
+    # clamped), another geometry on the main table.
+    *((m, 6144, 256, 257, 8, "Silu", False, "bf16", False, "mxfp8", _UNCLAMPED) for m in (4, 512)),
+    *((m, 6144, 256, 257, 8, "Silu", False, "bf16", False, "mxfp8") for m in (16,)),
+    *((m, 2048, 256, 65, 4, "Silu", False, "bf16", False, "mxfp8") for m in (8,)),
+    # Both raise: a block size other than the selected kernel's, an unclamped shared
+    # expert with MXFP4 routed weights.
+    (4, 256, 128, 9, 2, "Silu", False, "bf16", False, "fp4", {"block_size_M": 64}),
+    (4, 256, 128, 9, 2, "Silu", False, "bf16", False, "fp4", _UNCLAMPED),
+)  # fmt: skip
+
 _CASES = {
     "a8w8_pt": _A8W8_PT_DEFAULT,
     "a16w16": _A16W16_DEFAULT,
@@ -397,6 +420,7 @@ _CASES = {
     "a16wi4": _A16WI4,
     "a8w4": _A8W4,
     "mxfp8": _MXFP8,
+    "fhmoe": _FHMOE,
 }
 # Cases for one (gfx, cu_num) only: the shipped rows they select exist only there.
 _ARCH_CASES = {("a8w8_pt", "gfx942", 80): _A8W8_PT_GFX942_CU80}
@@ -452,6 +476,8 @@ def _make_call(path_name, case):
     )
     from aiter.utility import fp4_utils
 
+    if path_name == "fhmoe":
+        return _make_fhmoe_call(case)
     token, model_dim, inter_dim, E, topk, act, doweight, out, ep, *rest = case
     weights = rest[0] if rest else "fp8"
     q_dtype = dtypes.i8 if weights in ("i8", "i4") else dtypes.fp8
@@ -668,6 +694,56 @@ _RAISES = {
 }
 
 
+_FHMOE_WEIGHTS = {}
+
+
+def _make_fhmoe_call(case):
+    """Inputs as op_tests/test_fhmoe.py builds them: routed MXFP4 ("fp4") or MXFP8
+    ("mxfp8") weights and the FP8 shared expert as the last of the `E` rows, `topk`
+    routed experts per token plus the shared one, `swiglu_limit` 10."""
+    import torch
+
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    sys.path.insert(0, str(_REPO / "op_tests"))
+    import test_fhmoe
+
+    token, model_dim, inter_dim, E, topk, act, doweight, out, ep, weights, *rest = case
+    options = rest[0] if rest else {}
+    assert (act, doweight, out, ep) == ("Silu", False, "bf16", False), case
+    profile = test_fhmoe._Profile(model_dim, inter_dim, inter_dim, E, topk)
+    interleave = options.get("interleave", True)
+    built = (profile, interleave, weights)
+    if built not in _FHMOE_WEIGHTS:
+        _FHMOE_WEIGHTS.clear()  # one set at a time: the GPU may be shared
+        torch.cuda.empty_cache()
+        _FHMOE_WEIGHTS[built] = test_fhmoe._build_weights(
+            profile, interleave, routed_mxfp8=weights == "mxfp8"
+        )
+    w = _FHMOE_WEIGHTS[built]
+    hidden, _, _, all_weight, all_ids = test_fhmoe._route_inputs(
+        profile, token, w.routed_w1.device, w.routed_expert_ids
+    )
+    gate_mode = GateMode.INTERLEAVE if interleave else GateMode.SEPARATED
+    call = {
+        "hidden_states": hidden,
+        "w1": w.routed_w1,
+        "w2": w.routed_w2,
+        "topk_weight": all_weight,
+        "topk_ids": all_ids,
+        **test_fhmoe._common_kwargs(profile, w.routed_s1, w.routed_s2, gate_mode),
+        "shared_w1": w.shared_w1,
+        "shared_w2": w.shared_w2,
+        "shared_w1_scale": w.shared_s1,
+        "shared_w2_scale": w.shared_s2,
+        "shared_expert_id": profile.shared_id,
+    }
+    for name in ("clamp_shared", "block_size_M"):
+        if name in options:
+            call[name] = options[name]
+    return call
+
+
 def _synth_rows(path_name, table_file, gfx, cu_num, limit):
     """The table: (gfx, cu_num)'s own rows plus `path_name`'s gfx942 CK rows rewritten
     for it (own rows win on a shared key); the case tuples of a sample of the latter."""
@@ -796,6 +872,7 @@ def cases(path_name, synth_cases=(), gfx=None, cu_num=None):
 
 
 def _clear_dispatch_caches():
+    import aiter.fhmoe as legacy_fhmoe
     import aiter.fused_moe as fm
     from aiter.moev2.migration import (
         a4w4,
@@ -806,6 +883,7 @@ def _clear_dispatch_caches():
         a16w4,
         a16w16,
         a16wi4,
+        fhmoe,
         mxfp8,
     )
 
@@ -820,10 +898,15 @@ def _clear_dispatch_caches():
         a16wi4,
         a8w4,
         mxfp8,
+        fhmoe,
     )
     for path in paths:
         for cache in (path.LOCAL.dispatch, path.LOCAL.resolve, path.LOCAL.relookup):
             cache.cache_clear()
+    # The FHMoE capability checks resolve and log their token buckets once.
+    for module in (legacy_fhmoe, fhmoe):
+        module._supports_dsv4_i384_fhmoe_config.cache_clear()
+        module._supports_mxfp8_fhmoe_config.cache_clear()
 
 
 def _raised(fn):

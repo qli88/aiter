@@ -208,5 +208,10 @@ class Segment:
     def build(self, p: MoeProblem, params: Params):
         raise NotImplementedError(self.name)
 
+    def call_args(self, c) -> dict:
+        """For a stage: arguments from the call (`executor.Call`) its launch adds to the
+        ones `build` binds, before the executor adds its own (`run_mxfp4`)."""
+        return {}
+
     def __repr__(self):
         return f"<segment {self.name}>"

@@ -457,6 +457,7 @@ def test_builtin_paths():
         a16w4,
         a16w16,
         a16wi4,
+        fhmoe,
         mxfp8,
     )
 
@@ -470,10 +471,12 @@ def test_builtin_paths():
         a16wi4,
         a8w4,
         mxfp8,
+        fhmoe,
     )
     assert paths._BUILTIN_MODULES == tuple(m.__name__ for m in modules)
     for module in modules:
-        assert module.PATH.name == module.NAME and module.PATH.entry == "op"
+        entry = "fhmoe" if module is fhmoe else "op"
+        assert module.PATH.name == module.NAME and module.PATH.entry == entry
         assert module.PATH.dispatch_record is not None
         assert module.PATH.segments and module.PATH.takes is not None
         assert module.PATH.why_not is module.why_not

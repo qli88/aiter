@@ -470,8 +470,8 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
             and cfg.get("run_1stage", False)
             and _plain_asm_1stage_row(cfg)
         )
-        # A dedicated table is the FHMoE path (not ported), where legacy discards
-        # these rows too and runs the default heuristics.
+        # A dedicated table (FHMoE) declines where legacy discards these rows too and
+        # runs the default heuristics; the shipped FHMoE table has no 1-stage rows.
         if plain_1stage and activation not in _ASM_1STAGE_ACTIVATIONS:
             if problem.extras.get("tuned_table") is not None:
                 return declined("1-stage row discarded for a dedicated table")
@@ -552,6 +552,11 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
     for _row in profile.exact(problem):
         pass  # no profile files are read yet
 
+    if problem.extras.get("tuned_table") is not None and (
+        cfg is None or bypass_tuned_config
+    ):
+        # Legacy raises: a dedicated table (FHMoE) runs its exact rows only.
+        return declined("no exact row in the dedicated table")
     s = problem.shape
     q_type = problem.quant_type
     if cfg is None or bypass_tuned_config:

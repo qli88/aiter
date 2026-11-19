@@ -490,7 +490,7 @@ def test_a_declined_call_runs_on_legacy(monkeypatch):
     monkeypatch.setattr(a8w8_pt.LOCAL, "dispatch", lambda *a, **k: None)
     monkeypatch.setattr(local.executor, "prologue", prologue)
     monkeypatch.setattr(local.executor, "a16w4_unsupported", lambda c, q: None)
-    monkeypatch.setattr(api, "dispatch_key", lambda c: ((), {}, None))
+    monkeypatch.setattr(api, "dispatch_key", lambda c, *_: ((), {}, None))
     assert a8w8_pt.PATH.run({}) is paths.DECLINED
     assert prepares == [False]
     # Calls legacy rejects with the a16w4 NotImplementedError: declined on the preview.
@@ -2104,7 +2104,7 @@ def test_a8w4_leaves_legacy_grouped_gfx1250_calls_to_legacy(monkeypatch):
     from aiter.ops.flydsl.moe_common import GateMode
 
     monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(a8w4, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx950")
     for name in (
         "AITER_USE_GROUPED_GEMM",
         "GPU_ARCHS",
@@ -2133,7 +2133,7 @@ def test_a8w4_leaves_legacy_grouped_gfx1250_calls_to_legacy(monkeypatch):
     assert a8w4.claims({**call, "expert_mask": ep, "doweight_stage1": True})
     assert not a8w4.claims({**call, "expert_mask": ep})
     monkeypatch.delenv("GPU_ARCHS")
-    monkeypatch.setattr(a8w4, "get_gfx", lambda: "gfx1250-strict")
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx1250-strict")
     assert not a8w4.claims(call)
     monkeypatch.setenv("AITER_DISABLE_GROUPED_A8W4", "1")
     assert a8w4.claims(call)
@@ -2511,7 +2511,7 @@ def test_a4w4_run_warns_then_dispatches_the_fallback_key(monkeypatch, caplog):
     monkeypatch.setattr(local, "get_cu_num", lambda: 256)
     monkeypatch.setattr(local.executor, "prologue", prologue)
     monkeypatch.setattr(local.executor, "a16w4_unsupported", lambda c, q: None)
-    monkeypatch.setattr(local.api, "dispatch_key", lambda c: ((), {}, None))
+    monkeypatch.setattr(local.api, "dispatch_key", lambda c, *_: ((), {}, None))
     warning = "[fused_moe] MXMOE pair is unsupported (r); using default heuristics"
     fallbacks = [
         (
@@ -2569,7 +2569,7 @@ def test_a4w4_mxmoe_fallback_key_resolves_without_the_row(monkeypatch):
     monkeypatch.setattr(
         local.api,
         "problem_from_key",
-        lambda args, kwargs, arch, cu_num: _a4w4_problem(
+        lambda args, kwargs, *_: _a4w4_problem(
             token=4096, shape=(4096, 2048, 288, 8), is_shuffled=True, **kwargs
         ),
     )
@@ -2601,6 +2601,303 @@ def test_the_relookup_ignores_disable_inline_sort(monkeypatch):
     p = _a4w4_problem(_disable_inline_sort=True, config_file="/tmp/t.csv")
     a4w4.LOCAL._relookup(p, 128)
     assert dict(seen[0].extras) == {"tuned_table": "/tmp/t.csv"}
+
+
+# 3.7 FHMoE
+
+
+def test_fhmoe_helpers_moved_verbatim():
+    import aiter.fhmoe as legacy_fhmoe
+    from aiter.moev2.segments import flydsl_fhmoe
+
+    for name in (
+        "_validate_fhmoe_contract",
+        "_dtype_name",
+        "_flydsl_fhmoe_stage1_wrapper",
+        "_flydsl_fhmoe_stage2_wrapper",
+        "_validate_fhmoe_metadata_consistency",
+        "_is_fhmoe_metadata_compatible",
+        "_is_dsv4_i384_metadata",
+        "_valid_fhmoe_kernel_geometry",
+        "_config_has_mxfp8_fhmoe_geometry",
+        "_config_has_mxfp8_fhmoe_contract",
+        "_is_dsv4_i384_fhmoe_contract",
+    ):
+        assert getattr(legacy_fhmoe, name) is getattr(flydsl_fhmoe, name), name
+
+
+def test_only_the_fhmoe_path_takes_shared_expert_keys():
+    from aiter.moev2.migration import fhmoe
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    interleave = {"gate_mode": GateMode.INTERLEAVE}
+    taken = (
+        _a4w4_problem(),
+        _a8w4_problem(**interleave),
+        _mxfp8_problem(**interleave),
+        _a8w4_problem(swiglu_limit=7.0, **interleave),
+        dataclasses.replace(
+            _a4w4_problem(),
+            layout=dataclasses.replace(
+                _a4w4_problem().layout, hidden_pad=64, intermediate_pad=64
+            ),
+        ),
+    )
+    # Outside the `fhmoe_` contract or its activation formats.
+    not_taken = (
+        _a8w4_problem(),
+        _mxfp8_problem(),
+        _a4w4_problem(activation=ActivationType.Swiglu),
+        _a4w4_problem(is_ep=True),
+        _a4w4_problem(has_stage1_bias=True),
+        _problem(quant=QuantType.per_Token),
+    )
+    modules = _local_path_modules() + [fhmoe]
+    for p in taken:
+        assert [m.NAME for m in modules if m.takes(api.fhmoe_problem(p))] == ["fhmoe"]
+        assert not fhmoe.takes(p)
+    for p in not_taken:
+        assert not any(m.takes(api.fhmoe_problem(p)) for m in modules), p
+
+
+def test_fhmoe_stages_run_the_flydsl_kernels_through_the_fhmoe_wrappers(monkeypatch):
+    from aiter.moev2.migration import fhmoe, mxfp8
+    from aiter.moev2.segments import flydsl_fhmoe
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    monkeypatch.setattr(tuned, "lookup", lambda p: None)
+    p = _mxfp8_problem(gate_mode=GateMode.INTERLEAVE, gate_up_interleave=True)
+    plain = resolver.resolve(p, mxfp8.SEGMENTS)
+    res = resolver.resolve(api.fhmoe_problem(p), fhmoe.SEGMENTS)
+    assert res.plan.structure()[0] == (
+        "sort",
+        "quant.a1",
+        "flydsl_fhmoe.gemm1",
+        "quant.inter",
+        "flydsl_fhmoe.gemm2",
+    )
+    assert res.metadata.block_m == plain.metadata.block_m
+    assert res.logs == plain.logs
+    for stage, wrapper in (
+        ("stage1", flydsl_fhmoe._flydsl_fhmoe_stage1_wrapper),
+        ("stage2", flydsl_fhmoe._flydsl_fhmoe_stage2_wrapper),
+    ):
+        got, want = getattr(res.metadata, stage), getattr(plain.metadata, stage)
+        assert got.func is wrapper
+        assert (got.args, got.keywords) == (want.args, want.keywords)
+    c = {
+        "shared_w1": "w1",
+        "shared_w1_scale": "s1",
+        "shared_w2": "w2",
+        "shared_w2_scale": "s2",
+        "shared_expert_id": 255,
+        "swiglu_limit": 7.0,
+        "clamp_shared": False,
+    }
+    stage1, stage2 = (
+        res.plan.starting(op).segment for op in (ops.Op.GEMM1, ops.Op.GEMM2)
+    )
+    assert stage1.call_args(c) == {
+        "shared_w1": "w1",
+        "shared_w1_scale": "s1",
+        "shared_expert_id": 255,
+        "swiglu_limit": 7.0,
+        "clamp_shared": False,
+    }
+    assert stage2.call_args(c) == {
+        "shared_w2": "w2",
+        "shared_w2_scale": "s2",
+        "shared_expert_id": 255,
+    }
+    # Separated gate/up without the w1 tag: legacy raises, v2 declines.
+    res = resolver.resolve(api.fhmoe_problem(_mxfp8_problem()), fhmoe.SEGMENTS)
+    assert res.plan is None
+
+
+def test_fhmoe_capability_checks_match_legacy_on_the_shipped_table(monkeypatch):
+    import aiter.fhmoe as legacy_fhmoe
+    from aiter.moev2.migration import fhmoe
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    monkeypatch.delenv("AITER_BYPASS_TUNE_CONFIG", raising=False)
+    hy4 = {
+        "model_dim": 6144,
+        "inter_dim": 256,
+        "experts": 257,
+        "topk": 9,
+        "dtype": torch.bfloat16,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "gate_mode": GateMode.INTERLEAVE,
+        "doweight_stage1": False,
+    }
+    for m in (1, 7, 64, 1000, 8192, 70000):
+        assert fhmoe.supports_dsv4_i384_fhmoe(m) == (
+            legacy_fhmoe.supports_dsv4_i384_fhmoe(m)
+        ), m
+        assert fhmoe.supports_mxfp8_fhmoe_config(m, **hy4) == (
+            legacy_fhmoe.supports_mxfp8_fhmoe_config(m, **hy4)
+        ), m
+    assert fhmoe.supports_dsv4_i384_fhmoe(64)
+    assert fhmoe.supports_mxfp8_fhmoe_config(64, **hy4)
+    with pytest.raises(ValueError, match="partially matches"):
+        fhmoe._resolve_mxfp8_fhmoe_config_file(64, **{**hy4, "hidden_pad": 64})
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "1")
+    assert not fhmoe.supports_dsv4_i384_fhmoe(64)
+
+
+def test_fhmoe_call_raises_the_legacy_api_errors():
+    import re
+
+    tensor = torch.empty(0)
+    weight = torch.empty(0, dtype=dtypes.fp8)
+    call = {
+        "hidden_states": tensor,
+        "w1": weight,
+        "w2": weight,
+        "topk_weight": tensor,
+        "topk_ids": tensor,
+        "shared_w1": weight,
+        "shared_w2": weight,
+        "shared_w1_scale": tensor,
+        "shared_w2_scale": tensor,
+        "shared_expert_id": 0,
+    }
+    for change in (
+        {},
+        {"quant_type_a": QuantType.per_1x32},
+        {"quant_dtype_a": dtypes.bf16},
+        {"quant_dtype_a2": dtypes.fp8},
+        {"a1_scale": tensor, "a2_scale": tensor},
+        {"w1_global_scale": tensor},
+        {"herd_topk": 1},
+        {"herd_topk": 1, "w1_global_scale": tensor},
+        {"deterministic": True},
+    ):
+        with pytest.raises(Exception) as legacy_error:
+            legacy.fused_moe(**call, **change)
+        with pytest.raises(
+            type(legacy_error.value), match=re.escape(str(legacy_error.value))
+        ):
+            api.fused_moe(**call, **change)
+
+
+def _fhmoe_claims_call(monkeypatch):
+    from aiter.moev2.migration import fhmoe, local
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    monkeypatch.setattr(fhmoe, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_gfx", lambda: "gfx950")
+    for name in (
+        "AITER_USE_GROUPED_GEMM",
+        "GPU_ARCHS",
+        "TARGET_ARCH",
+        "AITER_GPU_ARCHS",
+        "AITER_FORCE_GFX1250",
+        "AITER_ONLINE_TUNE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return {
+        "w1": torch.empty(1, dtype=dtypes.fp4x2),
+        "gate_mode": GateMode.INTERLEAVE.value,
+        "w1_scale": torch.empty(1),
+        "w2_scale": torch.empty(1),
+        "expert_mask": None,
+        "doweight_stage1": False,
+        "a1_scale": None,
+        "a2_scale": None,
+        "num_local_tokens": None,
+    }
+
+
+def test_fhmoe_leaves_legacy_grouped_gfx1250_calls_to_legacy(monkeypatch):
+    from aiter.moev2.migration import fhmoe
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    call = _fhmoe_claims_call(monkeypatch)
+    assert fhmoe.claims(call)
+    monkeypatch.setenv("AITER_USE_GROUPED_GEMM", "1")
+    monkeypatch.setenv("GPU_ARCHS", "gfx950;gfx1250")
+    assert not fhmoe.claims(call)
+    assert fhmoe.why_not(call) == (
+        "interleaved gate/up on legacy's grouped gfx1250 path"
+    )
+    # The grouped branch runs fp8 activations into MXFP4 weights only.
+    assert fhmoe.claims({**call, "w1": torch.empty(1, dtype=dtypes.fp8)})
+    assert fhmoe.claims({**call, "gate_mode": GateMode.SEPARATED.value})
+
+
+def test_fhmoe_dispatches_a_full_fhmoe_call(monkeypatch):
+    """Every `fhmoe_` argument plus the `fused_moe_` defaults `run` adds reach the
+    dispatch key; calls with arguments no FHMoE stage takes are refused up front."""
+    from aiter.fhmoe import fhmoe_
+    from aiter.moev2.execute import executor
+    from aiter.moev2.migration import fhmoe
+    from aiter.moev2.policy import quant_remap
+    from aiter.moev2.shapes import get_padded_M
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    monkeypatch.setattr(tuned, "lookup", lambda p: None)
+    experts, model_dim, inter_dim, topk, token = 9, 256, 128, 3, 4
+    params = inspect.signature(fhmoe_).parameters
+    call = {
+        name: param.default
+        for name, param in params.items()
+        if param.default is not inspect.Parameter.empty
+    }
+    w1 = torch.empty(experts, 2 * inter_dim, model_dim // 2, dtype=dtypes.fp4x2)
+    w2 = torch.empty(experts, model_dim, inter_dim // 2, dtype=dtypes.fp4x2)
+    for w in (w1, w2):
+        w.is_shuffled = True
+    call.update(
+        hidden_states=torch.empty(token, model_dim, dtype=torch.bfloat16),
+        w1=w1,
+        w2=w2,
+        topk_weight=torch.empty(token, topk),
+        topk_ids=torch.zeros(token, topk, dtype=torch.int32),
+        w1_scale=torch.empty(1),
+        w2_scale=torch.empty(1),
+        activation=ActivationType.Silu.value,
+        quant_type=QuantType.per_1x32.value,
+        gate_mode=GateMode.INTERLEAVE.value,
+        shared_expert_id=experts - 1,
+    )
+    assert set(call) == set(params)
+    c = executor.prologue({**call, **fhmoe._OP_DEFAULTS}, quant_remap, prepare=False)
+    args, kwargs, _ = api.dispatch_key(c, dtypes.fp8, None)
+    resolution, _ = fhmoe.LOCAL.dispatch(
+        args, tuple(kwargs.items()), "gfx950", 256, get_padded_M(token), emit=False
+    )
+    assert resolution.plan.structure()[0] == (
+        "sort",
+        "quant.a1",
+        "flydsl_fhmoe.gemm1",
+        "quant.inter",
+        "flydsl_fhmoe.gemm2",
+    )
+    monkeypatch.setattr(fhmoe, "get_gfx_runtime", lambda: "gfx950")
+    assert fhmoe.why_not(call) is None
+    for name in ("a1_scale", "a2_scale", "num_local_tokens"):
+        assert fhmoe.why_not({**call, name: torch.empty(1)}) == f"{name} is set"
+    assert fhmoe.why_not({**call, "doweight_stage1": True}) == "doweight_stage1"
+
+
+def test_fhmoe_leaves_calls_with_a_registered_presort_to_legacy(monkeypatch):
+    from aiter.moev2.migration import fhmoe
+
+    call = _fhmoe_claims_call(monkeypatch)
+    assert fhmoe.claims(call)
+    register_presorted_moe({"M": 2})
+    try:
+        assert fhmoe.why_not(call) == "a registered presort"
+    finally:
+        register_presorted_moe(None)
+    assert fhmoe.claims(call)
+    monkeypatch.setenv("AITER_ONLINE_TUNE", "1")
+    assert fhmoe.why_not(call) == "AITER_ONLINE_TUNE=1"
+    monkeypatch.delenv("AITER_ONLINE_TUNE")
+    monkeypatch.setattr(fhmoe, "get_gfx_runtime", lambda: "gfx942")
+    assert fhmoe.why_not(call) == "arch gfx942"
 
 
 def test_shape_helpers_moved_verbatim():

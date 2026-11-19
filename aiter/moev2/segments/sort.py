@@ -668,7 +668,8 @@ class Sort(Segment):
                 }
             ),
             pads=True,
-            extras=frozenset({"disable_inline_sort", "exclude_mxmoe"}),
+            extras=frozenset({"disable_inline_sort", "exclude_mxmoe", "tuned_table"}),
+            shared=True,
         ),
     )
 

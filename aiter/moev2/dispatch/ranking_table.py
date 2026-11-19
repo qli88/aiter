@@ -67,6 +67,7 @@ B16 = frozenset({torch.bfloat16, torch.float16})
 CK_2STAGE = "sort | quant.a1 | ck.gemm1 | quant.inter | ck.gemm2"
 ASM_2STAGE = "sort | quant.a1 | asm.stage1 | quant.inter | ck.gemm2"
 FLYDSL_2STAGE = "sort | quant.a1 | flydsl.gemm1 | quant.inter | flydsl.gemm2"
+FHMOE_2STAGE = "sort | quant.a1 | flydsl_fhmoe.gemm1 | quant.inter | flydsl_fhmoe.gemm2"
 MXMOE_2STAGE = "sort.aux | quant.a1 | mxmoe.gemm1 | mxmoe.gemm2"
 CKTILE_2STAGE = "sort | quant.a1 | cktile.gemm1 | quant.inter | cktile.gemm2"
 ASM_1STAGE = "sort | asm.fmoe_1stage"
@@ -364,5 +365,20 @@ RANKING = (
         "a16wi4",
         match(quant_type=QuantType.per_1x32, w1_dtype=dtypes.i4x2),
         otherwise=[FLYDSL_2STAGE],
+    ),
+    # FHMoE (`fhmoe_`): get_2stage_cfgs without a tuned row resolves the key as without
+    # the shared expert, then `_use_fhmoe_wrappers` raises unless the plan is FlyDSL
+    # 2-stage: the heuristic FlyDSL fallback where `use_mxfp4_flydsl` holds, run with
+    # the FHMoE stages; legacy raises for every other default branch.
+    Entry(
+        "fhmoe",
+        match(shared="fused_row"),
+        regions=[
+            Region(when(flydsl_mxfp4=True), prefer=[FHMOE_2STAGE]),
+            Region(
+                when(flydsl_mxfp4=False),
+                legacy="not FlyDSL 2-stage (FHMoE raises)",
+            ),
+        ],
     ),
 )
