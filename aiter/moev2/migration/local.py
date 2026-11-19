@@ -61,7 +61,8 @@ def why_not(call, quant_types, archs, weight_dtypes):
     separated gate/up, no bias, clamping swiglu_limit, beta or linear_beta, global
     scales, padding, scatter, caller-chosen activation dtypes, HERD routing,
     deterministic mode or registered presort, outside AITER_ONLINE_TUNE, on `archs`,
-    with 3D `w1`/`w2` of `weight_dtypes` and `w1` holding gate and up (g1u1).
+    with 3D `w1`/`w2` of one of `weight_dtypes` and `w1` holding gate and up (g1u1);
+    int8 weights only without doweight_stage1.
     """
     if overrides.online_tune():
         return "AITER_ONLINE_TUNE=1"
@@ -94,11 +95,16 @@ def why_not(call, quant_types, archs, weight_dtypes):
     if arch not in archs:
         return f"arch {arch}"
     w1, w2 = call["w1"], call["w2"]
-    if w1.dtype not in weight_dtypes or w2.dtype not in weight_dtypes:
+    if w1.dtype not in weight_dtypes:
         expected = " or ".join(map(str, weight_dtypes))
         return f"weights {w1.dtype} / {w2.dtype}, not {expected}"
+    if w2.dtype != w1.dtype:
+        return f"w2 dtype {w2.dtype} differs from w1 dtype {w1.dtype}"
     if w1.dim() != 3 or w2.dim() != 3:
         return f"weights of {w1.dim()} / {w2.dim()} dimensions"
+    # No ASM int8 stage 1 applies the routing weights; legacy raises in its kernel lookup.
+    if w1.dtype == dtypes.i8 and call["doweight_stage1"]:
+        return "int8 weights with doweight_stage1"
     _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
     if w1.shape[1] not in (inter_dim, 2 * inter_dim):
         return f"w1 {tuple(w1.shape)} does not match w2 {tuple(w2.shape)}"
@@ -124,6 +130,9 @@ def key_args_supported(problem) -> bool:
         and not clamps(activation.swiglu_limit)
         and problem.inter is None
         and (activation.situ_beta, activation.situ_linear_beta) == (1.0, 1.0)
+        and not (
+            problem.w1.dtype == dtypes.i8 and "doweight_stage1" in problem.features
+        )
     )
 
 

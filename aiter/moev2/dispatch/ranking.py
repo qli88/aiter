@@ -400,6 +400,7 @@ class Entry:
 FP8 = frozenset({torch.float8_e4m3fn, torch.float8_e4m3fnuz})
 B16 = frozenset({torch.bfloat16, torch.float16})
 CK_2STAGE = "sort | quant.a1 | ck.gemm1 | quant.inter | ck.gemm2"
+ASM_2STAGE = "sort | quant.a1 | asm.stage1 | quant.inter | ck.gemm2"
 
 RANKING = (
     # get_2stage_cfgs without a tuned row: fused_moe_1stage_dict has no per-tensor
@@ -453,6 +454,29 @@ RANKING = (
                 legacy="1-stage ASM fmoe_fp8_blockscale_g1u1",
             ),
         ],
+        otherwise=[CK_2STAGE],
+    ),
+    # get_2stage_cfgs without a tuned row, int8 weights: per-token keys in
+    # fused_moe_1stage_dict run 1-stage ASM `fmoe` when `token > 32`; everything else
+    # takes the ASM branch (int8 is not in the CK branch's weight list), with block_m
+    # rounded up to a CK stage 2 size.
+    Entry(
+        "int8_per_token",
+        match(quant_type=QuantType.per_Token, w1_dtype=dtypes.i8),
+        regions=[Region(when(fmoe_1stage=True, m__gt=32), legacy="1-stage ASM fmoe")],
+        otherwise=[ASM_2STAGE],
+    ),
+    Entry(
+        "int8_per_tensor",
+        match(quant_type=QuantType.per_Tensor, w1_dtype=dtypes.i8),
+        otherwise=[ASM_2STAGE],
+    ),
+    # get_2stage_cfgs without a tuned row, int4 weights packed in uint32: no key of
+    # fused_moe_1stage_dict (its int4 key has the `torch.int4` dtype), and uint32
+    # weights with an empty kernelName1 take the CK branch.
+    Entry(
+        "int4_per_token",
+        match(quant_type=QuantType.per_Token, w1_dtype=torch.uint32),
         otherwise=[CK_2STAGE],
     ),
 )

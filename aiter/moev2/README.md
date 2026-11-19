@@ -41,9 +41,9 @@ next to the legacy code (`aiter/fused_moe.py`, `aiter/fhmoe.py`,
 - Helpers that both sides need are moved here verbatim and imported back into
   `aiter/fused_moe.py` under their old names, so existing imports keep working.
 
-Status: four paths are registered, none graduated: `a8w8_pt` (per-tensor fp8), `a16w16`
-(unquantized bf16/fp16), `a8w8_ptok` (per-token fp8) and `a8w8_blockscale` (fp8 in
-1x128 / 128x128 blocks).
+Status: four paths are registered, none graduated: `a8w8_pt` (per-tensor fp8 and int8),
+`a16w16` (unquantized bf16/fp16), `a8w8_ptok` (per-token fp8 and int8, and int4 weights
+with fp8 activations) and `a8w8_blockscale` (fp8 in 1x128 / 128x128 blocks).
 
 ## How a call flows
 
@@ -67,7 +67,7 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 |---|---|---|
 | `__init__.py` | permanent | Package docstring: coexistence with the legacy code and the import rule. |
 | `envs.py` | permanent; the `AITER_MOEV2` accessor is removed | `AITER_MOEV2` parsing, read once and cached (tests call `reload()`). |
-| `paths.py` | to be removed | Path registry: `route_to_v2(call, entry)` picks the path for a call, `DECLINED` hands it back to legacy. Graduation can be scoped to archs. `Path.takes(problem)` names the dispatch keys a path runs, since one segment (CK) serves several paths. Logs the selection once; with `AITER_MOE_EXPLAIN=1`, why an active path does not claim a call. |
+| `paths.py` | to be removed | Path registry: `route_to_v2(call, entry)` picks the path for a call, `DECLINED` hands it back to legacy. Graduation can be scoped to archs, and `graduated_claims` keeps a format added to a graduated path behind `AITER_MOEV2` until its own gate. `Path.takes(problem)` names the dispatch keys a path runs, since one segment (CK) serves several paths. Logs the selection once; with `AITER_MOE_EXPLAIN=1`, why an active path does not claim a call. |
 | `api.py` | permanent; `op_call` and `dispatch_key` are removed | `aiter.moev2.fused_moe` with the legacy signature (always v2; raises when no path takes the call; like legacy, clears a registered presort when the call returns or raises); `build_problem` and `dispatch_key` (a call to its `MoeProblem` and legacy key); `op_call` (the `fused_moe_` arguments legacy passes). |
 | `problem.py` | permanent | `MoeProblem`: what one call must compute (formats, shapes, flags, never tensors). Round-trips the legacy `get_2stage_cfgs` key, so v2 can be compared with legacy key by key. |
 | `hooks.py` | permanent; `legacy_kernel_bench` is removed | Context managers for tests and benchmarks (kernel bench callable, sort implementation) that replace assigning legacy module globals. `legacy_kernel_bench` forwards legacy's `kernel_bench_callable` global to v2 runs. |
@@ -87,8 +87,8 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 | `segments/base.py` | permanent | The `Segment` interface. A segment declares what it can run (`Cap`); anything a problem has that no `Cap` declares rejects the segment. |
 | `segments/sort.py` | permanent | Token sorting: `moe_sorting` and its helpers, moved from `fused_moe.py`, which imports them (Opus, CK or FlyDSL backend; local topk ids, the adaptive auxiliary sort, FLAT's unsorted input), and segment `sort`, which runs the plain sort through it. |
 | `segments/quant.py` | permanent | Activation quantization before GEMM1 (with the scale transposed when the stage 1 kernel needs it) and between the GEMMs. |
-| `segments/ck.py` | permanent | CK 2-stage GEMM kernels for per-tensor fp8, per-token fp8, 1x128 blockscale fp8 and bf16/fp16 (stage 1 g1u1 only); `ck_moe_stage1` and `_require_shuffled_gfx950_fp8` moved from `fused_moe.py`. |
-| `segments/asm.py` | permanent | ASM stage-1 kernels: per-tensor and per-token fp8, and for 1x128 fp8 the kernel that also quantizes the intermediate, writing it and its scales into one buffer (it covers GEMM1 and the intermediate quant); `asm_stage1` moved from `fused_moe.py`. |
+| `segments/ck.py` | permanent | CK 2-stage GEMM kernels for per-tensor and per-token fp8 and int8, fp8 activations with int4 weights, 1x128 blockscale fp8 and bf16/fp16 (stage 1 g1u1 only); `ck_moe_stage1` and `_require_shuffled_gfx950_fp8` moved from `fused_moe.py`. |
+| `segments/asm.py` | permanent | ASM stage-1 kernels: per-tensor and per-token fp8 and int8 (int8 without `doweight_stage1`), and for 1x128 fp8 the kernel that also quantizes the intermediate, writing it and its scales into one buffer (it covers GEMM1 and the intermediate quant); `asm_stage1` moved from `fused_moe.py`. |
 | `segments/whole_graph.py` | permanent | Whole-graph implementations (`impl__<name>__<config>`) from `aiter.fused_moe_registry`. |
 | `segments/defaults.py` | permanent | Default kernel parameters (`BLOCK_SIZE_M`, `get_block_size_M`, `get_ksplit`, `use_nt`), moved from `fused_moe.py`; `default_block_m` / `default_ksplit`, the 2-stage defaults of the legacy default branch per quant type. |
 | `execute/executor.py` | permanent | Runs a plan on one call, statement for statement as the legacy `_fused_moe_impl` / `fused_moe_2stages`, including a stage 1 that quantizes its own output. |
@@ -96,9 +96,9 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 | `execute/output.py` | permanent | The caller's `output=` buffer: validation and the final copy, moved from `fused_moe.py`. |
 | `migration/__init__.py` | to be removed | The migration paths, one module per path. |
 | `migration/local.py` | to be removed | Shared by the single-GPU paths at the `fused_moe_` entry: the common claims checks (`why_not` gives each refusal's reason), the per-key cached resolve, the log-only second lookup after the sort (a call where it would raise or be declined is declined), the run and `dispatch_record`. |
-| `migration/a8w8_pt.py` | to be removed | Path `a8w8_pt` (per-tensor fp8): its claims, segments, `takes` and registration. |
+| `migration/a8w8_pt.py` | to be removed | Path `a8w8_pt` (per-tensor fp8 and int8 weights): its claims, segments, `takes` and registration. |
 | `migration/a16w16.py` | to be removed | Path `a16w16` (unquantized bf16/fp16, `QuantType.No`): its claims, segments, `takes` and registration. |
-| `migration/a8w8_ptok.py` | to be removed | Path `a8w8_ptok` (per-token fp8): its claims, segments, `takes` and registration. |
+| `migration/a8w8_ptok.py` | to be removed | Path `a8w8_ptok` (per-token fp8 and int8 weights, and int4 weights packed in `uint32` with fp8 activations): its claims, segments, `takes` and registration. |
 | `migration/a8w8_blockscale.py` | to be removed | Path `a8w8_blockscale` (fp8, 1x128 activations and 128x128 weight blocks; `per_128x128` calls too, which legacy remaps): its claims, segments, `takes` and registration. |
 | `tuning/__init__.py` | permanent | Empty subpackage; a later step adds the tuner. |
 
@@ -110,7 +110,7 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 | `tests/test_moev2_switch.py` | to be removed | `AITER_MOEV2` parsing and routing; the v2 entry point keeps the legacy signature. |
 | `tests/test_moev2_hooks.py` | permanent | The hooks restore the previous state. |
 | `tests/test_moev2_differential.py` | to be removed | Runs the differential harness: dispatch on the CPU, outputs on the GPU (with `AITER_MOEV2_GPU_DIFFERENTIAL=1`; CI runs the rest). |
-| `tests/test_moev2_dispatch.py` | permanent; the tests against legacy are removed | Unit tests of the problem, plans and capabilities, kernel names, resolver and overrides, the executor (including the packed 1x128 stage 1 buffer), and the local paths (claims, `takes`, g1u0 left to legacy, the second-lookup declines, the per-token 1-stage hand-back, the 1x128 block_m and split-K defaults); the snapshot's feature variants are valid legacy calls. |
+| `tests/test_moev2_dispatch.py` | permanent; the tests against legacy are removed | Unit tests of the problem, plans and capabilities, kernel names, resolver and overrides, the executor (including the packed 1x128 stage 1 buffer), and the local paths (claims, `takes`, g1u0 left to legacy, the second-lookup declines, the per-token 1-stage hand-back, the 1x128 block_m and split-K defaults, the int8 and int4 weight defaults, `graduated_claims`); the snapshot's feature variants are valid legacy calls. |
 | `tests/test_moev2_ranking.py` | permanent | Unit tests of the ranking table and its checks, including predicates, their evaluation order and legacy regions. |
 | `tests/test_moe_dispatch_snapshot.py` | permanent | Legacy dispatch matches the golden snapshot. |
 | `tests/moe_dispatch/keys.py` | permanent; the feature variants are removed | Dispatch keys per simulated arch: every tuned row plus a grid of untuned keys. For the quant types v2 paths take (`FEATURE_QUANT_TYPES`), feature variants: the same call with one more `get_2stage_cfgs` feature (`num_local_tokens`, activation scales, bias, padding, ...), so the snapshot names the key whose decision changed. |

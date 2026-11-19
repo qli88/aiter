@@ -167,12 +167,17 @@ def test_every_gpu_case_variant_is_defined():
     from moe_dispatch import gpu_differential
 
     variants = {
-        case[9]
+        gpu_differential.case_variant(case)
         for path in gpu_differential._CASES
         for case in gpu_differential.cases(path, gfx="gfx942", cu_num=80)
-        if len(case) > 9
-    }
+    } - {None}
     assert variants <= set(gpu_differential._VARIANTS)
+    for path in gpu_differential._CASES:
+        for case in gpu_differential.cases(path, gfx="gfx942", cu_num=80):
+            # Field 10 is the weight format, field 11 the call options.
+            assert len(case) in (9, 10, 11), case
+            assert len(case) < 10 or case[9] not in gpu_differential._VARIANTS, case
+            assert len(case) < 11 or isinstance(case[10], dict), case
     assert set(gpu_differential._RAISES) <= variants
 
 

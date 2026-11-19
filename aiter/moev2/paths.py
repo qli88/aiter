@@ -82,6 +82,9 @@ class Path:
     function to the call's arguments. `run` returns the output, or `DECLINED`.
     `graduated`: True, or the archs (`get_gfx_runtime()` values) the path runs on by
     default; the default needs a passed GPU gate on that arch.
+    `graduated_claims(call)`: when the path runs by default (AITER_MOEV2 unset), it
+    claims only the calls this also accepts, the formats its gate covered; None for all.
+    A format added to a graduated path stays behind AITER_MOEV2 until its own gate.
     `dispatch_record(args, kwargs)`: for a legacy `get_2stage_cfgs(*args, **kwargs)` key,
     the v2 plan in the legacy snapshot record format, or None if the path does not take
     the key (not claimed, or declined). Used by the CPU differential test; the GPU cases
@@ -92,13 +95,14 @@ class Path:
     `supported_archs`: GPU architectures on which the path can claim calls. An empty set
     means the path does not declare an architecture restriction.
     `why_not(call)`: why `claims` refuses the call, or None; read only under
-    AITER_MOE_EXPLAIN, for the calls no active path claims.
+    AITER_MOE_EXPLAIN, for the calls no active path takes.
     """
 
     name: str
     claims: Callable[[Mapping], bool]
     run: Callable[[Mapping], object]
     graduated: bool | frozenset = False
+    graduated_claims: Callable[[Mapping], bool] | None = None
     dispatch_record: Callable[[tuple, dict], object] | None = None
     entry: str = "api"
     segments: tuple = ()
@@ -285,15 +289,20 @@ def any_active() -> bool:
 
 def route_to_v2(call: Mapping, entry: str = "api"):
     """The active path at `entry` that claims this call, or None for the legacy code."""
+    by_default = envs.moev2_selection() == "default"
     for path in active():
-        if path.entry == entry and path.claims(call):
-            return path
+        if path.entry != entry or not path.claims(call):
+            continue
+        gate = path.graduated_claims
+        if by_default and gate is not None and not gate(call):
+            continue
+        return path
     if overrides.explain():
-        _explain_unclaimed(call, entry)
+        _explain_unclaimed(call, entry, by_default)
     return None
 
 
-def _explain_unclaimed(call, entry):
+def _explain_unclaimed(call, entry, by_default=False):
     """AITER_MOE_EXPLAIN: log why each active path at `entry` refuses the call, once per
     path and reason."""
     if torch.compiler.is_compiling():
@@ -306,6 +315,9 @@ def _explain_unclaimed(call, entry):
             reason = path.why_not(call)
         except Exception as error:  # noqa: BLE001
             reason = f"why_not raised {type(error).__name__}: {error}"
+        gate = path.graduated_claims
+        if reason is None and by_default and gate is not None and not gate(call):
+            reason = f"a format not graduated yet (set {envs.AITER_MOEV2} to run it)"
         if reason is None:
             continue
         with _lock:

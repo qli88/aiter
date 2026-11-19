@@ -20,7 +20,8 @@ arch, to the arch's own rows in a temporary AITER_CONFIG_FMOE, so the tuned CK b
 on a gfx950 too. ASM and FlyDSL rows are not copied: their gfx942 configs give garbage on
 gfx950 (legacy and v2 alike). For a8w8_blockscale, whose shipped ASM stage-1 rows are
 gfx942 only, the arch's own CK rows are also added with stage 1 swapped for the arch's
-ASM kernel of the same tile M (when it ships one), so that branch runs too.
+ASM kernel of the same tile M (when it ships one), so that branch runs too; for a8w8_pt,
+the gfx942 int8 rows whose ASM kernel the arch ships are copied as well.
 
 A case that does not fit in the free GPU memory is reported as skipped.
 
@@ -43,26 +44,34 @@ import tempfile
 _HERE = pathlib.Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
 
-# (token, model_dim, inter_dim, experts, topk, activation, doweight_stage1, out dtype,
-#  ep [, variant]): a variant names one of `_VARIANTS`, an input `claims` accepts beyond
-# the plain call.
+# (token, model_dim, inter_dim, experts, topk, activation, doweight_stage1, out dtype, ep)
+# and optionally the weight format ("fp8" when absent, "i8", or "i4": int4 in uint32) and
+# a dict of call options: "variant" names one of `_VARIANTS`, an input `claims` accepts
+# beyond the plain call.
+_SWIGLU_0 = {"variant": "swiglu_limit_0"}
 _A8W8_PT_DEFAULT = (
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 64, 256, 1024, 4096)),
     *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 32, 512)),
     *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False) for m in (8, 300)),
     *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False) for m in (5, 200)),
     *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True) for m in (16, 512)),
-    *((m, 4096, 512, 64, 8, "Silu", False, "bf16", ep, v)
+    *((m, 4096, 512, 64, 8, "Silu", False, "bf16", ep, "fp8", {"variant": v})
       for m, ep in ((16, False), (512, True))
       for v in ("num_local_tokens", "num_local_tokens_fp8_input")),
-    *((m, 4096, 512, 64, 8, "Silu", False, "bf16", False, v)
+    *((m, 4096, 512, 64, 8, "Silu", False, "bf16", False, "fp8", {"variant": v})
       for v in ("a1_scale", "a1_a2_scales", "fp8_input", "output", "noncontiguous",
                 "block_m_32", "block_m_128", "swiglu_limit_0", "swiglu_limit_inf")
       for m in (16, 512)),
     # Mixtral-8x7B (TP1) as vLLM calls it: swiglu_limit=0.0 on every call.
-    *((m, 4096, 14336, 8, 2, "Silu", False, "bf16", False, "swiglu_limit_0") for m in (4, 256)),
+    *((m, 4096, 14336, 8, 2, "Silu", False, "bf16", False, "fp8", _SWIGLU_0) for m in (4, 256)),
     # vLLM passes swiglu_limit=0.0 with Gelu too; legacy leaves it unnormalized there.
-    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "swiglu_limit_0") for m in (32, 512)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "fp8", _SWIGLU_0) for m in (32, 512)),
+    # int8 (ASM stage 1 + CK stage 2), and the shape of the gfx942 cu80 int8 row.
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False, "i8") for m in (1, 64, 1024)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "i8") for m in (32,)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False, "i8") for m in (5, 200)),
+    *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True, "i8") for m in (512,)),
+    *((m, 6144, 4096, 8, 2, "Silu", False, "bf16", False, "i8") for m in (512,)),
 )  # fmt: skip
 
 _A8W8_PT_GFX942_CU80 = (
@@ -101,8 +110,20 @@ _A8W8_PTOK_DEFAULT = (
     *((m, 5120, 1536, 41, 10, "Silu", False, "bf16", False) for m in (3, 8, 64)),
     *((m, 5120, 384, 161, 9, "Silu", False, "bf16", False) for m in (4, 2048)),
     *((m, 6144, 512, 257, 9, "Silu", False, "bf16", False) for m in (16, 1024)),
-    *((16, 7168, 256, 256, 8, "Silu", False, "bf16", False, v) for v in _GENERIC_VARIANTS),
-    (300, 4096, 512, 64, 4, "Gelu", True, "bf16", False, "swiglu_limit_0"),
+    # int8 (ASM stage 1 + CK stage 2; gfx942's 1-stage region is `token > 32`).
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False, "i8") for m in (1, 16, 32)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "i8") for m in (8, 512)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False, "i8") for m in (5, 200)),
+    *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True, "i8") for m in (16,)),
+    # int4 weights, fp8 activations (CK 2-stage), as `-q 3`.
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False, "i4") for m in (1, 16, 256)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "i4") for m in (8, 512)),
+    *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False, "i4") for m in (8, 300)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False, "i4") for m in (5, 200)),
+    *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True, "i4") for m in (16,)),
+    *((16, 7168, 256, 256, 8, "Silu", False, "bf16", False, "fp8", {"variant": v})
+      for v in _GENERIC_VARIANTS),
+    (300, 4096, 512, 64, 4, "Gelu", True, "bf16", False, "fp8", _SWIGLU_0),
 )  # fmt: skip
 
 # Outside gfx950's default 1-stage ASM region (`token > 32`, bf16 output, no
@@ -120,8 +141,9 @@ _A8W8_BLOCKSCALE_DEFAULT = (
     *((m, 4096, 384, 128, 8, "Silu", True, "bf16", False) for m in (8, 512)),
     *((m, 7168, 512, 257, 9, "Silu", False, "bf16", False) for m in (1, 128)),
     *((m, 4096, 1536, 16, 8, "Silu", False, "bf16", False) for m in (16, 512)),
-    *((16, 7168, 256, 256, 8, "Silu", False, "bf16", False, v) for v in _GENERIC_VARIANTS),
-    (2, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "swiglu_limit_0"),
+    *((16, 7168, 256, 256, 8, "Silu", False, "bf16", False, "fp8", {"variant": v})
+      for v in _GENERIC_VARIANTS),
+    (2, 4096, 384, 128, 8, "Gelu", False, "bf16", False, "fp8", _SWIGLU_0),
 )  # fmt: skip
 
 _CASES = {
@@ -157,7 +179,8 @@ def _per_128x128_quant(weight, quant_dtype):
 def _make_call(path_name, case):
     """Inputs as op_tests/test_moe_2stage.py builds them for `-q 1` (per-tensor fp8,
     path a8w8_pt), `-q 0` (unquantized, path a16w16), `-q 2` (per-token fp8, path
-    a8w8_ptok) or `-q 5` (128x128 fp8 blocks, path a8w8_blockscale).
+    a8w8_ptok), `-q 3` (per-token int4 weights, path a8w8_ptok) or `-q 5` (128x128 fp8
+    blocks, path a8w8_blockscale); int8 weights as `-q 1`/`-q 2` with int8.
     Unlike op_tests, the weights are scaled by 1/sqrt(K) (see `weight`); then the
     case's variant is applied."""
     import torch
@@ -165,10 +188,14 @@ def _make_call(path_name, case):
     import aiter
     from aiter import ActivationType, QuantType, dtypes
     from aiter.fused_moe import fused_topk
+    from aiter.int4_utils import convert_int8_to_uint32_int4, rearrange_4bit_elements
     from aiter.ops.shuffle import shuffle_weight
 
-    token, model_dim, inter_dim, E, topk, act, doweight, out, ep = case[:9]
-    variant = case[9] if len(case) > 9 else None
+    token, model_dim, inter_dim, E, topk, act, doweight, out, ep, *rest = case
+    weights = rest[0] if rest else "fp8"
+    q_dtype = dtypes.i8 if weights in ("i8", "i4") else dtypes.fp8
+    options = rest[1] if len(rest) > 1 else {}
+    variant = options.get("variant")
     torch.manual_seed(token * 7919 + model_dim + inter_dim + E + topk)
     dtype = {"bf16": dtypes.bf16, "fp16": dtypes.fp16}[out]
     device = "cuda"
@@ -185,10 +212,15 @@ def _make_call(path_name, case):
         # outputs reach the fp16 limit, and whether a sum overflows then depends on
         # the order of the GEMM2 atomics.
         w = torch.randn(shape, dtype=dtype, device=device) / shape[-1] ** 0.5
+        if weights == "i4":
+            qt, scale = aiter.pertoken_quant(w, quant_dtype=dtypes.i8, dtypeMax=7)
+            del w
+            packed = shuffle_weight(qt, (16, 16), use_int4=True)
+            return rearrange_4bit_elements(convert_int8_to_uint32_int4(packed)), scale
         if quant_type == QuantType.per_Tensor:
-            qt, scale = aiter.pertoken_quant(w.view(E, -1), quant_dtype=dtypes.fp8)
+            qt, scale = aiter.pertoken_quant(w.view(E, -1), quant_dtype=q_dtype)
         elif quant_type == QuantType.per_Token:
-            qt, scale = aiter.pertoken_quant(w, quant_dtype=dtypes.fp8)
+            qt, scale = aiter.pertoken_quant(w, quant_dtype=q_dtype)
         elif quant_type == QuantType.per_128x128:
             qt, scale = _per_128x128_quant(w, dtypes.fp8)
         else:
@@ -339,7 +371,9 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
     extra = df.iloc[:0]
     if path_name == "a8w8_blockscale":
         extra = _asm_blockscale_rows(df, gfx, cu_num)
-        sample = pd.concat([extra, sample])
+    elif path_name == "a8w8_pt":
+        extra = _asm_int8_rows(df, gfx, cu_num)
+    sample = pd.concat([extra, sample])
     table = pd.concat([extra, own, src]).drop_duplicates(_KEY_COLUMNS)
     cases = []
     for r in sample.itertuples():
@@ -347,9 +381,15 @@ def _synth_rows(path_name, table_file, gfx, cu_num, limit):
         out = "bf16" if "bfloat16" in str(r.dtype) else "fp16"
         cases.append(
             (int(r.token), int(r.model_dim), int(r.inter_dim), int(r.expert),
-             int(r.topk), act, bool(r.doweight_stage1), out, False)
+             int(r.topk), act, bool(r.doweight_stage1), out, False, _weights(r))
         )  # fmt: skip
     return table, cases
+
+
+def _weights(row):
+    """The case weight format of a tuned row."""
+    w = str(row.q_dtype_w)
+    return "i8" if "int8" in w else "i4" if "uint32" in w or "int4" in w else "fp8"
 
 
 _KEY_COLUMNS = [
@@ -385,6 +425,33 @@ def _asm_blockscale_rows(df, gfx, cu_num):
     ].copy()
     own["kernelName1"] = own["block_m"].map(by_tile_m)
     return own
+
+
+def _asm_int8_rows(df, gfx, cu_num):
+    """The gfx942 per-tensor int8 rows (ASM stage 1 + CK stage 2) whose ASM kernel the
+    arch also ships, copied to it."""
+    import pandas as pd
+
+    listing = (
+        _REPO / "hsa" / gfx / "fmoe_2stages" / "fmoe_stage1_bf16_pertokenInt8_g1u1.csv"
+    )
+    if not listing.exists():
+        return df.iloc[:0]
+    shipped = set(pd.read_csv(listing)["knl_name"])
+    rows = df[
+        (df["gfx"] == "gfx942")
+        & (df["q_type"] == "QuantType.per_Tensor")
+        & (df["q_dtype_w"] == "torch.int8")
+        & (df["run_1stage"] == 0)
+        & df["kernelName1"].isin(shipped)
+    ].copy()
+    rows["gfx"], rows["cu_num"] = gfx, cu_num
+    return rows
+
+
+def case_variant(case):
+    """The `_VARIANTS` name a case applies, or None."""
+    return case[10].get("variant") if len(case) > 10 else None
 
 
 def cases(path_name, synth_cases=(), gfx=None, cu_num=None):
@@ -459,7 +526,7 @@ def run_case(path_name, case):
         v2_error = _raised(lambda: fm.fused_moe(**call))
     if legacy_logs != v2_logs:
         return f"{case}: log lines differ\n    legacy: {legacy_logs}\n    v2:     {v2_logs}"
-    expected = _RAISES.get(case[9] if len(case) > 9 else None)
+    expected = _RAISES.get(case_variant(case))
     if expected is not None:
         if not (legacy_error and legacy_error == v2_error and expected in v2_error):
             return (

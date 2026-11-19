@@ -70,6 +70,7 @@ EXTRA_COMBOS = (
     ("Relu2", "bfloat16", "bfloat16", "float4_e2m1fn_x2", "per_1x32", False, False),
     ("Silu", "bfloat16", "fp8", "fp8", "per_Tensor", True, False),
     ("Gelu", "bfloat16", "fp8", "fp8", "per_Token", True, False),
+    ("Silu", "bfloat16", "fp8", "uint32", "per_Token", True, False),
 )
 
 TUNED_VARIANTS = ("base", "ep", "unshuffled")

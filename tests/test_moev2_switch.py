@@ -391,6 +391,32 @@ def test_graduation_can_be_scoped_to_archs(monkeypatch):
     assert paths.active() == ()
 
 
+def test_a_graduated_path_runs_by_default_only_what_its_gate_covered(
+    monkeypatch, caplog
+):
+    paths.register(
+        paths.Path(
+            "a8w8_pt",
+            lambda call: True,
+            lambda call: None,
+            graduated=True,
+            graduated_claims=lambda call: call["weights"] == "fp8",
+            why_not=lambda call: None,
+        )
+    )
+    fp8, int8 = {"weights": "fp8"}, {"weights": "int8"}
+    assert paths.route_to_v2(fp8).name == "a8w8_pt"
+    monkeypatch.setattr(logging.getLogger("aiter"), "propagate", True)
+    monkeypatch.setenv("AITER_MOE_EXPLAIN", "1")
+    with caplog.at_level(logging.INFO, logger="aiter"):
+        assert paths.route_to_v2(int8) is None
+    assert (
+        "path a8w8_pt does not claim a call (a format not graduated yet" in caplog.text
+    )
+    _set(monkeypatch, "a8w8_pt")
+    assert paths.route_to_v2(int8).name == "a8w8_pt"
+
+
 def test_unknown_entry_is_an_error():
     with pytest.raises(ValueError, match="entry"):
         paths.Path("a4w4", lambda call: True, lambda call: None, entry="fused_moe")

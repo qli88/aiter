@@ -130,9 +130,10 @@ def test_feature_variants_are_legacy_calls_with_one_change(q_dtype, quant):
     assert len({k.label() for k in variants}) == len(variants)
 
 
-def _key(token=64, quant=QuantType.per_Tensor, fp8=None, **kwargs):
+def _key(token=64, quant=QuantType.per_Tensor, fp8=None, w=None, **kwargs):
     fp8 = dtypes.fp8 if fp8 is None else fp8
-    args = (token, 7168, 256, 256, 8, dtypes.bf16, fp8, fp8, quant, True)
+    w = fp8 if w is None else w
+    args = (token, 7168, 256, 256, 8, dtypes.bf16, fp8, w, quant, True)
     args += (ActivationType.Silu, False, 0, 0)
     return args, kwargs
 
@@ -668,6 +669,22 @@ def _fp8_op_call(quant_type):
     return call
 
 
+def _int_op_call(quant_type, weights):
+    """int8 weights, or int4 packed eight to a uint32 (K / 8 columns)."""
+    call = _fp8_op_call(quant_type)
+    if weights == "i8":
+        call.update(
+            w1=torch.empty(4, 32, 64, dtype=dtypes.i8),
+            w2=torch.empty(4, 64, 16, dtype=dtypes.i8),
+        )
+    else:
+        call.update(
+            w1=torch.empty(4, 32, 8, dtype=torch.uint32),
+            w2=torch.empty(4, 64, 2, dtype=torch.uint32),
+        )
+    return call
+
+
 def _claimed_op_call(path_name):
     """A `fused_moe_` call the local path `path_name` claims."""
     return {
@@ -675,19 +692,76 @@ def _claimed_op_call(path_name):
         "a16w16": _a16w16_op_call,
         "a8w8_ptok": lambda: _fp8_op_call(QuantType.per_Token),
         "a8w8_blockscale": lambda: _fp8_op_call(QuantType.per_1x128),
+        "a8w8_pt_i8": lambda: _int_op_call(QuantType.per_Tensor, "i8"),
+        "a8w8_ptok_i8": lambda: _int_op_call(QuantType.per_Token, "i8"),
+        "a8w8_ptok_i4": lambda: _int_op_call(QuantType.per_Token, "i4"),
     }[path_name]()
 
 
 def test_the_paths_take_disjoint_keys():
-    owners = {
-        "a8w8_pt": _problem(),
-        "a16w16": _problem(quant=QuantType.No, fp8=dtypes.bf16),
-        "a8w8_ptok": _problem(quant=QuantType.per_Token),
-        "a8w8_blockscale": _problem(quant=QuantType.per_1x128),
-    }
+    i8, u32 = dtypes.i8, torch.uint32
+    owners = (
+        ("a8w8_pt", _problem()),
+        ("a8w8_pt", _problem(fp8=i8)),
+        ("a16w16", _problem(quant=QuantType.No, fp8=dtypes.bf16)),
+        ("a8w8_ptok", _problem(quant=QuantType.per_Token)),
+        ("a8w8_ptok", _problem(quant=QuantType.per_Token, fp8=i8)),
+        ("a8w8_ptok", _problem(quant=QuantType.per_Token, w=u32)),
+        ("a8w8_blockscale", _problem(quant=QuantType.per_1x128)),
+    )
     modules = _local_path_modules()
-    for owner, p in owners.items():
+    for owner, p in owners:
         assert [m.NAME for m in modules if m.takes(p)] == [owner], p
+    for p in (_problem(w=u32), _problem(quant=QuantType.per_Token, w=torch.int4)):
+        assert not any(m.takes(p) for m in modules), p
+
+
+def test_claims_int8_and_int4_weights(monkeypatch):
+    from aiter.moev2.migration import a8w8_pt, a8w8_ptok, local
+
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    modules = _local_path_modules()
+    for quant, weights, owner in (
+        (QuantType.per_Tensor, "i8", a8w8_pt),
+        (QuantType.per_Token, "i8", a8w8_ptok),
+        (QuantType.per_Token, "i4", a8w8_ptok),
+    ):
+        call = _int_op_call(quant, weights)
+        assert [m.NAME for m in modules if m.claims(call)] == [owner.NAME], weights
+        mixed = {**call, "w2": torch.empty(4, 64, 16, dtype=dtypes.fp8)}
+        assert not owner.claims(mixed), weights
+    assert not a8w8_pt.claims(_int_op_call(QuantType.per_Tensor, "i4"))
+    # int8 with doweight_stage1 stays on legacy; fp8 with it does not.
+    doweight = {"doweight_stage1"}
+    for quant, owner in (
+        (QuantType.per_Tensor, a8w8_pt),
+        (QuantType.per_Token, a8w8_ptok),
+    ):
+        assert not owner.claims({**_int_op_call(quant, "i8"), "doweight_stage1": True})
+        assert owner.claims({**_fp8_op_call(quant), "doweight_stage1": True})
+        i8 = _problem(quant=quant, fp8=dtypes.i8).with_features(add=doweight)
+        assert not owner.takes(i8)
+        assert owner.takes(_problem(quant=quant).with_features(add=doweight))
+
+
+def test_a8w8_pt_runs_only_when_enabled(monkeypatch):
+    from aiter.moev2 import envs, paths
+    from aiter.moev2.migration import a8w8_pt, local
+
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(paths, "get_gfx_runtime", lambda: "gfx950")
+    fp8, i8 = _per_tensor_op_call(), _int_op_call(QuantType.per_Tensor, "i8")
+    for selection, routed in (
+        ("", (False, False)),
+        ("a8w8_pt", (True, True)),
+        ("on", (True, True)),
+    ):
+        monkeypatch.setenv(envs.AITER_MOEV2, selection)
+        envs.reload()
+        got = tuple(paths.route_to_v2(c, "op") is a8w8_pt.PATH for c in (fp8, i8))
+        assert got == routed, selection
+    monkeypatch.delenv(envs.AITER_MOEV2)
+    envs.reload()
 
 
 def test_claims_per_token_and_blockscale_fp8(monkeypatch):
@@ -716,7 +790,9 @@ def test_claims_per_token_and_blockscale_fp8(monkeypatch):
         assert owner.why_not(clamped) == "swiglu_limit=7.0 clamps", quant
 
 
-@pytest.mark.parametrize("base", _LOCAL_PATHS)
+@pytest.mark.parametrize(
+    "base", _LOCAL_PATHS + ("a8w8_pt_i8", "a8w8_ptok_i8", "a8w8_ptok_i4")
+)
 def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
     """A claimed call's key is taken by the same path, and only by it.
 
@@ -732,7 +808,7 @@ def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
     for change in (
         {},
         *({"quant_type": q.value} for q in QuantType.__members__.values()),
-        {"w1": torch.empty(4, 16, 64, dtype=w1.dtype)},  # g1u0
+        {"w1": torch.empty(4, 16, w1.shape[2], dtype=w1.dtype)},  # g1u0
         {"activation": ActivationType.Gelu.value},
         {"dtype": dtypes.fp16},
         {"swiglu_limit": 0.0},
@@ -745,14 +821,45 @@ def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
             assert path.claims(changed) == path.takes(problem), (path.NAME, change)
 
 
-def _default_resolve(monkeypatch, token, quant, inter_dim=256):
-    from aiter.moev2.migration import a8w8_blockscale, a8w8_ptok
+def _default_resolve(monkeypatch, token, quant, inter_dim=256, arch="gfx950", **kw):
+    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok
 
     monkeypatch.setattr(tuned, "lookup", lambda problem: None)
-    p = _problem(token=token, quant=quant)
+    p = _problem(token=token, quant=quant, arch=arch, **kw)
     p = dataclasses.replace(p, shape=dataclasses.replace(p.shape, inter_dim=inter_dim))
-    path = a8w8_blockscale if quant == QuantType.per_1x128 else a8w8_ptok
-    return resolver.resolve(p, path.SEGMENTS)
+    path = {QuantType.per_1x128: a8w8_blockscale, QuantType.per_Tensor: a8w8_pt}
+    return resolver.resolve(p, path.get(quant, a8w8_ptok).SEGMENTS)
+
+
+def test_int8_defaults_run_asm_stage1_and_int4_runs_ck(monkeypatch):
+    asm = ("sort", "quant.a1", "asm.stage1", "quant.inter", "ck.gemm2")
+    for quant in (QuantType.per_Tensor, QuantType.per_Token):
+        res = _default_resolve(monkeypatch, 64, quant, fp8=dtypes.i8)
+        assert res.plan.structure()[0] == asm, quant
+        assert res.metadata.stage1.func.__name__ == "asm_stage1"
+        assert res.metadata.block_m in (16, 32, 64, 128)
+    # gfx942 runs 1-stage `fmoe` for per-token int8 above 32 tokens.
+    res = _default_resolve(
+        monkeypatch, 33, QuantType.per_Token, arch="gfx942", fp8=dtypes.i8
+    )
+    assert res.plan is None and "1-stage ASM fmoe is not ported" in res.declined
+    res = _default_resolve(
+        monkeypatch, 32, QuantType.per_Token, arch="gfx942", fp8=dtypes.i8
+    )
+    assert res.plan.structure()[0] == asm
+    res = _default_resolve(monkeypatch, 64, QuantType.per_Token, w=torch.uint32)
+    assert res.plan.structure()[0][2] == "ck.gemm1"
+    assert res.metadata.stage1.func.__name__ == "ck_moe_stage1"
+
+
+def test_asm_int8_has_no_doweight_stage1_kernel():
+    from aiter.moev2.segments.asm import AsmStage1
+
+    doweight = {"doweight_stage1"}
+    i8 = _problem(quant=QuantType.per_Token, fp8=dtypes.i8).with_features(add=doweight)
+    fp8 = _problem(quant=QuantType.per_Token).with_features(add=doweight)
+    assert "doweight_stage1" in AsmStage1().reject_reason(i8)
+    assert AsmStage1().reject_reason(fp8) is None
 
 
 def test_per_token_fp8_defaults_hand_the_1stage_region_back(monkeypatch):
