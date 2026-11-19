@@ -42,9 +42,10 @@ def _gfx950():
 
 
 def _paths():
-    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
+    from aiter.moev2.migration import a4w4, a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
 
-    return [a8w8_pt.PATH, a16w16.PATH, a8w8_ptok.PATH, a8w8_blockscale.PATH]
+    modules = (a8w8_pt, a16w16, a8w8_ptok, a8w8_blockscale, a4w4)
+    return [m.PATH for m in modules]
 
 
 def _segments():

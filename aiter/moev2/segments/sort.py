@@ -7,7 +7,12 @@ imports it with its helpers: the backend comes from the same environment variabl
 (Opus by default, CK with AITER_USE_CK_MOE_SORTING=1, FlyDSL with
 AITER_USE_FLYDSL_MOE_SORTING=1), and it also runs the local topk ids, the auxiliary
 outputs (the adaptive sort) and FLAT's unsorted input. Segment `sort` runs the plain
-sort through it; `hooks.set_sort_impl` replaces it there.
+sort through it and segment `sort.aux` the auxiliary sort of the MXFP4 kernels;
+`hooks.set_sort_impl` replaces it there. `_fused_decode_sort_quant` is the decode sort
+fused with the MXFP4 activation quant. Its legacy gate
+`_is_fused_decode_sort_quant_enabled` stays in aiter/fused_moe.py, where tests patch
+its globals; v2 checks the copy here, which `hooks.disable_fused_decode_sort_quant`
+turns off.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 `moe_sorting` and the helpers aiter.fused_moe imports from here are shared with the
@@ -23,7 +28,8 @@ import os
 import torch
 
 import aiter
-from aiter import dtypes, logger
+from aiter import ActivationType, QuantType, dtypes, logger, mxfp4_moe_sort_fwd
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 from aiter.presorted_moe import aux_sort_capacity
 
@@ -67,6 +73,143 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
     if routed_rows is None or num_experts is None:
         return False
     return 3 * routed_rows >= 4 * num_experts  # crossover ~1.3 rows per expert
+
+
+# (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
+# sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
+_FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
+_FUSED_DECODE_SORT_QUANT_MAX_M = 128
+
+
+def _is_fused_decode_sort_quant_enabled(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    global_experts: int,
+    block_m: int,
+    quant_type: QuantType,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    activation: ActivationType,
+    is_g1u1: bool,
+    expert_mask: torch.Tensor | None,
+    need_local_topk_ids: bool,
+    run_1stage: bool,
+    stage1_is_flydsl: bool,
+    hidden_pad: int,
+    ksplit: int,
+) -> bool:
+    """The legacy gate of the direct-scale HIP route-sort/quant kernel, unchanged."""
+    if hooks.fused_decode_sort_quant_disabled():
+        return False
+    try:
+        runtime_is_gfx950 = get_gfx_runtime() == "gfx950"
+    except (KeyError, OSError, RuntimeError):
+        return False
+    tokens = hidden_states.shape[0] if hidden_states.ndim == 2 else 0
+    topk = topk_ids.shape[1] if topk_ids.ndim == 2 else 0
+    return (
+        runtime_is_gfx950
+        and hidden_states.dtype == dtypes.bf16
+        and 1 <= tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
+        and hidden_states.shape[1] == 4096
+        and hidden_states.is_contiguous()
+        and topk_ids.dtype == dtypes.i32
+        and (global_experts, topk) in _FUSED_DECODE_SORT_QUANT_ROUTES
+        and topk_ids.shape[0] == tokens
+        and topk_ids.is_contiguous()
+        and topk_weights.dtype == dtypes.fp32
+        and topk_weights.is_contiguous()
+        and block_m == 32
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and is_g1u1
+        and expert_mask is None
+        and not need_local_topk_ids
+        and not run_1stage
+        and stage1_is_flydsl
+        and hidden_pad == 0
+        # ksplit > 1 makes fused_moe_2stages hand stage 1 unquantized BF16
+        # activations (the kernel quantizes inline), so prequantizing here
+        # would feed the wrong dtype.
+        and ksplit <= 1
+    )
+
+
+def _fused_decode_sort_quant(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    model_dim: int,
+    global_experts: int,
+    block_m: int,
+    moebuf_dtype: torch.dtype,
+    accumulate: bool,
+    compact_scale: bool = False,
+    num_local_tokens: torch.Tensor | None = None,
+):
+    """Return standard sorted metadata plus the pre-quantized stage-1 input."""
+    device = hidden_states.device
+    tokens = hidden_states.shape[0]
+    route_count = topk_ids.numel()
+    active_experts = min(global_experts, route_count)
+    max_sorted = (
+        (route_count + active_experts * (block_m - 1) + block_m - 1)
+        // block_m
+        * block_m
+    )
+    max_blocks = (max_sorted + block_m - 1) // block_m
+    sorted_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+    sorted_expert_ids = torch.empty(max_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = (
+        torch.empty((tokens, model_dim), dtype=moebuf_dtype, device=device)
+        if accumulate
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
+    activation_quant = torch.empty(
+        (tokens, model_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    activation_scale_token = torch.empty(
+        (tokens, model_dim // 32), dtype=dtypes.fp8_e8m0, device=device
+    )
+    aiter.mxfp4_moe_sort_quant_fwd(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale_token,
+        global_experts,
+        num_local_tokens,
+    )
+    activation_scale = activation_scale_token
+    if not compact_scale:
+        activation_scale = mxfp4_moe_sort_fwd(
+            activation_scale_token,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=tokens,
+            cols=model_dim,
+        )
+    return (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale,
+    )
 
 
 def _moe_prepare_unsorted_input(
@@ -520,7 +663,8 @@ class Sort(Segment):
                     "act_scales",
                     "a1_scale",
                 }
-            )
+            ),
+            extras=frozenset({"disable_inline_sort", "exclude_mxmoe"}),
         ),
     )
 
@@ -542,6 +686,7 @@ class Sort(Segment):
         num_local_tokens,
         dispatch_policy,
         output,
+        accumulate=True,
     ):
         return hooks.sort_impl(moe_sorting)(
             topk_ids,
@@ -553,6 +698,43 @@ class Sort(Segment):
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-            accumulate=True,
+            accumulate=accumulate,
+            output=output,
+        )
+
+
+class SortAux(Sort):
+    """The sort with the MXFP4 auxiliary outputs (`m_indices`, `reverse_sorted`)."""
+
+    name = "sort.aux"
+
+    def produces(self, p, params):
+        return Buf("sorted", None, "aux_sorted", block_m=params.get("block_m"))
+
+    def run(
+        self,
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size,
+        expert_mask,
+        num_local_tokens,
+        output_aux,
+        accumulate,
+        output,
+    ):
+        return hooks.sort_impl(moe_sorting)(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            accumulate=accumulate,
+            output_aux=output_aux,
             output=output,
         )

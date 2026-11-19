@@ -37,7 +37,8 @@ from aiter import ActivationType, QuantType, dtypes
 
 from ..problem import FrozenMap
 from ..segments.base import Segment
-from ..segments.defaults import BLOCK_SIZE_M
+from ..segments.defaults import BLOCK_SIZE_M, default_ksplit
+from ..segments.flydsl import _flydsl_mxfp4_layout_is_compatible
 from . import overrides
 from .ops import Op
 
@@ -156,11 +157,49 @@ def _blockscale_1stage_kernel(p) -> bool:
     return has_kernel == 1
 
 
+def _flydsl_mxfp4(p) -> bool:
+    """The legacy `use_mxfp4_flydsl` for fp4/fp8 activations: the heuristic FlyDSL
+    fallback takes the problem."""
+    return (
+        p.out_dtype in (dtypes.bf16, dtypes.fp16)
+        and p.quant_type == QuantType.per_1x32
+        and (
+            p.activation.activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            or overrides.flydsl_force()
+        )
+        and p.act_in.dtype in (dtypes.fp4x2, dtypes.fp8)
+        and p.w1.dtype in (dtypes.fp4x2, dtypes.fp8)
+        and _flydsl_mxfp4_layout_is_compatible(
+            p.act_in.dtype, p.gate_mode, p.layout.gate_up_interleave
+        )
+        and p.any_shuffled
+        and p.layout.g1u1
+        and "doweight_stage1" not in p.features
+    )
+
+
+def _shuffled(p) -> bool:
+    """Either weight is marked `is_shuffled` (the legacy `is_shuffled`)."""
+    return p.any_shuffled
+
+
+def _split_k(p) -> bool:
+    """The default split-K of the problem is above 1."""
+    s = p.shape
+    return (
+        default_ksplit(p.quant_type, s.m, s.topk, s.experts, s.inter_dim, s.model_dim)
+        > 1
+    )
+
+
 # Named boolean predicates `when(...)` can test (`when(fmoe_1stage=True)`).
 PREDICATES = {
     "fmoe_1stage": _fmoe_1stage,
     "inter_dim_128": _inter_dim_128,
     "blockscale_1stage_kernel": _blockscale_1stage_kernel,
+    "flydsl_mxfp4": _flydsl_mxfp4,
+    "shuffled": _shuffled,
+    "split_k": _split_k,
 }
 
 _GETTERS = {**MATCH_FIELDS, **SCALARS}
@@ -401,6 +440,7 @@ FP8 = frozenset({torch.float8_e4m3fn, torch.float8_e4m3fnuz})
 B16 = frozenset({torch.bfloat16, torch.float16})
 CK_2STAGE = "sort | quant.a1 | ck.gemm1 | quant.inter | ck.gemm2"
 ASM_2STAGE = "sort | quant.a1 | asm.stage1 | quant.inter | ck.gemm2"
+FLYDSL_2STAGE = "sort | quant.a1 | flydsl.gemm1 | quant.inter | flydsl.gemm2"
 
 RANKING = (
     # get_2stage_cfgs without a tuned row: fused_moe_1stage_dict has no per-tensor
@@ -477,6 +517,28 @@ RANKING = (
     Entry(
         "int4_per_token",
         match(quant_type=QuantType.per_Token, w1_dtype=torch.uint32),
+        otherwise=[CK_2STAGE],
+    ),
+    # get_2stage_cfgs without a tuned row, MXFP4 activations and weights, Silu or Gelu
+    # (its Swiglu, SiTUv2 and Relu2 branches come first and are not translated; no
+    # per_1x32 key runs 1-stage by default): the heuristic FlyDSL fallback when
+    # `use_mxfp4_flydsl` holds; else CK-Tile split-K for shuffled weights with a split-K
+    # above 1; else the CK branch (fp4 weights, empty kernelName1).
+    Entry(
+        "a4w4",
+        match(
+            quant_type=QuantType.per_1x32,
+            act_dtype=dtypes.fp4x2,
+            w1_dtype=dtypes.fp4x2,
+            activation={"silu", "gelu"},
+        ),
+        regions=[
+            Region(when(flydsl_mxfp4=True), prefer=[FLYDSL_2STAGE]),
+            Region(
+                when(flydsl_mxfp4=False, shuffled=True, split_k=True),
+                legacy="CK-Tile split-K MXFP4",
+            ),
+        ],
         otherwise=[CK_2STAGE],
     ),
 )

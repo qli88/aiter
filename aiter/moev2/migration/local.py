@@ -5,7 +5,8 @@
 A local path supplies its segments and `takes(problem)`, the problems it runs (its
 segments may accept more: a CK segment serves several quant formats, each in its own
 path). `LocalDispatch` resolves each legacy dispatch key once, as the cached legacy
-`get_2stage_cfgs` does, and runs the plan with `executor.run_two_stage`.
+`get_2stage_cfgs` does, and runs the plan with `executor.run_two_stage` (`run_mxfp4` for
+MXFP4 weights).
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See
@@ -16,7 +17,7 @@ import functools
 import math
 from dataclasses import replace
 
-from aiter import ActivationType, QuantType, dtypes, presorted_moe
+from aiter import ActivationType, QuantType, dtypes, logger, presorted_moe
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -24,12 +25,19 @@ from .. import api, paths
 from ..dispatch import overrides, resolver, tuned
 from ..execute import executor
 from ..policy import quant_remap
+from ..problem import FrozenMap
+from ..segments.mxmoe import (
+    _is_mxfp4_inline_sort,
+    _mxfp4_a4w4_stage1_fw,
+    _mxfp4_inline_sort_unsupported,
+)
 from ..shapes import get_inter_dim, get_padded_M
 
 # After sorting, fused_moe_2stages looks the key up again without these, on the
 # hidden_states rows. _fused_moe_impl's _metadata_transform then replaces the result
 # with the first lookup's, so the second lookup only logs, or raises.
 _RELOOKUP_DROPS = frozenset({"act_scales", "num_local_tokens", "scatter"})
+_RELOOKUP_DROPS_EXTRAS = frozenset({"disable_inline_sort", "exclude_mxmoe"})
 _UNRESOLVED = object()
 
 # `fused_moe_` arguments no local path supports yet.
@@ -127,6 +135,7 @@ def key_args_supported(problem) -> bool:
     activation = problem.activation
     return (
         problem.layout.g1u1
+        and activation.kind in ("silu", "gelu")
         and not clamps(activation.swiglu_limit)
         and problem.inter is None
         and (activation.situ_beta, activation.situ_linear_beta) == (1.0, 1.0)
@@ -138,9 +147,11 @@ def key_args_supported(problem) -> bool:
 
 def _relookup_problem(problem, token):
     shape = replace(problem.shape, m=token)
-    return replace(
-        problem.with_features(remove=_RELOOKUP_DROPS), inter=None, shape=shape
+    problem = problem.with_features(remove=_RELOOKUP_DROPS)
+    extras = FrozenMap(
+        {k: v for k, v in problem.extras.items() if k not in _RELOOKUP_DROPS_EXTRAS}
     )
+    return replace(problem, inter=None, shape=shape, extras=extras)
 
 
 class LocalDispatch:
@@ -217,30 +228,142 @@ class LocalDispatch:
         preview = executor.prologue(call, quant_remap, prepare=False)
         args, kwargs, _ = api.dispatch_key(preview)
         token = get_padded_M(preview["hidden_states"].shape[0])
-        where = (args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num(), token)
+        arch, cu_num = get_gfx_runtime(), get_cu_num()
+        where = (args, tuple(kwargs.items()), arch, cu_num, token)
         if self.dispatch(*where, emit=False) is None:
             self.dispatch(*where, emit=True)
             return paths.DECLINED
+        fallbacks = ()
+        if preview.quant_type == QuantType.per_1x32:
+            fallbacks = self._mxfp4_fallbacks(
+                preview, args, kwargs, arch, cu_num, token
+            )
+            if fallbacks is None:
+                return paths.DECLINED
 
         c = executor.prologue(call, quant_remap)
         args, kwargs, q_dtype_a = api.dispatch_key(c)
         dispatched = self.dispatch(
-            args,
-            tuple(kwargs.items()),
-            get_gfx_runtime(),
-            get_cu_num(),
-            token,
-            emit=True,
+            args, tuple(kwargs.items()), arch, cu_num, token, emit=True
         )
         if dispatched is None:
             return paths.DECLINED
+        for fallback_kwargs, warning in fallbacks:
+            message = warning(c)
+            if not message:
+                continue
+            logger.warning(message)
+            dispatched = self.dispatch(
+                args, tuple(fallback_kwargs.items()), arch, cu_num, token
+            )
+            if "_exclude_mxmoe" not in fallback_kwargs:
+                continue
+            block_m = dispatched[0].metadata.block_m
+            if int(block_m) != int(c.block_size_M):
+                raise NotImplementedError(
+                    f"No fallback backend supports block_size_M={c.block_size_M}; "
+                    f"resolved backend requires block_m={block_m}"
+                )
         resolution, problem = dispatched
         after_sort = None
         if problem is not None:
             after_sort = functools.partial(self.relookup, problem, token)
-        return executor.run_two_stage(
+        run = (
+            executor.run_mxfp4
+            if c.quant_type == QuantType.per_1x32
+            else executor.run_two_stage
+        )
+        return run(
             c, resolution.metadata, resolution.plan, q_dtype_a, after_sort=after_sort
         )
+
+    def _mxfp4_fallbacks(self, preview, args, kwargs, arch, cu_num, token):
+        """`_fused_moe_impl`'s second resolutions, in its order, as `(kwargs, warning)`
+        pairs: an MXMOE row whose block size the caller overrides, then a tuned
+        inline-sort row this call cannot run, are discarded and the key resolved again.
+        `warning(c)` gives the line to log for the prepared call, or "" where the row
+        runs after all; `run` calls it after the first lookup has logged, as legacy
+        checks then.
+
+        None where v2 declines a key resolved again; decided before anything is logged.
+        """
+        fallbacks = []
+        first = self._peek_key(args, kwargs, arch, cu_num, token)
+        if first is None or first is paths.DECLINED:
+            return fallbacks
+        metadata = first.metadata
+        block_size_M = preview.block_size_M
+        if (
+            getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
+            and not _is_mxfp4_inline_sort(metadata)
+            and block_size_M is not None
+            and int(block_size_M) != int(metadata.block_m)
+        ):
+            reason = (
+                f"block_size_M={block_size_M} differs from configured "
+                f"BM={metadata.block_m}"
+            )
+            fallback_kwargs = {**kwargs, "_exclude_mxmoe": True}
+            first = self._peek_key(args, fallback_kwargs, arch, cu_num, token)
+            if first is paths.DECLINED:
+                return None
+            message = (
+                f"[fused_moe] MXMOE pair is unsupported ({reason}); "
+                "using default heuristics"
+            )
+            fallbacks.append((fallback_kwargs, lambda c: message))
+            # `run` raises where resolving raises or the block size still differs.
+            if first is None or int(block_size_M) != int(first.metadata.block_m):
+                return fallbacks
+            metadata = first.metadata
+        if not _is_mxfp4_inline_sort(metadata):
+            return fallbacks
+        fallback_kwargs = {**kwargs, "_disable_inline_sort": True}
+        # Declined even if the row could run: the check probes a JIT module, which
+        # legacy loads only after the first lookup has logged.
+        if self._peek_key(args, fallback_kwargs, arch, cu_num, token) is paths.DECLINED:
+            return None
+
+        def inline_sort_warning(c):
+            reason = _mxfp4_inline_sort_unsupported(
+                metadata,
+                c["hidden_states"],
+                c["w1"],
+                c["w2"],
+                c["w1_scale"],
+                c["w2_scale"],
+                c["topk_ids"],
+                gate_mode=c.gate_mode,
+                expert_mask=c["expert_mask"],
+                bias1=c["bias1"],
+                bias2=c["bias2"],
+                a1_scale=c["a1_scale"],
+                a2_scale=c["a2_scale"],
+                stage2_scatter=None,
+                block_size_M=block_size_M,
+                hidden_pad=c["hidden_pad"],
+                intermediate_pad=c["intermediate_pad"],
+            )
+            if not reason:
+                return ""
+            return (
+                f"[fused_moe] inline-sort config is unsupported ({reason}); "
+                "using default heuristics"
+            )
+
+        fallbacks.append((fallback_kwargs, inline_sort_warning))
+        return fallbacks
+
+    def _peek_key(self, args, kwargs, arch, cu_num, token):
+        """A key's first resolution, with nothing emitted: DECLINED where `dispatch`
+        declines the key, None where it raises."""
+        problem = api.problem_from_key(args, kwargs, arch, cu_num)
+        if not self.takes(problem) or self.relookup_decline(problem, token):
+            return paths.DECLINED
+        first = self.peek(problem)
+        if first is not None and first.plan is None:
+            return paths.DECLINED
+        return first
 
     def dispatch_record(self, args, kwargs):
         """The v2 `MOEMetadata` for a legacy key (logs emitted), or None if not taken.

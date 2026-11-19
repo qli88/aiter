@@ -14,6 +14,7 @@ the PR.
 """
 
 import dataclasses
+import functools
 import importlib
 import inspect
 import logging
@@ -650,8 +651,9 @@ def test_claims_use_the_live_arch_on_multi_target_builds(monkeypatch, live_chip_
     for module in (live_chip_info, local, *modules):
         if hasattr(module, "get_gfx"):  # also catch a path that imports it for itself
             monkeypatch.setattr(module, "get_gfx", lambda: "gfx1250")
-    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx942")
     for module in modules:
+        arch = module.ARCHS[0]
+        monkeypatch.setattr(local, "get_gfx_runtime", lambda arch=arch: arch)
         assert module.claims(_claimed_op_call(module.NAME)), module.NAME
 
 
@@ -702,7 +704,7 @@ def test_claims_only_unquantized_16_bit(monkeypatch):
     assert not a16w16.claims(call)
 
 
-_LOCAL_PATHS = ("a8w8_pt", "a16w16", "a8w8_ptok", "a8w8_blockscale")
+_LOCAL_PATHS = ("a8w8_pt", "a16w16", "a8w8_ptok", "a8w8_blockscale", "a4w4")
 
 
 def _local_path_modules():
@@ -733,6 +735,16 @@ def _int_op_call(quant_type, weights):
     return call
 
 
+def _a4w4_op_call():
+    """MXFP4 activations and weights: fp4 packed two to a byte (K / 2 columns)."""
+    call = _fp8_op_call(QuantType.per_1x32)
+    call.update(
+        w1=torch.empty(4, 32, 32, dtype=dtypes.fp4x2),
+        w2=torch.empty(4, 64, 8, dtype=dtypes.fp4x2),
+    )
+    return call
+
+
 def _claimed_op_call(path_name):
     """A `fused_moe_` call the local path `path_name` claims."""
     return {
@@ -743,6 +755,7 @@ def _claimed_op_call(path_name):
         "a8w8_pt_i8": lambda: _int_op_call(QuantType.per_Tensor, "i8"),
         "a8w8_ptok_i8": lambda: _int_op_call(QuantType.per_Token, "i8"),
         "a8w8_ptok_i4": lambda: _int_op_call(QuantType.per_Token, "i4"),
+        "a4w4": _a4w4_op_call,
     }[path_name]()
 
 
@@ -756,6 +769,7 @@ def test_the_paths_take_disjoint_keys():
         ("a8w8_ptok", _problem(quant=QuantType.per_Token, fp8=i8)),
         ("a8w8_ptok", _problem(quant=QuantType.per_Token, w=u32)),
         ("a8w8_blockscale", _problem(quant=QuantType.per_1x128)),
+        ("a4w4", _problem(quant=QuantType.per_1x32, fp8=dtypes.fp4x2)),
     )
     modules = _local_path_modules()
     for owner, p in owners:
@@ -1291,6 +1305,370 @@ def test_a_strided_input_is_copied_before_the_output_overlap_check(monkeypatch):
     call["output"] = buf[:128].view(2, 64)
     with hooks.set_sort_impl(sort), pytest.raises(Stop):
         a8w8_pt.PATH.run(call)
+
+
+def _a4w4_problem(token=64, shape=(7168, 256, 256, 8), doweight=False, **kwargs):
+    args = (token, *shape, dtypes.bf16, dtypes.fp4x2, dtypes.fp4x2)
+    args += (QuantType.per_1x32, True, ActivationType.Silu, doweight, 0, 0)
+    return MoeProblem.from_legacy_key(*args, **kwargs, arch="gfx950", cu_num=256)
+
+
+def _a4w4_resolve(monkeypatch, problem, row=None):
+    from aiter.moev2.migration import a4w4
+
+    monkeypatch.setattr(tuned, "lookup", lambda p: row)
+    return resolver.resolve(problem, a4w4.SEGMENTS)
+
+
+_MXMOE_ROW = {
+    "block_m": 16,
+    "ksplit": 0,
+    "run_1stage": 0,
+    "kernelName1": "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_xcd4",
+    "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16",
+}
+_MXMOE_SHAPE = (5120, 640, 128, 3)
+
+
+def test_a4w4_defaults_follow_the_legacy_branches(monkeypatch):
+    res = _a4w4_resolve(monkeypatch, _a4w4_problem(is_shuffled=True))
+    assert res.plan.structure()[0] == (
+        "sort", "quant.a1", "flydsl.gemm1", "quant.inter", "flydsl.gemm2"
+    )  # fmt: skip
+    assert (res.metadata.block_m, res.metadata.ksplit) == (32, -1)
+    kn1 = res.metadata.stage1.keywords["kernelName"]
+    assert kn1 == "flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w2"
+    assert "using heuristic FlyDSL fallback" in res.logs[-1][1]
+    # doweight_stage1 rules FlyDSL out: CK-Tile split-K at decode sizes, else CK.
+    dw = _a4w4_problem(token=1, doweight=True, is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, dw)
+    assert res.plan is None and "CK-Tile split-K MXFP4 is not ported" in res.declined
+    dw = _a4w4_problem(token=4096, doweight=True, is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, dw)
+    assert res.plan.structure()[0][2] == "ck.gemm1"
+    assert res.metadata.stage1.func.__name__ == "ck_moe_stage1"
+
+
+def test_a4w4_tuned_rows_pick_the_mxmoe_and_layout_v2_segments(monkeypatch):
+    p = _a4w4_problem(token=8, shape=_MXMOE_SHAPE, is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, p, _MXMOE_ROW)
+    assert res.plan.structure()[0] == (
+        "sort.aux", "quant.a1", "mxmoe.gemm1", "mxmoe.gemm2"
+    )  # fmt: skip
+    m = res.metadata
+    assert (m.block_m, m.output_aux, m.fuse_quant, m.prequant) == (
+        16,
+        "opus",
+        "fp4",
+        False,
+    )
+    row = {
+        "block_m": 32,
+        "ksplit": 0,
+        "run_1stage": 0,
+        "kernelName1": "flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w4_fp4",
+        "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x256_atomic_nt_sbm32",
+    }
+    res = _a4w4_resolve(monkeypatch, _a4w4_problem(is_shuffled=True), row)
+    assert res.plan.structure()[0] == (
+        "sort", "quant.a1", "flydsl.gemm1_layout", "flydsl_layout.gemm2"
+    )  # fmt: skip
+    assert res.metadata.skip_inter_quant and res.metadata.output_aux is False
+
+
+def test_a4w4_rows_legacy_discards_or_overrides(monkeypatch):
+    # Legacy runs the FlyDSL heuristic over a tuned CK row on preshuffled weights.
+    ck = {
+        "block_m": 32,
+        "ksplit": 0,
+        "run_1stage": 0,
+        "kernelName1": "moe_ck2stages_gemm1_256x32x128x128_1x4_MulABScaleShuffled_v3_Nswizzle0_Quant3_MulRoutedWeight0_silu_FP4X2_FP4X2_B16",
+        "kernelName2": "moe_ck2stages_gemm2_256x32x128x128_1x4_MulABScaleShuffled_v3_Nswizzle0_Quant3_MulRoutedWeight1_FP4X2_FP4X2_B16",
+    }
+    res = _a4w4_resolve(monkeypatch, _a4w4_problem(is_shuffled=True), ck)
+    assert res.plan is None and "tuned CK row for shuffled MXFP4" in res.declined
+    # An inline-sort row is discarded under _disable_inline_sort; with expert_mask the
+    # MXMOE checks discard this BM16 one.
+    for kwargs, warning in (
+        ({"_disable_inline_sort": True}, "discarding tuned inline-sort config"),
+        ({"is_ep": True}, "BM16 MXMOE is not supported under EP yet"),
+    ):
+        p = _a4w4_problem(token=8, shape=_MXMOE_SHAPE, is_shuffled=True, **kwargs)
+        res = _a4w4_resolve(monkeypatch, p, _MXMOE_ROW)
+        assert res.plan.structure()[0][2] == "flydsl.gemm1", kwargs
+        warnings = [text for level, text in res.logs if level == logging.WARNING]
+        assert warning in warnings[0], warnings
+
+
+_MXMOE_BM128_ROW = {
+    "block_m": 128,
+    "ksplit": 0,
+    "run_1stage": 0,
+    "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256",
+    "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_nt_sbm128",
+}
+
+
+def test_a4w4_mxmoe_rows_discarded_as_legacy(monkeypatch):
+    def warnings(problem, row):
+        res = _a4w4_resolve(monkeypatch, problem, row)
+        assert res.plan.structure()[0][2] == "flydsl.gemm1"
+        return next(text for level, text in res.logs if level == logging.WARNING)
+
+    inline = _MXMOE_ROW["kernelName1"], _MXMOE_ROW["kernelName2"]
+    bm128 = _MXMOE_BM128_ROW["kernelName1"], _MXMOE_BM128_ROW["kernelName2"]
+    prefix = "[fused_moe] discarding MXMOE config ({!r}, {!r}): ".format
+    p = _a4w4_problem(
+        token=8, shape=_MXMOE_SHAPE, is_shuffled=True, _exclude_mxmoe=True
+    )
+    assert warnings(p, _MXMOE_ROW) == (
+        prefix(*inline) + "excluded for this invocation; using default heuristics"
+    )
+    p = _a4w4_problem(
+        token=8, shape=_MXMOE_SHAPE, is_shuffled=True, input_dtype=dtypes.fp4x2
+    )
+    assert warnings(p, _MXMOE_ROW) == (
+        prefix(*inline) + f"inline GEMM1 reads BF16 and cannot accept {dtypes.fp4x2} "
+        "input; using default heuristics"
+    )
+    p = _a4w4_problem(token=4096, shape=(4096, 2048, 288, 8), is_shuffled=True)
+    assert warnings(p, {**_MXMOE_BM128_ROW, "block_m": 64}) == (
+        prefix(*bm128) + f"sort block_m=64 and GEMM2 {bm128[1]!r} must both match "
+        "GEMM1 BM=128; using default heuristics"
+    )
+    # Under EP, MXMOE runs SiTUv2 only.
+    p = _a4w4_problem(
+        token=4096, shape=(4096, 2048, 288, 8), is_shuffled=True, is_ep=True
+    )
+    assert warnings(p, _MXMOE_BM128_ROW) == (
+        prefix(*bm128) + "MXMOE under EP is only validated for SiTUv2, got "
+        f"{ActivationType.Silu}; using default heuristics"
+    )
+
+
+def test_post_reduction_rows_discarded_for_other_layouts(monkeypatch):
+    row = {
+        "block_m": 256,
+        "ksplit": 0,
+        "run_1stage": 1,
+        "flat": 3,
+        "kernelName1": "fmoe_bf16_pertokenMXfp4_g1u1_silu_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route",
+        "kernelName2": "",
+    }
+    shape = (8192, 256, 513, 11)
+    p = _a4w4_problem(token=8192, shape=shape, is_shuffled=False)
+    res = _a4w4_resolve(monkeypatch, p, row)
+    assert res.plan.structure()[0][2] == "ck.gemm1"
+    warning = (
+        "[fused_moe] discarding post-reduction config for incompatible weight "
+        "layout; using default heuristics"
+    )
+    assert res.logs[0] == (logging.WARNING, warning)
+    p = _a4w4_problem(token=8192, shape=shape, is_shuffled=True)
+    res = _a4w4_resolve(monkeypatch, p, row)
+    assert res.plan is None and res.declined == "1-stage tuned row"
+
+
+class _FallbackCall(dict):
+    quant_type = QuantType.per_1x32
+    gate_mode = None
+
+    def __init__(self, block_size_M=None):
+        super().__init__(hidden_states=torch.empty(1, 1))
+        self.block_size_M = block_size_M
+
+    def __missing__(self, name):
+        return None
+
+
+def _stub_peeks(monkeypatch, local, peeks):
+    """`_peek_key` answers from `peeks`, keyed on the fallback flag the kwargs set."""
+
+    def peek_key(self, args, kwargs, arch, cu_num, token):
+        flag = next(
+            (k for k in ("_exclude_mxmoe", "_disable_inline_sort") if kwargs.get(k)),
+            None,
+        )
+        result = peeks[flag]
+        if isinstance(result, int):
+            stage1 = functools.partial(local._mxfp4_a4w4_stage1_fw)
+            result = types.SimpleNamespace(
+                metadata=types.SimpleNamespace(stage1=stage1, block_m=result)
+            )
+        return result
+
+    monkeypatch.setattr(local.LocalDispatch, "_peek_key", peek_key)
+
+
+def test_a4w4_mxmoe_block_override_resolves_again_without_mxmoe(monkeypatch):
+    from aiter.moev2 import paths
+    from aiter.moev2.migration import a4w4, local
+
+    checked = []
+    monkeypatch.setattr(
+        local, "_is_mxfp4_inline_sort", lambda m: checked.append(m.block_m) and False
+    )
+    kwargs = {"_exclude_mxmoe": False}
+    warning = (
+        "[fused_moe] MXMOE pair is unsupported (block_size_M=32 differs from "
+        "configured BM=128); using default heuristics"
+    )
+
+    def fallbacks(block_size_M):
+        call = _FallbackCall(block_size_M)
+        got = a4w4.LOCAL._mxfp4_fallbacks(call, (), kwargs, "gfx950", 256, 32)
+        return [(k, w(call)) for k, w in got]
+
+    # The fallback key's row goes on to the inline-sort check only where its block
+    # size matches; `run` raises where it still differs (64).
+    for fallback, inline_checked in ((32, [128, 32]), (64, [128])):
+        checked.clear()
+        _stub_peeks(monkeypatch, local, {None: 128, "_exclude_mxmoe": fallback})
+        assert fallbacks(32) == [({"_exclude_mxmoe": True}, warning)]
+        assert checked == inline_checked
+    # The caller's block size matches, or the caller gives none: no fallback.
+    for block_size_M in (128, None):
+        assert fallbacks(block_size_M) == []
+    # A fallback key v2 declines sends the call back before anything is logged.
+    _stub_peeks(monkeypatch, local, {None: 128, "_exclude_mxmoe": paths.DECLINED})
+    got = a4w4.LOCAL._mxfp4_fallbacks(_FallbackCall(32), (), kwargs, "gfx950", 256, 32)
+    assert got is None
+
+
+def test_a4w4_inline_sort_fallback_resolves_again_without_inline_sort(monkeypatch):
+    from aiter.moev2 import paths
+    from aiter.moev2.migration import a4w4, local
+
+    reasons = []
+
+    def unsupported(metadata, *args, **kwargs):
+        reasons.append(metadata.block_m)
+        return reason
+
+    monkeypatch.setattr(local, "_is_mxfp4_inline_sort", lambda metadata: True)
+    monkeypatch.setattr(local, "_mxfp4_inline_sort_unsupported", unsupported)
+    kwargs = {"_disable_inline_sort": False}
+    fallbacks = a4w4.LOCAL._mxfp4_fallbacks
+    _stub_peeks(monkeypatch, local, {None: 16, "_disable_inline_sort": 32})
+    got = fallbacks(_FallbackCall(), (), kwargs, "gfx950", 256, 32)
+    # The check (a JIT probe) waits for `run`, after the first lookup has logged.
+    assert [k for k, _ in got] == [{"_disable_inline_sort": True}] and reasons == []
+    reason = "x"
+    assert got[0][1](_FallbackCall()) == (
+        "[fused_moe] inline-sort config is unsupported (x); using default heuristics"
+    )
+    reason = ""
+    assert got[0][1](_FallbackCall()) == "" and reasons == [16, 16]
+    # A fallback key v2 declines sends the call back, whether or not the row runs.
+    _stub_peeks(monkeypatch, local, {None: 16, "_disable_inline_sort": paths.DECLINED})
+    assert fallbacks(_FallbackCall(), (), kwargs, "gfx950", 256, 32) is None
+    assert reasons == [16, 16]
+
+
+def test_a4w4_run_warns_then_dispatches_the_fallback_key(monkeypatch, caplog):
+    from aiter.moev2 import paths
+    from aiter.moev2.migration import a4w4, local
+
+    preview, c = _FallbackCall(32), _FallbackCall(32)
+    prepares, checked = [], []
+
+    def prologue(call, remap, *, prepare=True):
+        prepares.append(prepare)
+        return c if prepare else preview
+
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(local.executor, "prologue", prologue)
+    monkeypatch.setattr(local.api, "dispatch_key", lambda c: ((), {}, None))
+    warning = "[fused_moe] MXMOE pair is unsupported (r); using default heuristics"
+    fallbacks = [
+        (
+            {"_disable_inline_sort": True},
+            lambda call: checked.append(call) or local.logger.warning("check") or "",
+        ),
+        ({"_exclude_mxmoe": True}, lambda call: warning),
+    ]
+    monkeypatch.setattr(
+        local.LocalDispatch,
+        "_mxfp4_fallbacks",
+        lambda self, call, *a: checked.append(call) or fallbacks,
+    )
+
+    def dispatch(args, kwargs, arch, cu_num, token, emit=True):
+        if emit:
+            local.logger.warning(f"lookup {dict(kwargs)}")
+        block_m = 64 if dict(kwargs).get("_exclude_mxmoe") else 128
+        return (
+            types.SimpleNamespace(metadata=types.SimpleNamespace(block_m=block_m)),
+            None,
+        )
+
+    monkeypatch.setattr(a4w4.LOCAL, "dispatch", dispatch)
+    # caplog listens on the root logger; aiter's logger does not propagate.
+    monkeypatch.setattr(logging.getLogger("aiter"), "propagate", True)
+    with (
+        caplog.at_level(logging.WARNING, logger="aiter"),
+        pytest.raises(NotImplementedError) as e,
+    ):
+        a4w4.LOCAL.run({})
+    assert caplog.messages == [
+        "lookup {}", "check", warning, "lookup {'_exclude_mxmoe': True}"
+    ]  # fmt: skip
+    assert str(e.value) == (
+        "No fallback backend supports block_size_M=32; resolved backend requires "
+        "block_m=64"
+    )
+    # The fallbacks are decided on the preview; the warnings read the prepared call.
+    assert checked[0] is preview and checked[1] is c and prepares == [False, True]
+    # A declined fallback key sends the call back before anything is logged or the
+    # prologue prepares the call.
+    caplog.clear()
+    prepares.clear()
+    monkeypatch.setattr(local.LocalDispatch, "_mxfp4_fallbacks", lambda self, *a: None)
+    with caplog.at_level(logging.WARNING, logger="aiter"):
+        assert a4w4.LOCAL.run({}) is paths.DECLINED
+    assert caplog.messages == [] and prepares == [False]
+
+
+def test_a4w4_mxmoe_fallback_key_resolves_without_the_row(monkeypatch):
+    from aiter.moev2.migration import a4w4, local
+
+    monkeypatch.setattr(tuned, "lookup", lambda p: _MXMOE_BM128_ROW)
+    monkeypatch.setattr(
+        local.api,
+        "problem_from_key",
+        lambda args, kwargs, arch, cu_num: _a4w4_problem(
+            token=4096, shape=(4096, 2048, 288, 8), is_shuffled=True, **kwargs
+        ),
+    )
+    dispatch = local.LocalDispatch(a4w4.SEGMENTS, a4w4.LOCAL.takes)
+    first = dispatch._peek_key((), {}, "gfx950", 256, 4096)
+    assert first.plan.structure()[0][2] == "mxmoe.gemm1"
+    assert first.metadata.block_m == 128
+    got = dispatch._mxfp4_fallbacks(_FallbackCall(32), (), {}, "gfx950", 256, 4096)
+    assert [k for k, _ in got] == [{"_exclude_mxmoe": True}]
+    fallback = dispatch._peek_key((), got[0][0], "gfx950", 256, 4096)
+    assert fallback.plan.structure()[0][2] == "flydsl.gemm1"
+    assert fallback.logs[0][1].endswith(
+        "excluded for this invocation; using default heuristics"
+    )
+    dispatch = local.LocalDispatch(
+        a4w4.SEGMENTS, lambda p: a4w4.LOCAL.takes(p) and not p.extras
+    )
+    assert (
+        dispatch._mxfp4_fallbacks(_FallbackCall(32), (), {}, "gfx950", 256, 4096)
+        is None
+    )
+
+
+def test_the_relookup_ignores_disable_inline_sort(monkeypatch):
+    from aiter.moev2.migration import a4w4
+
+    seen = []
+    monkeypatch.setattr(a4w4.LOCAL, "resolve", lambda p, relookup: seen.append(p))
+    p = _a4w4_problem(_disable_inline_sort=True, config_file="/tmp/t.csv")
+    a4w4.LOCAL._relookup(p, 128)
+    assert dict(seen[0].extras) == {"tuned_table": "/tmp/t.csv"}
 
 
 def test_shape_helpers_moved_verbatim():

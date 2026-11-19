@@ -468,7 +468,7 @@ def _without_device_queries():
     import torch
 
     import aiter
-    from aiter import fused_moe
+    from aiter.moev2.segments import flydsl
 
     def stage2_scratch(_slot, shape, dtype, device):
         return torch.empty(shape, dtype=dtype, device=device)
@@ -477,7 +477,7 @@ def _without_device_queries():
         mock.patch.object(
             aiter, "moe_sorting_opus_get_workspace_size", lambda *_a, **_k: 0
         ),
-        mock.patch.object(fused_moe, "_stage2_scratch", stage2_scratch),
+        mock.patch.object(flydsl, "_stage2_scratch", stage2_scratch),
     ):
         yield
 

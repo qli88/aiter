@@ -206,9 +206,19 @@ def a16w16_caps():
     )
 
 
+def a4w4_caps():
+    """MXFP4 activations and weights, as the a4w4 path runs them: gfx950, no
+    num_local_tokens or caller-quantized activations."""
+    from .mxfp4 import a4w4_caps
+
+    return tuple(
+        replace(cap, features=cap.features | {"doweight_stage1"}) for cap in a4w4_caps()
+    )
+
+
 def ck_2stage_caps():
     """The `gen_instances.py` build list: f8 and i8 (and f8 x i4) per-tensor/per-token,
-    f8 1x128, and unquantized f16/b16."""
+    f8 1x128, fp4 1x32, and unquantized f16/b16."""
     return (
         a8w8_per_tensor_caps()
         + a8w8_per_token_caps()
@@ -216,6 +226,7 @@ def ck_2stage_caps():
         + int8_per_tensor_caps()
         + int8_per_token_caps()
         + int4_per_token_caps()
+        + a4w4_caps()
         + a16w16_caps()
     )
 
@@ -239,6 +250,18 @@ class CkGemm1(Segment):
         return kernel is None or (
             kernel.family == kernel_names.CK2STAGES and kernel.stage == 1
         )
+
+    def declines_row(self, p, row):
+        kernel_name2 = str(row.get("kernelName2", "") or "")
+        if (
+            p.quant_type == QuantType.per_1x32
+            and p.any_shuffled
+            and not kernel_name2.startswith("flydsl_")
+        ):
+            # get_2stage_cfgs keeps such a row only after its default MXFP4 choices
+            # (FlyDSL, CK-Tile split-K) pass on it.
+            return "tuned CK row for shuffled MXFP4 weights"
+        return None
 
     def reads(self, p):
         return (Buf("sorted", None), Buf("tokens", p.act_in))

@@ -184,7 +184,7 @@ def test_scatter_reduce_last_row_and_all_skipped(mb):
 def test_stage2_scratch_never_shares_live_memory(monkeypatch):
     """The reused scatter/reduce scratch must not alias across slots (fp4 target
     and scale) or streams, and must not be handed to a graph being captured."""
-    import aiter.fused_moe as fm
+    import aiter.moev2.segments.flydsl as fm
 
     monkeypatch.setattr(fm, "_STAGE2_SCRATCH", {})
     dev = torch.device("cuda", torch.cuda.current_device())

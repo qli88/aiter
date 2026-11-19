@@ -163,6 +163,95 @@ def test_launch_equal_nans_pass_and_legacy_noise_excuses_no_new_ones():
     ) == [("stage2", 0)]
 
 
+def _sorted_launches(inter, a1_scale):
+    """A 2-stage recording over 4 tokens x topk 2 in blocks of 4: 8 routed rows, then a
+    block of padding (token id 4)."""
+    import torch
+
+    slots = [(k << 24) | t for t in range(4) for k in range(2)]
+    sorted_ids = torch.tensor(slots + [4] * 4, dtype=torch.int32)
+    stage1 = partial(
+        _kernel,
+        torch.ones(4, 64, dtype=torch.bfloat16),
+        None,
+        None,
+        sorted_ids,
+        torch.zeros(3, dtype=torch.int32),
+        torch.tensor([12], dtype=torch.int32),
+        None,
+        2,
+        block_m=4,
+        a1_scale=a1_scale,
+    )
+    return [("stage1", stage1), ("stage2", partial(_kernel, inter, block_m=4))]
+
+
+def _compare_sorted(legacy, v2):
+    import torch
+    from moe_dispatch.differential import compare_launches
+
+    call = {
+        "topk_ids": torch.zeros(4, 2, dtype=torch.int32),
+        "expert_mask": None,
+        "hidden_states": torch.empty(4, 64),
+        "w1": torch.empty(2, 64, 64),
+        "w2": torch.empty(2, 64, 32),
+    }
+    out = torch.empty(1)
+    return compare_launches(legacy, v2, call, out, out)
+
+
+def test_sorted_fp4_rows_compare_bitwise_at_the_routed_rows_only():
+    import torch
+
+    from aiter import dtypes
+
+    def fp4(raw):
+        return raw.view(dtypes.fp4x2)
+
+    scale = torch.zeros(32, 8, dtype=torch.uint8).view(dtypes.fp8_e8m0)
+    inter = torch.randint(0, 256, (12, 16), dtype=torch.uint8)
+    padding = inter.clone()
+    padding[10] ^= 1
+    assert not _compare_sorted(
+        _sorted_launches(fp4(inter), scale), _sorted_launches(fp4(padding), scale)
+    )
+    routed = inter.clone()
+    routed[3, 0] ^= 1
+    problems = _compare_sorted(
+        _sorted_launches(fp4(inter), scale), _sorted_launches(fp4(routed), scale)
+    )
+    assert (
+        list(problems) == [("stage2", 0)] and "values differ" in problems["stage2", 0]
+    )
+
+
+def test_sorted_mx_scales_compare_only_the_bytes_the_quant_kernels_write():
+    import torch
+    from moe_dispatch.differential import _sorted_scale_defined
+
+    from aiter import dtypes
+
+    inter = torch.zeros(12, 16, dtype=torch.bfloat16)
+    raw = torch.randint(0, 256, (32, 8), dtype=torch.uint8)
+    slots = [(k << 24) | t for t in range(4) for k in range(2)]
+    sorted_ids = torch.tensor(slots + [4] * 4, dtype=torch.int32)
+    # model_dim 64: 2 groups of 32, padded to 8 columns.
+    defined = set(_sorted_scale_defined(sorted_ids, 4, 2, 8).tolist())
+    unwritten = next(i for i in range(raw.numel()) if i not in defined)
+    written = min(defined)
+
+    def flipped(index):
+        bits = raw.clone().view(-1)
+        bits[index] ^= 1
+        return bits.view(32, 8).view(dtypes.fp8_e8m0)
+
+    legacy = _sorted_launches(inter, raw.view(dtypes.fp8_e8m0))
+    assert not _compare_sorted(legacy, _sorted_launches(inter, flipped(unwritten)))
+    problems = _compare_sorted(legacy, _sorted_launches(inter, flipped(written)))
+    assert list(problems) == [("stage1", "a1_scale")], problems
+
+
 def test_every_gpu_case_variant_is_defined():
     from moe_dispatch import gpu_differential
 

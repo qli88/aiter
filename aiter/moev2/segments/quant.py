@@ -4,7 +4,8 @@
 
 Covers the quant types whose activations are quantized by a standalone kernel and the
 intermediate is quantized after GEMM1 (the generic branches of the legacy
-`fused_moe_2stages`).
+`fused_moe_2stages`), and its MXFP4 (`per_1x32` fp4) branches, which quantize into the
+sorted layout.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See
@@ -13,8 +14,15 @@ aiter/moev2/README.md.
 
 import functools
 
-from aiter import QuantType
+from aiter import (
+    ActivationType,
+    QuantType,
+    dtypes,
+    fused_dynamic_mxfp4_quant_moe_sort,
+    mxfp4_moe_sort_fwd,
+)
 from aiter import get_hip_quant as get_quant
+from aiter.ops.flydsl.moe_common import GateMode
 
 from ..dispatch.buf import CALL_INPUT, Buf
 from ..dispatch.ops import Op
@@ -23,12 +31,13 @@ from .base import Cap, Segment
 _FEATURES = frozenset(
     {"ep_mask", "num_local_tokens", "doweight_stage1", "act_scales", "a1_scale"}
 )
+_EXTRAS = frozenset({"disable_inline_sort", "exclude_mxmoe"})
 
 
 class QuantA1(Segment):
     name = "quant.a1"
     covers = (Op.QUANT_A1, Op.QUANT_A1)
-    capabilities = (Cap(features=_FEATURES),)
+    capabilities = (Cap(features=_FEATURES, extras=_EXTRAS),)
 
     def reads(self, p):
         return (CALL_INPUT,)
@@ -61,11 +70,75 @@ class QuantA1(Segment):
         ), "a1_scale must be provided for quantized input for fused_moe"
         return hidden_states, a1_scale
 
+    def run_mxfp4(
+        self,
+        metadata,
+        hidden_states,
+        a1_scale,
+        q_dtype_a,
+        dtype,
+        w1_dtype,
+        activation,
+        gate_mode,
+        is_shuffled,
+        sorted_ids,
+        num_valid_ids,
+        model_dim,
+        topk,
+        block_size_M,
+        num_local_tokens,
+        sorted_weights,
+        routing_num_experts,
+    ):
+        """`(a1, a1_scale)` for MXFP4 weights: the `per_1x32` branches of the legacy
+        `fused_moe_2stages`, which sort the scales for the stage 1 kernel."""
+        token_num = hidden_states.shape[0]
+        if not metadata.prequant:
+            return hidden_states, None
+        if (
+            dtype in [dtypes.bf16, dtypes.fp16]
+            and w1_dtype == dtypes.fp4x2
+            and (
+                q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                and (
+                    activation
+                    in (
+                        ActivationType.Swiglu,
+                        ActivationType.Situv2,
+                        ActivationType.Relu2,
+                    )
+                    or gate_mode == GateMode.INTERLEAVE
+                )
+                or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
+            )
+        ):
+            return hidden_states.to(dtype), None
+        if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
+            # Already fp4 (e.g. from an FP4 dispatch): only sort the scale.
+            return hidden_states, mxfp4_moe_sort_fwd(
+                a1_scale,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                cols=model_dim,
+            )
+        return fused_dynamic_mxfp4_quant_moe_sort(
+            hidden_states,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            topk=topk,
+            block_size=block_size_M,
+            num_rows=num_local_tokens,
+            sorted_weights=sorted_weights,
+            num_experts_upper_bound=routing_num_experts,
+        )
+
 
 class QuantInter(Segment):
     name = "quant.inter"
     covers = (Op.QUANT_INTER, Op.QUANT_INTER)
-    capabilities = (Cap(features=_FEATURES),)
+    capabilities = (Cap(features=_FEATURES, extras=_EXTRAS),)
 
     def reads(self, p):
         # Any unquantized intermediate: `asm.stage1` writes bf16 even for fp16 outputs.
@@ -93,3 +166,29 @@ class QuantInter(Segment):
             num_rows_factor=topk,
         )
         return a2.view(token_num, topk, inter_dim), a2_scale
+
+    def run_mxfp4(
+        self,
+        a2,
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        topk,
+        inter_dim,
+        block_size_M,
+        num_local_tokens,
+        sorted_weights,
+        routing_num_experts,
+    ):
+        a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+            a2.view(-1, inter_dim),
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            topk=topk,
+            block_size=block_size_M,
+            num_rows=num_local_tokens,
+            sorted_weights=sorted_weights,
+            num_experts_upper_bound=routing_num_experts,
+        )
+        return a2.view(token_num, topk, -1), a2_scale

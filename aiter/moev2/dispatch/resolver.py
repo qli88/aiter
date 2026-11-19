@@ -19,7 +19,8 @@ aiter/moev2/README.md.
 import logging
 from dataclasses import dataclass
 
-from aiter import logger
+from aiter import ActivationType, logger
+from aiter.ops.flydsl.moe_common import GateMode
 
 from ..execute.metadata import AsmMoeMode, MOEMetadata
 from ..segments.asm import stage2_block_m
@@ -128,6 +129,24 @@ def _owned_kernel(raw):
     return kernel
 
 
+def _discards_post_reduction(problem, row) -> bool:
+    """Legacy `get_2stage_cfgs` discards post-reduction `row` for this layout (not
+    separated gate/up on fully shuffled weights). False for rows an earlier legacy
+    check may discard or raise on instead (Opus or FlyDSL names, SiTUv2)."""
+    if row.get("flat", AsmMoeMode.SORTED) != AsmMoeMode.POST_REDUCE:
+        return False
+    names = (str(row.get(k, "") or "").strip() for k in ("kernelName1", "kernelName2"))
+    if any(n.startswith(("opus_", "flydsl_")) for n in names):
+        return False
+    if problem.activation.activation == ActivationType.Situv2:
+        return False
+    return (
+        problem.gate_mode != GateMode.SEPARATED
+        or problem.layout.gate_up_interleave is True
+        or not problem.fully_shuffled
+    )
+
+
 def match_row(plans, row):
     """The plan structure that runs tuned `row`, or a decline reason (str)."""
     if row.get("run_1stage", False):
@@ -171,12 +190,18 @@ def _two_stage_plan(
     choices = []
     for segment in structure:
         if segment.covers[0] == Op.GEMM1:
-            params = Params(kernel=kernelName1, ksplit=ksplit, nt=nt)
+            params = Params(
+                kernel=kernelName1, kernel2=kernelName2, ksplit=ksplit, nt=nt
+            )
         elif segment.covers[0] == Op.GEMM2:
             params = Params(kernel=kernelName2, nt=nt)
         else:
             params = Params()
         choices.append(SegmentChoice(segment, params))
+    fields = {}
+    for choice in choices:
+        fields.update(choice.segment.metadata_fields(problem, choice.params))
+    block_m = fields.pop("block_m", block_m)
     plan = MoePlan(
         tuple(choices),
         source,
@@ -191,6 +216,7 @@ def _two_stage_plan(
         block_m,
         ksplit if is_asm else int(ksplit),
         run_1stage,
+        **fields,
     )
     return plan, metadata
 
@@ -234,6 +260,7 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
     if not plans:
         return declined("no feasible plan")
     keys = problem.log_keys()
+    logs = []
     cfg = tuned.lookup(problem)
     if cfg is None:
         note(f"tuned lookup: miss (tier {problem.shape.m})")
@@ -243,10 +270,36 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
             f"tuned lookup: kernelName1={cfg.get('kernelName1')!r} "
             f"kernelName2={cfg.get('kernelName2')!r}"
         )
-        matched = match_row(plans, cfg)
-        if isinstance(matched, str):
-            return declined(matched)
-    logs = []
+        if _discards_post_reduction(problem, cfg):
+            if problem.extras.get("tuned_table") is not None:
+                # Legacy raises for a dedicated table.
+                return declined("post-reduction row for an incompatible layout")
+            warning = (
+                "[fused_moe] discarding post-reduction config for incompatible "
+                "weight layout; using default heuristics"
+            )
+            logs.append((WARNING, warning))
+            note(f"tuned row discarded: {warning}")
+            cfg = None
+            matched = None
+        else:
+            matched = match_row(plans, cfg)
+            if isinstance(matched, str):
+                return declined(matched)
+    if matched is not None and len(matched) > 1:
+        reason = next(
+            filter(None, (s.declines_row(problem, cfg) for s in matched)), None
+        )
+        if reason is not None:
+            return declined(reason)
+        rejection = next(
+            filter(None, (s.check_row(problem, cfg) for s in matched)), None
+        )
+        if rejection is not None:
+            logs.append((WARNING, rejection.warning))
+            note(f"tuned row discarded: {rejection.warning}")
+            cfg = None
+            matched = None
     bypass_tuned_config = overrides.bypass_tuned()
     kernel_name1 = (
         str(cfg.get("kernelName1", "") or "").strip() if cfg is not None else ""
@@ -343,6 +396,9 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
             )
             logs.append((WARNING, message))
         source = "tuned"
+    gemm1 = next(s for s in structure if s.covers[0] == Op.GEMM1)
+    gemm2 = next(s for s in structure if s.covers[0] == Op.GEMM2)
+    kernelName2 = gemm2.stage2_kernel(problem, kernelName1, kernelName2)
     tag = f"({kernelName1=}, {kernelName2=})"
     logs.append(
         (
@@ -353,6 +409,11 @@ def resolve(problem, segments, emit_on_raise=True) -> Resolution:
     names = [s.name for s in structure]
     if "ck.gemm1" in names and "ck.gemm2" in names:
         _require_shuffled_ck_fp8(problem, logs, explain, emit_on_raise)
+    default = gemm1.default_kernels(problem) if source != "tuned" else None
+    if default is not None:
+        kernelName1, kernelName2 = default.kernel1, default.kernel2
+        block_m, ksplit = default.block_m, default.ksplit
+        logs.append((WARNING, default.warning))
     plan, metadata = _two_stage_plan(
         problem,
         structure,
