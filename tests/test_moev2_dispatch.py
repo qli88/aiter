@@ -13,6 +13,7 @@ Golden snapshots: after an intended change to legacy MoE dispatch, run
 the PR.
 """
 
+import dataclasses
 import importlib
 import inspect
 import logging
@@ -104,11 +105,15 @@ def test_problems_and_tuned_lookup_match_legacy_for_every_key():
     _subprocess_check("key_checks.py")
 
 
-def test_feature_variants_are_legacy_calls_with_one_change():
+@pytest.mark.parametrize(
+    "q_dtype,quant", [("fp8", QuantType.per_Tensor), ("bf16", QuantType.No)]
+)
+def test_feature_variants_are_legacy_calls_with_one_change(q_dtype, quant):
     from moe_dispatch import keys
 
-    combo = (ActivationType.Silu, dtypes.bf16, dtypes.fp8, dtypes.fp8)
-    combo += (QuantType.per_Tensor, True, False, (0, 0))
+    q_dtype = getattr(dtypes, q_dtype)
+    combo = (ActivationType.Silu, dtypes.bf16, q_dtype, q_dtype)
+    combo += (quant, True, False, (0, 0))
     base = keys._make_key("grid", "base", (64, 7168, 256, 256, 8), combo)
     variants = keys.feature_keys([base], dtypes.fp8)
     assert [k.variant for k in variants] == list(keys._feature_variants(dtypes.fp8))
@@ -418,7 +423,7 @@ def test_rows_of_unported_kernels_are_declined_silently(
 
 def test_a_declined_call_runs_on_legacy(monkeypatch):
     from aiter.moev2 import paths
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, local
 
     prepares = []
 
@@ -426,10 +431,10 @@ def test_a_declined_call_runs_on_legacy(monkeypatch):
         prepares.append(prepare)
         return {"hidden_states": torch.empty(2, 64)}
 
-    monkeypatch.setattr(a8w8_pt, "_dispatch", lambda *a, **k: None)
-    monkeypatch.setattr(a8w8_pt.executor, "prologue", prologue)
+    monkeypatch.setattr(a8w8_pt.LOCAL, "dispatch", lambda *a, **k: None)
+    monkeypatch.setattr(local.executor, "prologue", prologue)
     monkeypatch.setattr(api, "dispatch_key", lambda c: ((), {}, None))
-    assert a8w8_pt.run({}) is paths.DECLINED
+    assert a8w8_pt.PATH.run({}) is paths.DECLINED
     assert prepares == [False]
 
 
@@ -529,9 +534,9 @@ def _per_tensor_op_call():
 
 
 def test_claims_only_per_tensor_fp8(monkeypatch):
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, local
 
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
     call = _per_tensor_op_call()
     assert a8w8_pt.claims(call) and a8w8_pt.why_not(call) is None
     for limit in (0, 0.0, float("inf")):
@@ -544,6 +549,7 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
         {"hidden_pad": 64},
         {"quant_dtype_a2": dtypes.fp8},
         {"w1": torch.empty(4, 32, 64, dtype=torch.int8)},
+        {"w1": torch.empty(4, 16, 64, dtype=dtypes.fp8)},  # g1u0
         {"dtype": torch.float32},
         {"herd_topk": 1},
         {"deterministic": True},
@@ -560,9 +566,22 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
     assert a8w8_pt.claims(call)
     monkeypatch.setenv("AITER_ONLINE_TUNE", "1")
     assert not a8w8_pt.claims(call)
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx1201")
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx1201")
     monkeypatch.delenv("AITER_ONLINE_TUNE")
     assert not a8w8_pt.claims(call)
+
+
+def _a16w16_op_call(dtype=dtypes.bf16):
+    call = _per_tensor_op_call()
+    call.update(
+        hidden_states=torch.empty(2, 64, dtype=dtype),
+        w1=torch.empty(4, 32, 64, dtype=dtype),
+        w2=torch.empty(4, 64, 16, dtype=dtype),
+        w1_scale=None,
+        w2_scale=None,
+        quant_type=QuantType.No.value,
+    )
+    return call
 
 
 def test_claims_use_the_live_arch_on_multi_target_builds(monkeypatch, live_chip_info):
@@ -570,13 +589,14 @@ def test_claims_use_the_live_arch_on_multi_target_builds(monkeypatch, live_chip_
     it claims. Setting GPU_ARCHS would not do: `get_gfx_custom_op` caches a layer below
     the two caches this can clear, so what it returns then depends on the environment.
     """
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, a16w16, local
 
-    for module in (live_chip_info, a8w8_pt):
+    for module in (live_chip_info, local, a8w8_pt, a16w16):
         if hasattr(module, "get_gfx"):  # also catch a path that imports it for itself
             monkeypatch.setattr(module, "get_gfx", lambda: "gfx1250")
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx942")
     assert a8w8_pt.claims(_per_tensor_op_call())
+    assert a16w16.claims(_a16w16_op_call())
 
 
 def test_a_module_first_imported_in_a_simulation_follows_the_later_ones(
@@ -603,10 +623,92 @@ def test_a_module_first_imported_in_a_simulation_follows_the_later_ones(
         assert late.get_gfx_runtime() == "gfx1201"
 
 
-def test_tuned_cache_clear_also_resets_path_caches():
-    from aiter.moev2.migration import a8w8_pt
+def test_claims_only_unquantized_16_bit(monkeypatch):
+    from aiter.moev2.migration import a8w8_pt, a16w16, local
 
-    assert a8w8_pt._dispatch in tuned._CACHES and a8w8_pt._resolve in tuned._CACHES
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    for dtype in (dtypes.bf16, dtypes.fp16):
+        call = _a16w16_op_call(dtype)
+        assert a16w16.claims(call) and not a8w8_pt.claims(call)
+    assert not a16w16.claims(_per_tensor_op_call())
+    call = _a16w16_op_call()
+    for change in (
+        {"quant_type": QuantType.per_Token.value},
+        {"quant_type_a": QuantType.per_Tensor.value},
+        {"activation": ActivationType.Swiglu.value},
+        {"bias2": torch.empty(1)},
+        {"w2": torch.empty(4, 64, 16, dtype=dtypes.fp8)},
+        {"w1": torch.empty(4, 16, 64, dtype=dtypes.bf16)},  # g1u0
+        {"dtype": torch.float32},
+    ):
+        assert not a16w16.claims({**call, **change}), change
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx1201")
+    assert not a16w16.claims(call)
+
+
+def test_the_paths_take_disjoint_keys():
+    from aiter.moev2.migration import a8w8_pt, a16w16
+
+    bf16 = _problem(quant=QuantType.No, fp8=dtypes.bf16)
+    assert a16w16.takes(bf16) and not a8w8_pt.takes(bf16)
+    assert a8w8_pt.takes(_problem()) and not a16w16.takes(_problem())
+
+
+@pytest.mark.parametrize("base", ["a8w8_pt", "a16w16"])
+def test_claims_and_takes_agree_on_key_fields(monkeypatch, base):
+    """A claimed call's key is taken by the same path, and only by it.
+
+    Changes here are visible in the dispatch key; call-only checks (bias tensors,
+    padding, AITER_ONLINE_TUNE) are in `claims` alone.
+    """
+    from aiter.moev2.migration import a8w8_pt, a16w16, local
+
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(api, "get_gfx_runtime", lambda: "gfx950")
+    call = _per_tensor_op_call() if base == "a8w8_pt" else _a16w16_op_call()
+    w1 = call["w1"]
+    for change in (
+        {},
+        {"quant_type": QuantType.per_Token.value},
+        {"quant_type": QuantType.No.value},
+        {"quant_type": QuantType.per_Tensor.value},
+        {"w1": torch.empty(4, 16, 64, dtype=w1.dtype)},  # g1u0
+        {"activation": ActivationType.Gelu.value},
+        {"dtype": dtypes.fp16},
+        {"swiglu_limit": 0.0},
+        {"swiglu_limit": float("inf")},
+        {"swiglu_limit": 7.0},
+    ):
+        changed = {**call, **change}
+        problem = api.build_problem(changed, arch="gfx950", cu_num=256)
+        for path in (a8w8_pt, a16w16):
+            assert path.claims(changed) == path.takes(problem), (path.NAME, change)
+
+
+def test_g1u0_is_not_claimed_and_has_no_ck_plan():
+    """CK stage 1 always splits w1 into gate and up; g1u0 calls stay on legacy."""
+    from aiter.moev2.migration import a8w8_pt, a16w16
+
+    p = _problem(quant=QuantType.No, fp8=dtypes.bf16)
+    assert resolver.resolve(p, a16w16.SEGMENTS).plan is not None
+    g1u0 = dataclasses.replace(p, layout=dataclasses.replace(p.layout, g1u1=False))
+    assert not a16w16.takes(g1u0)
+    res = resolver.resolve(g1u0, a16w16.SEGMENTS)
+    assert res.plan is None and "no listed structure is feasible" in res.declined
+    fp8 = _problem()
+    assert a8w8_pt.takes(fp8)
+    assert not a8w8_pt.takes(
+        dataclasses.replace(fp8, layout=dataclasses.replace(fp8.layout, g1u1=False))
+    )
+
+
+def test_tuned_cache_clear_also_resets_path_caches():
+    from aiter.moev2.migration import a8w8_pt, a16w16
+
+    for path in (a8w8_pt, a16w16):
+        local = path.LOCAL
+        caches = (local.peek, local.dispatch, local.resolve, local.relookup)
+        assert all(cache in tuned._CACHES for cache in caches)
 
 
 def test_v2_reads_and_resets_with_the_legacy_table(monkeypatch):
@@ -618,15 +720,15 @@ def test_v2_reads_and_resets_with_the_legacy_table(monkeypatch):
     row = {"kernelName1": "", "kernelName2": "", "block_m": 64, "ksplit": 0}
     monkeypatch.setattr(legacy, "cfg_2stages", ({key: row}, {}))
     assert tuned.lookup(p) is row
-    a8w8_pt._resolve(p, False)
-    assert a8w8_pt._resolve.cache_info().currsize == 1
+    a8w8_pt.LOCAL.resolve(p, False)
+    assert a8w8_pt.LOCAL.resolve.cache_info().currsize == 1
     legacy.get_2stage_cfgs.cache_clear()
-    assert a8w8_pt._resolve.cache_info().currsize == 0
+    assert a8w8_pt.LOCAL.resolve.cache_info().currsize == 0
 
 
 def test_the_log_only_relookup_runs_after_the_sort(monkeypatch, caplog):
     from aiter.moev2 import hooks
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, local
     from aiter.moev2.segments.quant import QuantA1
 
     class Stop(Exception):
@@ -643,8 +745,8 @@ def test_the_log_only_relookup_runs_after_the_sort(monkeypatch, caplog):
         out = torch.empty(topk_ids.shape[0], model_dim, dtype=moebuf_dtype)
         return empty, empty, empty, empty, out
 
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(a8w8_pt, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_cu_num", lambda: 256)
     monkeypatch.setattr(tuned, "lookup", lambda problem: None)
     monkeypatch.setattr(QuantA1, "run", stop)
     # caplog listens on the root logger; aiter's logger does not propagate.
@@ -654,13 +756,13 @@ def test_the_log_only_relookup_runs_after_the_sort(monkeypatch, caplog):
         # Legacy logs the lookup once before sorting and once more after it.
         for _ in range(2):
             with pytest.raises(Stop):
-                a8w8_pt.run(_per_tensor_op_call())
+                a8w8_pt.PATH.run(_per_tensor_op_call())
     assert seen == [1, 1] and caplog.text.count(line) == 2
 
 
 def test_the_relookup_buckets_the_hidden_states_rows(monkeypatch):
     from aiter.moev2 import hooks
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, local
     from aiter.moev2.segments.quant import QuantA1
 
     class Stop(Exception):
@@ -679,15 +781,15 @@ def test_the_relookup_buckets_the_hidden_states_rows(monkeypatch):
     def lookup(problem):
         tokens.append(problem.shape.m)
 
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(a8w8_pt, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_cu_num", lambda: 256)
     monkeypatch.setattr(tuned, "lookup", lookup)
     monkeypatch.setattr(QuantA1, "run", stop)
     call = _per_tensor_op_call()
     call["hidden_states"] = torch.empty(3, 64, dtype=dtypes.bf16)
     # fused_moe_2stages buckets hidden_states.shape[0]; the first lookup, topk_ids rows.
     with hooks.set_sort_impl(sort), pytest.raises(Stop):
-        a8w8_pt.run(call)
+        a8w8_pt.PATH.run(call)
     assert tokens == [2, 4]
 
 
@@ -705,14 +807,14 @@ def _sort_not_reached(*args, **kwargs):
 
 def _relookup_test_call(monkeypatch, row):
     """A call with `a1_scale` whose second lookup (no activation scales) finds `row`."""
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import local
 
     def lookup(problem):
         return None if "act_scales" in problem.features else row
 
     monkeypatch.setattr(tuned, "lookup", lookup)
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(a8w8_pt, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_cu_num", lambda: 256)
     call = _per_tensor_op_call()
     call["a1_scale"] = torch.ones(1, dtype=torch.float32)
     return call
@@ -731,9 +833,11 @@ def test_a_relookup_that_selects_another_plan_still_runs_the_first(monkeypatch):
     # Legacy's _metadata_transform runs the first lookup's plan whatever the second finds.
     call = _relookup_test_call(monkeypatch, _CK_ROW)
     args, kwargs = _key(has_activation_scales=True)
-    assert a8w8_pt.dispatch_record(args, kwargs).stage1.keywords["kernelName"] == ""
+    assert (
+        a8w8_pt.LOCAL.dispatch_record(args, kwargs).stage1.keywords["kernelName"] == ""
+    )
     with hooks.set_sort_impl(sort), pytest.raises(Sorted):
-        a8w8_pt.run(call)
+        a8w8_pt.PATH.run(call)
 
 
 def test_a_call_whose_relookup_v2_declines_is_declined(monkeypatch):
@@ -745,8 +849,8 @@ def test_a_call_whose_relookup_v2_declines_is_declined(monkeypatch):
     call = _relookup_test_call(monkeypatch, {**_CK_ROW, "run_1stage": True})
     args, kwargs = _key(has_activation_scales=True)
     with captured_logs() as logs, hooks.set_sort_impl(_sort_not_reached):
-        assert a8w8_pt.dispatch_record(args, kwargs) is None
-        assert a8w8_pt.run(call) is paths.DECLINED
+        assert a8w8_pt.LOCAL.dispatch_record(args, kwargs) is None
+        assert a8w8_pt.PATH.run(call) is paths.DECLINED
     assert logs == []
 
 
@@ -754,19 +858,19 @@ def test_a_call_whose_relookup_raises_is_declined(monkeypatch):
     from moe_dispatch.differential import captured_logs
 
     from aiter.moev2 import hooks, paths
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, local
 
     def lookup(problem):
         if problem.shape.m == 4:
             raise RuntimeError("the second lookup raises")
 
     monkeypatch.setattr(tuned, "lookup", lookup)
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(a8w8_pt, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_cu_num", lambda: 256)
     call = _per_tensor_op_call()
     call["hidden_states"] = torch.empty(3, 64, dtype=dtypes.bf16)
     with captured_logs() as logs, hooks.set_sort_impl(_sort_not_reached):
-        assert a8w8_pt.run(call) is paths.DECLINED
+        assert a8w8_pt.PATH.run(call) is paths.DECLINED
     assert logs == []
 
 
@@ -787,7 +891,7 @@ def test_unshuffled_fp8_on_gfx950_raises_like_legacy(shuffle):
     with captured_logs() as legacy_logs, pytest.raises(RuntimeError) as legacy_error:
         legacy.get_2stage_cfgs.__wrapped__(*args, **kwargs)
     with captured_logs() as v2_logs, pytest.raises(RuntimeError) as v2_error:
-        a8w8_pt.dispatch_record(args, kwargs)
+        a8w8_pt.LOCAL.dispatch_record(args, kwargs)
     assert "shuffle_weight() layout" in str(legacy_error.value)
     assert str(v2_error.value) == str(legacy_error.value)
     assert v2_logs == legacy_logs and len(v2_logs) == 2
@@ -825,7 +929,7 @@ def test_two_stage_inputs_contiguous_and_a2_zeroed_like_legacy(
 ):
     from aiter.moev2 import hooks
     from aiter.moev2.execute import executor
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, local
     from aiter.moev2.segments.quant import QuantA1
 
     class Stop(Exception):
@@ -850,8 +954,8 @@ def test_two_stage_inputs_contiguous_and_a2_zeroed_like_legacy(
         zeroed_shapes.append(tuple(shape[0] if len(shape) == 1 else shape))
         return zeros(*shape, **kwargs)
 
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(a8w8_pt, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_cu_num", lambda: 256)
     monkeypatch.setattr(tuned, "lookup", lambda problem: None)
     monkeypatch.setattr(QuantA1, "run", quant_a1)
     monkeypatch.setattr(hooks, "record_kernel", record_kernel)
@@ -863,14 +967,14 @@ def test_two_stage_inputs_contiguous_and_a2_zeroed_like_legacy(
     call["hidden_states"] = wide[:, :64] if row_major else wide[:, ::2]
     call["a2_scale"] = a2_scale
     with hooks.set_sort_impl(sort), pytest.raises(Stop):
-        a8w8_pt.run(call)
+        a8w8_pt.PATH.run(call)
     assert seen == [True]
     assert ((2, 2, 16) in zeroed_shapes) == zeroed
 
 
 def test_a_strided_input_is_copied_before_the_output_overlap_check(monkeypatch):
     from aiter.moev2 import hooks
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, local
     from aiter.moev2.segments.quant import QuantA1
 
     class Stop(Exception):
@@ -883,8 +987,8 @@ def test_a_strided_input_is_copied_before_the_output_overlap_check(monkeypatch):
     def stop(*args, **kwargs):
         raise Stop
 
-    monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(a8w8_pt, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(local, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(local, "get_cu_num", lambda: 256)
     monkeypatch.setattr(tuned, "lookup", lambda problem: None)
     monkeypatch.setattr(QuantA1, "run", stop)
     call = _per_tensor_op_call()
@@ -893,7 +997,7 @@ def test_a_strided_input_is_copied_before_the_output_overlap_check(monkeypatch):
     call["hidden_states"] = buf.view(2, 128)[:, ::2]
     call["output"] = buf[:128].view(2, 64)
     with hooks.set_sort_impl(sort), pytest.raises(Stop):
-        a8w8_pt.run(call)
+        a8w8_pt.PATH.run(call)
 
 
 def test_shape_helpers_moved_verbatim():

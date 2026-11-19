@@ -397,13 +397,20 @@ def test_unknown_entry_is_an_error():
 
 
 def test_builtin_paths():
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, a16w16
 
-    assert paths._BUILTIN_MODULES == ("aiter.moev2.migration.a8w8_pt",)
-    assert a8w8_pt.PATH.name == "a8w8_pt" and a8w8_pt.PATH.entry == "op"
-    assert a8w8_pt.PATH.dispatch_record is not None
+    assert paths._BUILTIN_MODULES == (
+        "aiter.moev2.migration.a8w8_pt",
+        "aiter.moev2.migration.a16w16",
+    )
+    for module in (a8w8_pt, a16w16):
+        assert module.PATH.name == module.NAME and module.PATH.entry == "op"
+        assert module.PATH.dispatch_record is not None
+        assert module.PATH.segments and module.PATH.takes is not None
+        assert module.PATH.why_not is module.why_not
+        assert module.PATH.supported_archs == frozenset(module.ARCHS)
     # No path graduates: each runs only when enabled with AITER_MOEV2.
-    assert not a8w8_pt.PATH.graduated
+    assert not a8w8_pt.PATH.graduated and not a16w16.PATH.graduated
 
 
 def test_gpu_suites_cover_exactly_the_planned_paths():

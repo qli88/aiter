@@ -168,10 +168,11 @@ def test_every_gpu_case_variant_is_defined():
 
     variants = {
         case[9]
-        for case in gpu_differential.cases("a8w8_pt", gfx="gfx942", cu_num=80)
+        for path in gpu_differential._CASES
+        for case in gpu_differential.cases(path, gfx="gfx942", cu_num=80)
         if len(case) > 9
     }
-    assert variants <= set(gpu_differential._VARIANTS) | {"g1u0"}
+    assert variants <= set(gpu_differential._VARIANTS)
     assert set(gpu_differential._RAISES) <= variants
 
 

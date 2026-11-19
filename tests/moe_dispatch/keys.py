@@ -75,7 +75,7 @@ EXTRA_COMBOS = (
 TUNED_VARIANTS = ("base", "ep", "unshuffled")
 GRID_VARIANTS = ("base", "ep")
 # Quant types whose keys get the feature variants; a v2 path adds its quant type.
-FEATURE_QUANT_TYPES = ("per_Tensor",)
+FEATURE_QUANT_TYPES = ("per_Tensor", "No")
 
 _FP8_NAMES = ("float8_e4m3fn", "float8_e4m3fnuz")
 

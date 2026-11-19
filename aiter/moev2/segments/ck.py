@@ -11,6 +11,7 @@ module with the moev2 owners (@qli88). See aiter/moev2/README.md.
 """
 
 import functools
+from dataclasses import replace
 
 import torch
 
@@ -134,28 +135,40 @@ def per_tensor_fp8():
     return scale_spec(QuantType.per_Tensor, dtypes.fp8)
 
 
-def a8w8_per_tensor_caps():
-    fp8 = frozenset({per_tensor_fp8()})
-    return (
-        Cap(
-            arch=frozenset({"gfx942", "gfx950"}),
-            act_in=fp8,
-            w1=fp8,
-            w2=fp8,
-            out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
-            activation=frozenset({"silu", "gelu"}),
-            gate_mode=frozenset({"separated"}),
-            features=frozenset(
-                {
-                    "ep_mask",
-                    "num_local_tokens",
-                    "doweight_stage1",
-                    "act_scales",
-                    "a1_scale",
-                }
-            ),
+def _cap(specs):
+    return Cap(
+        arch=frozenset({"gfx942", "gfx950"}),
+        act_in=specs,
+        w1=specs,
+        w2=specs,
+        out_dtype=frozenset({dtypes.bf16, dtypes.fp16}),
+        activation=frozenset({"silu", "gelu"}),
+        gate_mode=frozenset({"separated"}),
+        features=frozenset(
+            {"ep_mask", "num_local_tokens", "doweight_stage1", "act_scales", "a1_scale"}
         ),
     )
+
+
+def a8w8_per_tensor_caps():
+    return (_cap(frozenset({per_tensor_fp8()})),)
+
+
+def a16w16_caps():
+    """bf16/fp16 activations and weights, unquantized (`QuantType.No`)."""
+    return tuple(
+        _cap(frozenset({scale_spec(QuantType.No, d)}))
+        for d in (dtypes.bf16, dtypes.fp16)
+    )
+
+
+def ck_2stage_caps():
+    return a8w8_per_tensor_caps() + a16w16_caps()
+
+
+def ck_stage1_caps():
+    """Stage 1 always splits w1 into gate and up (`N = w1.size(1) / 2`): g1u1 only."""
+    return tuple(replace(cap, g1u1=frozenset({True})) for cap in ck_2stage_caps())
 
 
 class CkGemm1(Segment):
@@ -165,7 +178,7 @@ class CkGemm1(Segment):
 
     @property
     def capabilities(self):
-        return a8w8_per_tensor_caps()
+        return ck_stage1_caps()
 
     def owns(self, kernel) -> bool:
         """An empty kernelName1 runs the CK heuristic kernel."""
@@ -195,7 +208,7 @@ class CkGemm2(Segment):
 
     @property
     def capabilities(self):
-        return a8w8_per_tensor_caps()
+        return ck_2stage_caps()
 
     def owns(self, kernel) -> bool:
         return kernel is None or (

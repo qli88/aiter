@@ -6,17 +6,18 @@ Each case runs on the same inputs with AITER_MOEV2=off and AITER_MOEV2=<path>: t
 must run the call (not decline it), launch the same kernels on equal inputs (exact, but
 floating-point tensors within 1 ulp or legacy's own spread), give the same output up to
 the GEMM2 atomics, and log the same dispatch lines on a first call (see
-`differential.run_differential`). Besides plain calls, the cases cover the inputs
-`claims` accepts (`_VARIANTS`); where legacy raises on one (`_RAISES`), v2 must run the
-call and raise the same error.
+`differential.run_differential`). Besides plain calls, the a8w8_pt cases cover the
+inputs `claims` accepts (`_VARIANTS`); where legacy raises on one (`_RAISES`), v2 must
+run the call and raise the same error.
 
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt
-    python tests/moe_dispatch/gpu_differential.py --path a8w8_pt --synth-table
+    python tests/moe_dispatch/gpu_differential.py --path a16w16 --synth-table
 
-Shipped tables have per-tensor rows for gfx942 only. `--synth-table` copies their CK rows
-to the running arch in a temporary AITER_CONFIG_FMOE, so the tuned CK branch runs on a
-gfx950 too. ASM and FlyDSL rows are not copied: their gfx942 configs give garbage on
-gfx950 (legacy and v2 alike), so those branches need a gfx942 for this check.
+Shipped tables have per-tensor rows for gfx942 only (and bf16 rows for gfx942 and a few
+gfx950 shapes). `--synth-table` copies the path's gfx942 CK rows to the running arch in a
+temporary AITER_CONFIG_FMOE, so the tuned CK branch runs on a gfx950 too. ASM and FlyDSL
+rows are not copied: their gfx942 configs give garbage on gfx950 (legacy and v2 alike),
+so those branches need a gfx942 for this check.
 
 NOTE: part of the aiter.moev2 migration (under active development, not graduated).
 Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
@@ -38,8 +39,8 @@ _HERE = pathlib.Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
 
 # (token, model_dim, inter_dim, experts, topk, activation, doweight_stage1, out dtype,
-#  ep [, variant]): a variant names one of `_VARIANTS` (or "g1u0"), an input `claims`
-# accepts beyond the plain call.
+#  ep [, variant]): a variant names one of `_VARIANTS`, an input `claims` accepts beyond
+# the plain call.
 _A8W8_PT_DEFAULT = (
     *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 64, 256, 1024, 4096)),
     *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 32, 512)),
@@ -51,7 +52,7 @@ _A8W8_PT_DEFAULT = (
       for v in ("num_local_tokens", "num_local_tokens_fp8_input")),
     *((m, 4096, 512, 64, 8, "Silu", False, "bf16", False, v)
       for v in ("a1_scale", "a1_a2_scales", "fp8_input", "output", "noncontiguous",
-                "block_m_32", "block_m_128", "g1u0", "swiglu_limit_0", "swiglu_limit_inf")
+                "block_m_32", "block_m_128", "swiglu_limit_0", "swiglu_limit_inf")
       for m in (16, 512)),
     # Mixtral-8x7B (TP1) as vLLM calls it: swiglu_limit=0.0 on every call.
     *((m, 4096, 14336, 8, 2, "Silu", False, "bf16", False, "swiglu_limit_0") for m in (4, 256)),
@@ -64,12 +65,32 @@ _A8W8_PT_GFX942_CU80 = (
     (1, 4096, 192, 192, 8, "Silu", False, "bf16", False),
 )  # fmt: skip
 
+_A16W16_DEFAULT = (
+    *((m, 7168, 256, 256, 8, "Silu", False, "bf16", False) for m in (1, 16, 64, 256, 1024, 4096)),
+    *((m, 4096, 384, 128, 8, "Gelu", False, "bf16", False) for m in (1, 32, 512)),
+    *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False) for m in (8, 300)),
+    *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False) for m in (5, 200)),
+    *((m, 2048, 256, 64, 6, "Gelu", True, "fp16", False) for m in (40,)),
+    *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True) for m in (16, 512)),
+    # Shapes with shipped gfx950 cu256 rows (tuned CK there, default elsewhere).
+    *((m, 6144, 512, 192, 8, "Silu", False, "bf16", False) for m in (1, 512, 2048)),
+    *((m, 4096, 384, 128, 8, "Silu", False, "bf16", False) for m in (64, 1024)),
+)  # fmt: skip
 
-def _make_a8w8_pt_call(
-    token, model_dim, inter_dim, E, topk, act, doweight, out, ep, variant=None
-):
-    """Inputs as op_tests/test_moe_2stage.py builds them for `-q 1` (per-tensor fp8),
-    except that the weights are scaled by 1/sqrt(K); then `variant` applied."""
+_CASES = {"a8w8_pt": _A8W8_PT_DEFAULT, "a16w16": _A16W16_DEFAULT}
+# Cases for one (gfx, cu_num) only: the shipped rows they select exist only there.
+_ARCH_CASES = {("a8w8_pt", "gfx942", 80): _A8W8_PT_GFX942_CU80}
+# The dispatch key's quant type and weight dtype of each path's tuned rows.
+_ROWS = {
+    "a8w8_pt": ("QuantType.per_Tensor", "float8"),
+    "a16w16": ("QuantType.No", "16"),
+}
+
+
+def _make_call(path_name, case):
+    """Inputs as op_tests/test_moe_2stage.py builds them for `-q 1` (per-tensor fp8,
+    path a8w8_pt) or `-q 0` (unquantized, path a16w16), except that the weights are
+    scaled by 1/sqrt(K); then the case's variant applied."""
     import torch
 
     import aiter
@@ -77,6 +98,8 @@ def _make_a8w8_pt_call(
     from aiter.fused_moe import fused_topk
     from aiter.ops.shuffle import shuffle_weight
 
+    token, model_dim, inter_dim, E, topk, act, doweight, out, ep = case[:9]
+    variant = case[9] if len(case) > 9 else None
     torch.manual_seed(token * 7919 + model_dim + inter_dim + E + topk)
     dtype = {"bf16": dtypes.bf16, "fp16": dtypes.fp16}[out]
     device = "cuda"
@@ -84,13 +107,17 @@ def _make_a8w8_pt_call(
     # Scaled so each GEMM keeps values near 1: unscaled, the fp16 outputs reach the
     # fp16 limit, and whether a sum overflows then depends on the order of the GEMM2
     # atomics.
-    gate_up = 1 if variant == "g1u0" else 2
-    w1 = torch.randn((E, inter_dim * gate_up, model_dim), dtype=dtype, device=device)
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device=device)
     w1 /= model_dim**0.5
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device=device)
     w2 /= inter_dim**0.5
-    w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=dtypes.fp8)
-    w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=dtypes.fp8)
+    if path_name == "a8w8_pt":
+        quant_type = QuantType.per_Tensor
+        w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=dtypes.fp8)
+        w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=dtypes.fp8)
+    else:
+        quant_type = QuantType.No
+        w1_qt, w1_scale, w2_qt, w2_scale = w1, None, w2, None
     w1_qt = shuffle_weight(w1_qt.view(w1.shape), layout=(16, 16))
     w2_qt = shuffle_weight(w2_qt.view(w2.shape), layout=(16, 16))
     global_E = 2 * E if ep else E
@@ -108,12 +135,12 @@ def _make_a8w8_pt_call(
         "topk_ids": topk_ids,
         "expert_mask": expert_mask,
         "activation": ActivationType.__members__[act],
-        "quant_type": QuantType.per_Tensor,
+        "quant_type": quant_type,
         "doweight_stage1": doweight,
         "w1_scale": w1_scale,
         "w2_scale": w2_scale,
     }
-    if variant not in (None, "g1u0"):
+    if variant is not None:
         _VARIANTS[variant](call)
     return call
 
@@ -198,19 +225,21 @@ _RAISES = {
 }
 
 
-def _synth_rows(table_file, gfx, cu_num, limit):
-    """gfx942 per-tensor fp8 rows rewritten for (gfx, cu_num); the case tuples."""
+def _synth_rows(path_name, table_file, gfx, cu_num, limit):
+    """`path_name`'s gfx942 rows rewritten for (gfx, cu_num); the case tuples."""
     import pandas as pd
 
     from aiter.moev2.dispatch import kernel_names
 
+    q_type, w_dtype = _ROWS[path_name]
     df = pd.read_csv(table_file)
     src = df[
         (df["gfx"] == "gfx942")
         & (df["cu_num"] == 80)
-        & (df["q_type"] == "QuantType.per_Tensor")
-        & (df["q_dtype_w"].str.contains("float8"))
+        & (df["q_type"] == q_type)
+        & (df["q_dtype_w"].str.contains(w_dtype))
         & (df["run_1stage"] == 0)
+        & (df["use_g1u1"] == 1)
     ].copy()
 
     def portable(name):
@@ -218,9 +247,10 @@ def _synth_rows(table_file, gfx, cu_num, limit):
         return parsed is None or parsed.family == kernel_names.CK2STAGES
 
     src = src[src["kernelName1"].map(portable) & src["kernelName2"].map(portable)]
-    fp8 = "torch.float8_e4m3fn" if gfx == "gfx950" else "torch.float8_e4m3fnuz"
     src["gfx"], src["cu_num"] = gfx, cu_num
-    src["q_dtype_a"] = src["q_dtype_w"] = fp8
+    if path_name == "a8w8_pt":
+        fp8 = "torch.float8_e4m3fn" if gfx == "gfx950" else "torch.float8_e4m3fnuz"
+        src["q_dtype_a"] = src["q_dtype_w"] = fp8
     # Spread the sample over kernel families, block_m, ksplit and token counts.
     src = src.sort_values(["kernelName1", "block_m", "ksplit", "token"])
     step = max(1, len(src) // limit)
@@ -237,21 +267,21 @@ def _synth_rows(table_file, gfx, cu_num, limit):
 
 
 def cases(path_name, synth_cases=(), gfx=None, cu_num=None):
-    if path_name != "a8w8_pt":
+    if path_name not in _CASES:
         raise SystemExit(f"no GPU cases for path {path_name}")
-    selected = list(_A8W8_PT_DEFAULT)
-    if (gfx, cu_num) == ("gfx942", 80):
-        selected.extend(_A8W8_PT_GFX942_CU80)
+    selected = list(_CASES[path_name])
+    selected += _ARCH_CASES.get((path_name, gfx, cu_num), ())
     return selected + list(synth_cases)
 
 
 def _clear_dispatch_caches():
     import aiter.fused_moe as fm
-    from aiter.moev2.migration import a8w8_pt
+    from aiter.moev2.migration import a8w8_pt, a16w16
 
     fm.get_2stage_cfgs.cache_clear()
-    a8w8_pt._dispatch.cache_clear()
-    a8w8_pt._resolve.cache_clear()
+    for path in (a8w8_pt, a16w16):
+        for cache in (path.LOCAL.dispatch, path.LOCAL.resolve, path.LOCAL.relookup):
+            cache.cache_clear()
 
 
 def _raised(fn):
@@ -296,7 +326,7 @@ def run_case(path_name, case):
     import aiter.fused_moe as fm
     from moe_dispatch.differential import captured_logs, moev2_mode, run_differential
 
-    call = _make_a8w8_pt_call(*case)
+    call = _make_call(path_name, case)
     with moev2_mode("off"), captured_logs():
         legacy_error = _raised(lambda: fm.fused_moe(**call))  # warm-up: JIT logs here
     torch.cuda.synchronize()
@@ -370,11 +400,11 @@ def main(argv=None):
 
     gfx, cu_num = get_gfx_runtime(), get_cu_num()
     rows, synth = _synth_rows(
-        AITER_CONFIGS.AITER_CONFIG_FMOE_FILE, gfx, cu_num, args.synth_limit
+        args.path, AITER_CONFIGS.AITER_CONFIG_FMOE_FILE, gfx, cu_num, args.synth_limit
     )
     table = pathlib.Path(tempfile.mkdtemp(prefix="moev2_gpu_")) / "tuned_fmoe.csv"
     rows.to_csv(table, index=False)
-    print(f"synthesized {len(rows)} per-tensor rows for {gfx} cu{cu_num} in {table}")
+    print(f"synthesized {len(rows)} {args.path} rows for {gfx} cu{cu_num} in {table}")
     env = dict(
         os.environ, AITER_CONFIG_FMOE=str(table), _MOEV2_SYNTH_CASES=json.dumps(synth)
     )

@@ -4,15 +4,18 @@
 
 An `Entry` covers one class of problems, given by `match(...)`: set membership on named
 fields. Its `Region`s split the class by `when(...)`: integer thresholds and set
-membership on named scalars. `otherwise` is the part of the class no region covers.
-Each region lists structures best first; the first feasible one wins.
+membership on named scalars, and named boolean predicates. `otherwise` is the part of the
+class no region covers. Each region lists structures best first; the first feasible one
+wins. A region can instead name what the legacy code runs there (`legacy=`), for a
+branch not ported yet: its problems are declined back to the legacy code.
 
 The result never depends on the order of entries or regions: classes are disjoint, and so
 are the regions of one entry. `check_table` verifies that statically, together with dead
 regions, unknown structures and an always-feasible last structure in every list;
 `check_problems` verifies, over a set of problems (the dispatch snapshot key grid in CI),
 that every supported problem lands in exactly one entry and one region whose last
-structure is feasible, and that every region is reached.
+structure is feasible (or that hands it to the legacy code), and that every region is
+reached.
 
 Each entry is a branch of the legacy `get_2stage_cfgs` default path, translated 1:1 with
 its full condition.
@@ -28,7 +31,7 @@ from dataclasses import dataclass
 
 import torch
 
-from aiter import QuantType
+from aiter import ActivationType, QuantType, dtypes
 
 from ..problem import FrozenMap
 from ..segments.base import Segment
@@ -60,7 +63,78 @@ SCALARS = {
     "cu_num": lambda p: p.cu_num,
 }
 
+# fmt: off
+# The keys of the legacy `fused_moe_1stage_dict` (aiter/fused_moe.py), whose problems the
+# legacy default path runs on 1-stage ASM under a per-quant-type token condition.
+# tests/test_moev2_ranking.py checks this copy against it.
+_S, _G = ActivationType.Silu, ActivationType.Gelu
+_V2, _SW = ActivationType.Situv2, ActivationType.Swiglu
+_NO, _TOK, _1X32, _1X128 = (
+    QuantType.No, QuantType.per_Token, QuantType.per_1x32, QuantType.per_1x128
+)
+_BF, _FP, _F8, _I8 = dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.i8
+_F4, _I4 = dtypes.fp4x2, dtypes.i4x2
+FMOE_1STAGE_KEYS = {
+    # activation, quant_type, out dtype, q_dtype_a, q_dtype_w, g1u1, doweight_stage1
+    "gfx942": frozenset({
+        (_S, _NO,    _BF, _BF, _BF, False, False),
+        (_S, _NO,    _FP, _FP, _FP, False, False),
+        (_G, _TOK,   _BF, _F8, _I4, True,  False),
+        (_S, _1X32,  _BF, _F4, _F4, True,  False),
+        (_S, _TOK,   _BF, _I8, _I8, True,  False),
+        (_G, _TOK,   _BF, _I8, _I8, True,  False),
+        (_S, _TOK,   _BF, _F8, _F8, True,  False),
+        (_G, _TOK,   _BF, _F8, _F8, True,  False),
+        (_S, _1X128, _BF, _F8, _F8, True,  False),
+        (_S, _TOK,   _BF, _I8, _I8, False, False),
+        (_G, _TOK,   _BF, _I8, _I8, False, False),
+    }),
+    "gfx950": frozenset({
+        (_S,  _1X32,  _BF, _F4, _F4, True,  False),
+        (_V2, _1X32,  _BF, _BF, _F4, True,  False),
+        (_SW, _1X32,  _BF, _F4, _F4, True,  False),
+        (_SW, _1X32,  _BF, _BF, _F4, True,  False),
+        (_S,  _1X128, _BF, _F8, _F8, True,  False),
+        (_G,  _1X128, _BF, _F8, _F8, True,  False),
+        (_S,  _TOK,   _BF, _BF, _BF, False, False),
+        (_S,  _TOK,   _BF, _F8, _F8, True,  True),
+        (_S,  _TOK,   _BF, _F8, _F8, True,  False),
+        (_G,  _TOK,   _BF, _F8, _F8, True,  False),
+    }),
+}
+# fmt: on
+
+
+def _fmoe_1stage_key(p):
+    return (
+        p.activation.activation,
+        p.quant_type,
+        p.out_dtype,
+        p.act_in.dtype,
+        p.w1.dtype,
+        p.layout.g1u1,
+        "doweight_stage1" in p.features,
+    )
+
+
+def _fmoe_1stage(p) -> bool:
+    """The legacy `fused_moe_1stage_dict` has the problem's key for its arch."""
+    return _fmoe_1stage_key(p) in FMOE_1STAGE_KEYS.get(p.arch, ())
+
+
+# Named boolean predicates `when(...)` can test (`when(fmoe_1stage=True)`).
+PREDICATES = {"fmoe_1stage": _fmoe_1stage}
+
 _GETTERS = {**MATCH_FIELDS, **SCALARS}
+
+
+def _when_value(name, p) -> int:
+    """A scalar's value, or a predicate's as 0/1."""
+    if name in PREDICATES:
+        return int(PREDICATES[name](p))
+    return SCALARS[name](p)
+
+
 _OPS = {"le": "<=", "lt": "<", "ge": ">=", "gt": ">", "in": " in "}
 
 
@@ -167,13 +241,13 @@ def _condition(op, threshold) -> Domain:
 
 @dataclass(frozen=True)
 class When:
-    """Conditions on named scalars, all of which must hold."""
+    """Conditions on named scalars and predicates, all of which must hold."""
 
-    domains: FrozenMap  # scalar name -> Domain
+    domains: FrozenMap  # scalar or predicate (0/1) name -> Domain
     text: str
 
     def holds(self, p) -> bool:
-        return all(SCALARS[name](p) in d for name, d in self.domains.items())
+        return all(_when_value(name, p) in d for name, d in self.domains.items())
 
     def disjoint(self, other) -> bool:
         return any(
@@ -190,16 +264,26 @@ class When:
 
 
 def when(**conditions) -> When:
-    """`when(rows_per_expert__le=8, model_dim__gt=2048, topk__in={6, 8})`."""
+    """`when(rows_per_expert__le=8, model_dim__gt=2048, topk__in={6, 8}, fmoe_1stage=True)`."""
     if not conditions:
         raise ValueError("when() needs at least one condition; use `otherwise`")
     domains, shown = {}, []
     for key, threshold in conditions.items():
+        if key in PREDICATES:
+            if not isinstance(threshold, bool):
+                raise TypeError(
+                    f"{key} is a predicate: True or False, got {threshold!r}"
+                )
+            d = Domain(values=frozenset({int(threshold)}))
+            domains[key] = domains[key] & d if key in domains else d
+            shown.append(key if threshold else f"not {key}")
+            continue
         name, sep, op = key.rpartition("__")
         if not sep or name not in SCALARS or op not in _OPS:
             raise ValueError(
                 f"bad condition {key!r}: use <scalar>__<op> with a scalar in "
-                f"{sorted(SCALARS)} and an op in {sorted(_OPS)}"
+                f"{sorted(SCALARS)} and an op in {sorted(_OPS)}, or a predicate in "
+                f"{sorted(PREDICATES)}"
             )
         d = _condition(op, threshold)
         domains[name] = domains[name] & d if name in domains else d
@@ -225,10 +309,15 @@ def _structures(texts) -> tuple:
 @dataclass(frozen=True)
 class Region:
     when: When
-    prefer: tuple  # structures (segment-name tuples), best first
+    prefer: tuple = ()  # structures (segment-name tuples), best first
+    # Instead of `prefer`: what the legacy code runs here (not ported yet); the problems
+    # of this region are declined back to it.
+    legacy: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "prefer", _structures(self.prefer))
+        if (self.legacy is None) == (not self.prefer):
+            raise ValueError(f"region [{self.when}]: give either prefer or legacy")
 
 
 @dataclass(frozen=True)
@@ -243,25 +332,29 @@ class Entry:
         object.__setattr__(self, "otherwise", _structures(self.otherwise))
 
     def lists(self):
-        """`(label, structures)` for every region, then `otherwise` if it has any."""
+        """`(label, structures, legacy)` for every region, then `otherwise` if any."""
         for r in self.regions:
-            yield f"{self.name}[{r.when}]", r.prefer
+            yield f"{self.name}[{r.when}]", r.prefer, r.legacy
         if self.otherwise:
-            yield f"{self.name}[otherwise]", self.otherwise
+            yield f"{self.name}[otherwise]", self.otherwise, None
 
     def region_for(self, p):
-        """`(label, structures)` of the region `p` falls in; empty structures if none."""
+        """`(label, structures, legacy)` of the region `p` falls in.
+
+        `otherwise` when no region holds (empty structures if the entry has none).
+        """
         hits = [r for r in self.regions if r.when.holds(p)]
         if len(hits) > 1:
             raise RuntimeError(
                 f"{self.name}: overlapping regions {[str(r.when) for r in hits]}"
             )
         if hits:
-            return f"{self.name}[{hits[0].when}]", hits[0].prefer
-        return f"{self.name}[otherwise]", self.otherwise
+            return f"{self.name}[{hits[0].when}]", hits[0].prefer, hits[0].legacy
+        return f"{self.name}[otherwise]", self.otherwise, None
 
 
 FP8 = frozenset({torch.float8_e4m3fn, torch.float8_e4m3fnuz})
+B16 = frozenset({torch.bfloat16, torch.float16})
 CK_2STAGE = "sort | quant.a1 | ck.gemm1 | quant.inter | ck.gemm2"
 
 RANKING = (
@@ -271,6 +364,15 @@ RANKING = (
     Entry(
         "fp8_per_tensor",
         match(quant_type=QuantType.per_Tensor, w1_dtype=FP8),
+        otherwise=[CK_2STAGE],
+    ),
+    # get_2stage_cfgs without a tuned row: bf16/fp16 weights with an empty kernelName1
+    # take the CK branch. The QuantType.No keys of fused_moe_1stage_dict (1-stage ASM
+    # `fmoe` under 256 tokens) are all g1u0, which no segment here runs (CK stage 1 is
+    # g1u1 only), so the local paths do not claim them.
+    Entry(
+        "a16w16",
+        match(quant_type=QuantType.No, w1_dtype=B16),
         otherwise=[CK_2STAGE],
     ),
 )
@@ -284,19 +386,23 @@ def entry_for(p, table=RANKING):
 
 
 def best(problem, plans, table=RANKING):
-    """`(label, plan)`: the first feasible structure of `problem`'s region, or None.
+    """`(label, plan, legacy)` for `problem`'s region, or None when no entry applies.
 
-    `plans` are the feasible segment tuples; `label` names the entry and region.
+    `plan`: the first feasible structure of the region, from `plans` (the feasible
+    segment tuples), None if none is; `label` names the entry and region. A region that
+    hands the problem to the legacy code gives `(label, None, legacy)`.
     """
     entry = entry_for(problem, table)
     if entry is None:
         return None
-    label, prefer = entry.region_for(problem)
+    label, prefer, legacy = entry.region_for(problem)
+    if legacy is not None:
+        return label, None, legacy
     by_names = {tuple(s.name for s in plan): plan for plan in plans}
     for names in prefer:
         if names in by_names:
-            return label, by_names[names]
-    return None
+            return label, by_names[names], None
+    return label, None, None
 
 
 def rankable(plans):
@@ -354,7 +460,9 @@ def check_table(table, segments) -> list:
         for a, b in itertools.combinations(e.regions, 2):
             if not a.when.disjoint(b.when):
                 errors.append(f"{e.name}: regions [{a.when}] and [{b.when}] overlap")
-        for label, prefer in e.lists():
+        for label, prefer, legacy in e.lists():
+            if legacy is not None:
+                continue
             if not prefer:
                 errors.append(f"{label}: empty structure list")
                 continue
@@ -372,19 +480,22 @@ def check_table(table, segments) -> list:
     return errors
 
 
-def check_problems(problems, segment_sets, table=RANKING):
+def check_problems(problems, paths, table=RANKING):
     """`(errors, hits)` over `(label, problem)` pairs.
 
-    A problem is supported by a segment set when it has a rankable feasible plan there; it
-    must land in exactly one entry and one region (or `otherwise`) whose last structure is
-    feasible. `hits` counts problems per region label, for `dead_lists`.
+    A problem is supported by a path (with `takes` and `segments`) when the path takes it
+    and it has a rankable feasible plan there; it must land in exactly one entry and one
+    region (or `otherwise`) whose last structure is feasible, or that hands it to the
+    legacy code. `hits` counts problems per region label, for `dead_lists`.
     """
     from .resolver import feasible_plans
 
     errors, hits = [], Counter()
     for label, p in problems:
-        for segments in segment_sets:
-            plans = rankable(feasible_plans(p, segments)[0])
+        for path in paths:
+            if not path.takes(p):
+                continue
+            plans = rankable(feasible_plans(p, path.segments)[0])
             if not plans:
                 continue
             entries = [e for e in table if e.match.holds(p)]
@@ -398,11 +509,13 @@ def check_problems(problems, segment_sets, table=RANKING):
                 shown = [str(r.when) for r in regions]
                 errors.append(f"{label}: lands in regions {shown} of {entry.name}")
                 continue
-            region, prefer = entry.region_for(p)
-            if not prefer:
+            region, prefer, legacy = entry.region_for(p)
+            if legacy is None and not prefer:
                 errors.append(f"{label}: no region of {entry.name} and no otherwise")
                 continue
             hits[region] += 1
+            if legacy is not None:
+                continue
             feasible = {tuple(s.name for s in plan) for plan in plans}
             if prefer[-1] not in feasible:
                 errors.append(
@@ -417,6 +530,6 @@ def dead_lists(hits, table=RANKING) -> list:
     return [
         f"{label}: dead, no supported problem lands here"
         for e in table
-        for label, _ in e.lists()
+        for label, _, _ in e.lists()
         if not hits[label]
     ]
