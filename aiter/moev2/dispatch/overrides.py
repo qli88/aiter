@@ -28,6 +28,11 @@ def nt_override() -> int:
     return int(os.environ.get("AITER_USE_NT", "-1"))
 
 
+def xbf16() -> bool:
+    """`AITER_XBFLOAT16=1`: the gfx950 1-stage fp8 blockscale kernel's bf16 variant."""
+    return int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
+
+
 def online_tune() -> bool:
     """`AITER_ONLINE_TUNE=1`: tune missing keys on the fly (legacy code only, for now)."""
     return os.environ.get("AITER_ONLINE_TUNE", "0") == "1"

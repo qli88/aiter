@@ -53,15 +53,15 @@ def clamps(swiglu_limit) -> bool:
     return swiglu_limit is not None and swiglu_limit != 0 and swiglu_limit != math.inf
 
 
-def why_not(call, quant_type, archs, weight_dtypes):
+def why_not(call, quant_types, archs, weight_dtypes):
     """Why a local path does not claim the `fused_moe_` call, or None if it does.
 
-    Cheap checks on the arguments; `run` may still decline a claimed call. Claimed:
-    `quant_type` (and a `quant_type_a`, if given), Silu or Gelu, separated gate/up, no
-    bias, clamping swiglu_limit, beta or linear_beta, global scales, padding, scatter,
-    caller-chosen activation dtypes, HERD routing, deterministic mode or registered
-    presort, outside AITER_ONLINE_TUNE, on `archs`, with 3D `w1`/`w2` of
-    `weight_dtypes` and `w1` holding gate and up (g1u1).
+    Cheap checks on the arguments; `run` may still decline a claimed call. Claimed: a
+    quant type in `quant_types` (and the same `quant_type_a`, if given), Silu or Gelu,
+    separated gate/up, no bias, clamping swiglu_limit, beta or linear_beta, global
+    scales, padding, scatter, caller-chosen activation dtypes, HERD routing,
+    deterministic mode or registered presort, outside AITER_ONLINE_TUNE, on `archs`,
+    with 3D `w1`/`w2` of `weight_dtypes` and `w1` holding gate and up (g1u1).
     """
     if overrides.online_tune():
         return "AITER_ONLINE_TUNE=1"
@@ -72,8 +72,9 @@ def why_not(call, quant_type, archs, weight_dtypes):
     # The legacy code consumes a registered presort on every call; the local paths do not.
     if getattr(presorted_moe._PRESORTED_MOE, "aux", None) is not None:
         return "a registered presort"
-    if QuantType(call["quant_type"]) != quant_type:
-        return f"quant_type {QuantType(call['quant_type'])}"
+    quant_type = QuantType(call["quant_type"])
+    if quant_type not in quant_types:
+        return f"quant_type {quant_type}"
     quant_type_a = call["quant_type_a"]
     if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
         return f"quant_type_a {QuantType(quant_type_a)}"

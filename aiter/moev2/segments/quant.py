@@ -11,6 +11,8 @@ Please do not modify this code without coordinating with the moev2 owners (@qli8
 aiter/moev2/README.md.
 """
 
+import functools
+
 from aiter import QuantType
 from aiter import get_hip_quant as get_quant
 
@@ -31,10 +33,21 @@ class QuantA1(Segment):
     def produces(self, p, params):
         return Buf("tokens", p.act_in)
 
-    def run(self, quant_type, hidden_states, a1_scale, q_dtype_a, num_local_tokens):
+    def run(
+        self,
+        quant_type,
+        hidden_states,
+        a1_scale,
+        q_dtype_a,
+        num_local_tokens,
+        transpose_scale=False,
+    ):
         """`(a1, a1_scale)`: quantize unless the activations already are `q_dtype_a`."""
         if hidden_states.dtype != q_dtype_a:
-            return get_quant(quant_type)(
+            quant_func = get_quant(quant_type)
+            if transpose_scale:
+                quant_func = functools.partial(quant_func, transpose_scale=True)
+            return quant_func(
                 hidden_states,
                 scale=a1_scale,
                 quant_dtype=q_dtype_a,

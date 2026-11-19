@@ -41,7 +41,7 @@ SEGMENTS = (
 
 def why_not(call):
     """Why this path does not claim the `fused_moe_` call, or None if it does."""
-    return local.why_not(call, QuantType.per_Tensor, ARCHS, (dtypes.fp8,))
+    return local.why_not(call, (QuantType.per_Tensor,), ARCHS, (dtypes.fp8,))
 
 
 def claims(call) -> bool:

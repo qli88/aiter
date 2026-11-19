@@ -21,6 +21,7 @@ from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import hooks
+from ..dispatch.ops import Op
 from ..shapes import _is_row_major_2d, get_inter_dim
 from .output import (
     _return_output,
@@ -179,7 +180,10 @@ def run_two_stage(c: Call, metadata, plan, q_dtype_a, after_sort=None):
         block_size_M = int(block_size_M)
     sort = plan.segment("sort").segment
     quant_a1 = plan.segment("quant.a1").segment
-    quant_inter = plan.segment("quant.inter").segment
+    gemm1 = plan.starting(Op.GEMM1).segment
+    # A stage 1 that also quantizes its output writes into its own buffer layout.
+    fused_inter_quant = gemm1.covers[1] == Op.QUANT_INTER
+    quant_inter = None if fused_inter_quant else plan.segment("quant.inter").segment
 
     hidden_states, w1, w2 = c["hidden_states"], c["w1"], c["w2"]
     topk_ids, topk_weight = c["topk_ids"], c["topk_weight"]
@@ -213,21 +217,29 @@ def run_two_stage(c: Call, metadata, plan, q_dtype_a, after_sort=None):
             else torch.empty((token_num, c.model_dim), dtype=dtype, device=device)
         )
     a1, a1_scale = quant_a1.run(
-        c.quant_type, hidden_states, c["a1_scale"], q_dtype_a, num_local_tokens
+        c.quant_type,
+        hidden_states,
+        c["a1_scale"],
+        q_dtype_a,
+        num_local_tokens,
+        transpose_scale=getattr(gemm1, "transpose_a1_scale", False),
     )
-    # Stage1 does not write slots with topk_ids == -1 or masked out by
-    # expert_mask, but dynamic per-tensor a2 quant reads the whole buffer,
-    # so stale memory in those slots can set the scale.
-    _a2_alloc = (
-        torch.zeros
-        if c.quant_type == QuantType.per_Tensor and c["a2_scale"] is None
-        else torch.empty
-    )
-    a2 = _a2_alloc(
-        (token_num, topk, inter_dim),
-        dtype=dtype,
-        device=device,
-    )
+    if fused_inter_quant:
+        a2 = gemm1.out_buffer(a1, a1_scale, token_num, topk, inter_dim, q_dtype_a)
+    else:
+        # Stage1 does not write slots with topk_ids == -1 or masked out by
+        # expert_mask, but dynamic per-tensor a2 quant reads the whole buffer,
+        # so stale memory in those slots can set the scale.
+        _a2_alloc = (
+            torch.zeros
+            if c.quant_type == QuantType.per_Tensor and c["a2_scale"] is None
+            else torch.empty
+        )
+        a2 = _a2_alloc(
+            (token_num, topk, inter_dim),
+            dtype=dtype,
+            device=device,
+        )
     _stage1_call = functools.partial(
         metadata.stage1,
         a1,
@@ -245,16 +257,19 @@ def run_two_stage(c: Call, metadata, plan, q_dtype_a, after_sort=None):
     )
     hooks.record_kernel("stage1", _stage1_call)
     a2 = _stage1_call()
-    a2, a2_scale = quant_inter.run(
-        c.quant_type,
-        a2,
-        c["a2_scale"],
-        q_dtype_a,
-        num_local_tokens,
-        token_num,
-        topk,
-        inter_dim,
-    )
+    if fused_inter_quant:
+        a2, a2_scale = gemm1.split_out(a2, a1, a1_scale, token_num, topk, inter_dim)
+    else:
+        a2, a2_scale = quant_inter.run(
+            c.quant_type,
+            a2,
+            c["a2_scale"],
+            q_dtype_a,
+            num_local_tokens,
+            token_num,
+            topk,
+            inter_dim,
+        )
     _stage2_call = functools.partial(
         metadata.stage2,
         a2,

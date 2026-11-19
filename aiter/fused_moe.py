@@ -4500,10 +4500,10 @@ def _can_reroute_bf16_to_a16wmix(
 
 
 # NOTE: aiter.moev2 (under development, not graduated) keeps a copy of this logic for
-# the kernel families its paths cover (per-tensor fp8 today): the tuned lookup, row
-# checks and log lines in aiter/moev2/dispatch/resolver.py, each default branch in
-# aiter/moev2/dispatch/ranking.py. Mirror changes there or coordinate with the moev2
-# owners (@qli88), then run the tests/moe_dispatch checks in aiter/moev2/README.md.
+# the kernel families its paths cover (listed in aiter/moev2/README.md): the tuned
+# lookup, row checks and log lines in aiter/moev2/dispatch/resolver.py, each default
+# branch in aiter/moev2/dispatch/ranking.py. Mirror changes there or coordinate with the
+# moev2 owners (@qli88), then run the tests/moe_dispatch checks in aiter/moev2/README.md.
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,

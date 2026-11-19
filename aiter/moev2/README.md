@@ -41,8 +41,9 @@ next to the legacy code (`aiter/fused_moe.py`, `aiter/fhmoe.py`,
 - Helpers that both sides need are moved here verbatim and imported back into
   `aiter/fused_moe.py` under their old names, so existing imports keep working.
 
-Status: two paths are registered, neither graduated: `a8w8_pt` (per-tensor fp8) and
-`a16w16` (unquantized bf16/fp16).
+Status: four paths are registered, none graduated: `a8w8_pt` (per-tensor fp8), `a16w16`
+(unquantized bf16/fp16), `a8w8_ptok` (per-token fp8) and `a8w8_blockscale` (fp8 in
+1x128 / 128x128 blocks).
 
 ## How a call flows
 
@@ -76,27 +77,29 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 | `reference/torch_moe.py` | permanent | PyTorch reference MoE that tests check backends against, moved from `fused_moe.py`: `torch_moe`, `torch_moe_stage1/2`, the activations and the per-1x32 dequant helpers. |
 | `dispatch/ops.py` | permanent | The MoE op chain that every plan covers: sort, activation quant, GEMM1, activation, intermediate quant, GEMM2, reduce. |
 | `dispatch/buf.py` | permanent | Boundary formats between adjacent segments. |
-| `dispatch/plan.py` | permanent | A plan: the segments that cover the op chain, with their parameters. |
+| `dispatch/plan.py` | permanent | A plan: the segments that cover the op chain, with their parameters; `starting(op)` finds the segment whose span starts at an op. |
 | `dispatch/kernel_names.py` | permanent | One parser for every kernel-name family in tuned tables; `parse(n).format() == n` for every shipped name. |
 | `dispatch/tuned.py` | permanent | Tuned-table reader (shared with legacy `get_2stage_cfgs`) and `lookup` with the legacy fallbacks; `@cached` and `clear_cache()`, which reset every v2 cache together. |
-| `dispatch/ranking.py` | permanent | The default ranking table used when no tuned row applies, with static checks that it is unambiguous and complete. Entries can test named predicates (`fmoe_1stage`: a copy of the keys of legacy `fused_moe_1stage_dict`) and can mark regions that stay on legacy. |
-| `dispatch/resolver.py` | permanent | Resolves a `MoeProblem` to a plan in the legacy order, collecting the legacy log lines and raising where legacy raises (unshuffled fp8 CK weights on gfx950); declines rows for families no segment owns and post-reduction rows, and says why. |
-| `dispatch/overrides.py` | permanent | Debug overrides of dispatch decisions (`AITER_BYPASS_TUNE_CONFIG`, `AITER_USE_NT`, `AITER_ONLINE_TUNE`, ...), read where legacy reads them. |
+| `dispatch/ranking.py` | permanent | The default ranking table used when no tuned row applies, with static checks that it is unambiguous and complete. Entries can test named predicates (`fmoe_1stage`: a copy of the keys of legacy `fused_moe_1stage_dict`; `blockscale_1stage_kernel`: the kernel library's check that legacy calls) and can mark regions that stay on legacy. A condition list is tested in the order written, so a predicate runs only where legacy evaluates it. |
+| `dispatch/resolver.py` | permanent | Resolves a `MoeProblem` to a plan in the legacy order, collecting the legacy log lines and raising where legacy raises (unshuffled fp8 CK weights on gfx950); declines rows for families no segment owns and post-reduction rows, and says why. Stage segments are found by the op they cover, so a stage 1 may span more than GEMM1. |
+| `dispatch/overrides.py` | permanent | Debug overrides of dispatch decisions (`AITER_BYPASS_TUNE_CONFIG`, `AITER_USE_NT`, `AITER_XBFLOAT16`, `AITER_ONLINE_TUNE`, ...), read where legacy reads them. |
 | `dispatch/profile.py` | permanent | Measured runners-up per tuned key; empty for now. |
 | `segments/base.py` | permanent | The `Segment` interface. A segment declares what it can run (`Cap`); anything a problem has that no `Cap` declares rejects the segment. |
 | `segments/sort.py` | permanent | Token sorting: `moe_sorting` and its helpers, moved from `fused_moe.py`, which imports them (Opus, CK or FlyDSL backend; local topk ids, the adaptive auxiliary sort, FLAT's unsorted input), and segment `sort`, which runs the plain sort through it. |
-| `segments/quant.py` | permanent | Activation quantization before GEMM1 and between the GEMMs. |
-| `segments/ck.py` | permanent | CK 2-stage GEMM kernels for per-tensor fp8 and bf16/fp16 (stage 1 g1u1 only); `ck_moe_stage1` and `_require_shuffled_gfx950_fp8` moved from `fused_moe.py`. |
-| `segments/asm.py` | permanent | ASM stage-1 kernels; `asm_stage1` moved from `fused_moe.py`. |
+| `segments/quant.py` | permanent | Activation quantization before GEMM1 (with the scale transposed when the stage 1 kernel needs it) and between the GEMMs. |
+| `segments/ck.py` | permanent | CK 2-stage GEMM kernels for per-tensor fp8, per-token fp8, 1x128 blockscale fp8 and bf16/fp16 (stage 1 g1u1 only); `ck_moe_stage1` and `_require_shuffled_gfx950_fp8` moved from `fused_moe.py`. |
+| `segments/asm.py` | permanent | ASM stage-1 kernels: per-tensor and per-token fp8, and for 1x128 fp8 the kernel that also quantizes the intermediate, writing it and its scales into one buffer (it covers GEMM1 and the intermediate quant); `asm_stage1` moved from `fused_moe.py`. |
 | `segments/whole_graph.py` | permanent | Whole-graph implementations (`impl__<name>__<config>`) from `aiter.fused_moe_registry`. |
-| `segments/defaults.py` | permanent | Default kernel parameters (`BLOCK_SIZE_M`, `get_block_size_M`, `get_ksplit`, `use_nt`), moved from `fused_moe.py`. |
-| `execute/executor.py` | permanent | Runs a plan on one call, statement for statement as the legacy `_fused_moe_impl` / `fused_moe_2stages`. |
+| `segments/defaults.py` | permanent | Default kernel parameters (`BLOCK_SIZE_M`, `get_block_size_M`, `get_ksplit`, `use_nt`), moved from `fused_moe.py`; `default_block_m` / `default_ksplit`, the 2-stage defaults of the legacy default branch per quant type. |
+| `execute/executor.py` | permanent | Runs a plan on one call, statement for statement as the legacy `_fused_moe_impl` / `fused_moe_2stages`, including a stage 1 that quantizes its own output. |
 | `execute/metadata.py` | permanent | `MOEMetadata` and `AsmMoeMode`, moved from `fused_moe.py`. |
 | `execute/output.py` | permanent | The caller's `output=` buffer: validation and the final copy, moved from `fused_moe.py`. |
 | `migration/__init__.py` | to be removed | The migration paths, one module per path. |
 | `migration/local.py` | to be removed | Shared by the single-GPU paths at the `fused_moe_` entry: the common claims checks (`why_not` gives each refusal's reason), the per-key cached resolve, the log-only second lookup after the sort (a call where it would raise or be declined is declined), the run and `dispatch_record`. |
 | `migration/a8w8_pt.py` | to be removed | Path `a8w8_pt` (per-tensor fp8): its claims, segments, `takes` and registration. |
 | `migration/a16w16.py` | to be removed | Path `a16w16` (unquantized bf16/fp16, `QuantType.No`): its claims, segments, `takes` and registration. |
+| `migration/a8w8_ptok.py` | to be removed | Path `a8w8_ptok` (per-token fp8): its claims, segments, `takes` and registration. |
+| `migration/a8w8_blockscale.py` | to be removed | Path `a8w8_blockscale` (fp8, 1x128 activations and 128x128 weight blocks; `per_128x128` calls too, which legacy remaps): its claims, segments, `takes` and registration. |
 | `tuning/__init__.py` | permanent | Empty subpackage; a later step adds the tuner. |
 
 ## Tests
@@ -107,13 +110,13 @@ is retired (legacy `fused_moe.py` and `fhmoe.py` become re-export shims over
 | `tests/test_moev2_switch.py` | to be removed | `AITER_MOEV2` parsing and routing; the v2 entry point keeps the legacy signature. |
 | `tests/test_moev2_hooks.py` | permanent | The hooks restore the previous state. |
 | `tests/test_moev2_differential.py` | to be removed | Runs the differential harness: dispatch on the CPU, outputs on the GPU (with `AITER_MOEV2_GPU_DIFFERENTIAL=1`; CI runs the rest). |
-| `tests/test_moev2_dispatch.py` | permanent; the tests against legacy are removed | Unit tests of the problem, plans and capabilities, kernel names, resolver and overrides, the executor, and the `a8w8_pt` and `a16w16` paths (claims, `takes`, g1u0 left to legacy, the second-lookup declines); the snapshot's feature variants are valid legacy calls. |
-| `tests/test_moev2_ranking.py` | permanent | Unit tests of the ranking table and its checks, including predicates and legacy regions. |
+| `tests/test_moev2_dispatch.py` | permanent; the tests against legacy are removed | Unit tests of the problem, plans and capabilities, kernel names, resolver and overrides, the executor (including the packed 1x128 stage 1 buffer), and the local paths (claims, `takes`, g1u0 left to legacy, the second-lookup declines, the per-token 1-stage hand-back, the 1x128 block_m and split-K defaults); the snapshot's feature variants are valid legacy calls. |
+| `tests/test_moev2_ranking.py` | permanent | Unit tests of the ranking table and its checks, including predicates, their evaluation order and legacy regions. |
 | `tests/test_moe_dispatch_snapshot.py` | permanent | Legacy dispatch matches the golden snapshot. |
 | `tests/moe_dispatch/keys.py` | permanent; the feature variants are removed | Dispatch keys per simulated arch: every tuned row plus a grid of untuned keys. For the quant types v2 paths take (`FEATURE_QUANT_TYPES`), feature variants: the same call with one more `get_2stage_cfgs` feature (`num_local_tokens`, activation scales, bias, padding, ...), so the snapshot names the key whose decision changed. |
 | `tests/moe_dispatch/arch_sim.py` | permanent | Runs dispatch as if on a given GPU arch, in a process without a GPU. |
 | `tests/moe_dispatch/snapshot.py`, `record.py` | permanent | Generate, check or update the legacy dispatch snapshot (`golden/*.jsonl.gz`), read from frozen tuned tables (`golden/inputs/`). |
-| `tests/moe_dispatch/differential.py` | to be removed | Requires v2 to make the same dispatch choice as legacy for every key a path claims. |
+| `tests/moe_dispatch/differential.py` | to be removed | Requires v2 to make the same dispatch choice as legacy for every key a path claims, and counts the keys a path hands back to legacy as 1-stage. |
 | `tests/moe_dispatch/key_checks.py` | to be removed | Per key: the problem/legacy key round trip, and the tuned lookup returns legacy's row. |
 | `tests/moe_dispatch/ranking_checks.py` | permanent | Every rankable snapshot key lands in one ranking entry and region, and every region is reached. |
 | `tests/moe_dispatch/gpu_differential.py` | to be removed | On a GPU, a path launches the same kernels on the same inputs as legacy and gives the same output (`--path`; `--synth-table` adds tuned rows the shipped tables lack). |

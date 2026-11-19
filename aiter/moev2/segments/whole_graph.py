@@ -19,7 +19,7 @@ from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..problem import ScaleSpec
 from .base import RowRejection, Segment
-from .ck import a8w8_per_tensor_caps, a16w16_caps
+from .ck import a8w8_per_tensor_caps, a8w8_per_token_caps, a16w16_caps
 
 __all__ = ["FusedMoeImplResolutionError", "WholeGraph", "resolve_fused_moe_impl"]
 
@@ -31,7 +31,7 @@ class WholeGraph(Segment):
 
     @property
     def capabilities(self):
-        return a8w8_per_tensor_caps() + a16w16_caps()
+        return a8w8_per_tensor_caps() + a8w8_per_token_caps() + a16w16_caps()
 
     def produces(self, p, params):
         return Buf("out", ScaleSpec(p.out_dtype))

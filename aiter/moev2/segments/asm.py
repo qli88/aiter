@@ -23,7 +23,7 @@ from ..dispatch.ops import Op
 from ..problem import ScaleSpec
 from ..shapes import get_inter_dim
 from .base import Segment
-from .ck import a8w8_per_tensor_caps
+from .ck import a8w8_blockscale_caps, a8w8_per_tensor_caps, a8w8_per_token_caps
 
 
 def asm_stage1(
@@ -127,7 +127,7 @@ class AsmStage1(Segment):
 
     @property
     def capabilities(self):
-        return a8w8_per_tensor_caps()
+        return a8w8_per_tensor_caps() + a8w8_per_token_caps()
 
     def produces(self, p, params):
         return Buf("inter", ScaleSpec(dtypes.bf16))
@@ -139,3 +139,44 @@ class AsmStage1(Segment):
             activation=p.activation.activation,
             quant_type=p.quant_type,
         )
+
+
+class AsmStage1Blockscale(AsmStage1):
+    """ASM stage 1 for 1x128 fp8: it writes the intermediate already quantized.
+
+    The a1 quantization writes its scale transposed for this kernel, which writes fp8
+    rows followed by their fp32 scales into one buffer (`out_buffer`); `split_out` cuts
+    that into the GEMM2 inputs.
+    """
+
+    name = "asm.stage1_1x128"
+    covers = (Op.GEMM1, Op.QUANT_INTER)
+    transpose_a1_scale = True
+
+    @property
+    def capabilities(self):
+        return a8w8_blockscale_caps()
+
+    def produces(self, p, params):
+        return Buf("inter", p.act_in)
+
+    @staticmethod
+    def out_buffer(a1, a1_scale, token_num, topk, inter_dim, q_dtype_a):
+        ratio = a1_scale.element_size() // a1.element_size()
+        return torch.empty(
+            (token_num + (token_num * ratio + 127) // 128, topk, inter_dim),
+            dtype=q_dtype_a,
+            device=a1.device,
+        )
+
+    @staticmethod
+    def split_out(a2, a1, a1_scale, token_num, topk, inter_dim):
+        """`(a2, a2_scale)` from the `out_buffer` stage 1 wrote."""
+        ratio = a1_scale.element_size() // a1.element_size()
+        a2_scale = (
+            a2[token_num:, ...]
+            .view(-1)[: token_num * topk * inter_dim * ratio // 128]
+            .view(dtypes.fp32)
+            .view(token_num, -1)
+        )
+        return a2[:token_num, :, :], a2_scale

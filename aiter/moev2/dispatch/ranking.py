@@ -25,16 +25,20 @@ Please do not modify this code without coordinating with the moev2 owners (@qli8
 aiter/moev2/README.md.
 """
 
+import functools
 import itertools
 from collections import Counter
 from dataclasses import dataclass
 
 import torch
 
+import aiter
 from aiter import ActivationType, QuantType, dtypes
 
 from ..problem import FrozenMap
 from ..segments.base import Segment
+from ..segments.defaults import BLOCK_SIZE_M
+from . import overrides
 from .ops import Op
 
 # Fields `match(...)` tests by set membership.
@@ -66,13 +70,16 @@ SCALARS = {
 # fmt: off
 # The keys of the legacy `fused_moe_1stage_dict` (aiter/fused_moe.py), whose problems the
 # legacy default path runs on 1-stage ASM under a per-quant-type token condition.
-# tests/test_moev2_ranking.py checks this copy against it.
+# tests/test_moev2_ranking.py checks this copy against it. `_F8` stands for the arch's
+# fp8, `dtypes.fp8` when looked up (legacy binds it at import; the same dtype in a GPU
+# process, and the arch simulation of the tests swaps both).
 _S, _G = ActivationType.Silu, ActivationType.Gelu
 _V2, _SW = ActivationType.Situv2, ActivationType.Swiglu
 _NO, _TOK, _1X32, _1X128 = (
     QuantType.No, QuantType.per_Token, QuantType.per_1x32, QuantType.per_1x128
 )
-_BF, _FP, _F8, _I8 = dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.i8
+_F8 = "fp8"
+_BF, _FP, _I8 = dtypes.bf16, dtypes.fp16, dtypes.i8
 _F4, _I4 = dtypes.fp4x2, dtypes.i4x2
 FMOE_1STAGE_KEYS = {
     # activation, quant_type, out dtype, q_dtype_a, q_dtype_w, g1u1, doweight_stage1
@@ -117,13 +124,44 @@ def _fmoe_1stage_key(p):
     )
 
 
+@functools.cache
+def _fmoe_1stage_keys(arch, fp8):
+    return frozenset(
+        tuple(fp8 if el is _F8 else el for el in key)
+        for key in FMOE_1STAGE_KEYS.get(arch, ())
+    )
+
+
+def fmoe_1stage_keys(arch):
+    """`FMOE_1STAGE_KEYS[arch]` with `_F8` read as `dtypes.fp8`."""
+    return _fmoe_1stage_keys(arch, dtypes.fp8)
+
+
 def _fmoe_1stage(p) -> bool:
     """The legacy `fused_moe_1stage_dict` has the problem's key for its arch."""
-    return _fmoe_1stage_key(p) in FMOE_1STAGE_KEYS.get(p.arch, ())
+    return _fmoe_1stage_key(p) in fmoe_1stage_keys(p.arch)
+
+
+def _inter_dim_128(p) -> bool:
+    return p.shape.inter_dim % 128 == 0
+
+
+def _blockscale_1stage_kernel(p) -> bool:
+    """`fmoe_fp8_blockscale_g1u1` has a kernel for the problem (legacy's check)."""
+    xbf16 = p.arch == "gfx950" and overrides.xbf16()
+    s = p.shape
+    has_kernel = aiter.fmoe_fp8_blockscale_g1u1_has_kernel(
+        p.activation.activation.value, xbf16, BLOCK_SIZE_M, s.inter_dim, s.model_dim
+    )
+    return has_kernel == 1
 
 
 # Named boolean predicates `when(...)` can test (`when(fmoe_1stage=True)`).
-PREDICATES = {"fmoe_1stage": _fmoe_1stage}
+PREDICATES = {
+    "fmoe_1stage": _fmoe_1stage,
+    "inter_dim_128": _inter_dim_128,
+    "blockscale_1stage_kernel": _blockscale_1stage_kernel,
+}
 
 _GETTERS = {**MATCH_FIELDS, **SCALARS}
 
@@ -241,13 +279,19 @@ def _condition(op, threshold) -> Domain:
 
 @dataclass(frozen=True)
 class When:
-    """Conditions on named scalars and predicates, all of which must hold."""
+    """Conditions on named scalars and predicates, all of which must hold.
+
+    `holds` tests them in the order written and stops at the first that fails, so a
+    predicate that calls into a kernel library runs only where the legacy condition
+    calls it.
+    """
 
     domains: FrozenMap  # scalar or predicate (0/1) name -> Domain
     text: str
+    order: tuple = ()  # the names in `domains`, as written
 
     def holds(self, p) -> bool:
-        return all(_when_value(name, p) in d for name, d in self.domains.items())
+        return all(_when_value(name, p) in self.domains[name] for name in self.order)
 
     def disjoint(self, other) -> bool:
         return any(
@@ -289,7 +333,7 @@ def when(**conditions) -> When:
         domains[name] = domains[name] & d if name in domains else d
         value = _show_set(_as_set(key, threshold)) if op == "in" else threshold
         shown.append(f"{name}{_OPS[op]}{value}")
-    return When(FrozenMap(domains), ", ".join(shown))
+    return When(FrozenMap(domains), ", ".join(shown), tuple(domains))
 
 
 def _structure(text) -> tuple:
@@ -373,6 +417,42 @@ RANKING = (
     Entry(
         "a16w16",
         match(quant_type=QuantType.No, w1_dtype=B16),
+        otherwise=[CK_2STAGE],
+    ),
+    # get_2stage_cfgs without a tuned row, per-token fp8 weights: keys in
+    # fused_moe_1stage_dict run 1-stage ASM `fmoe` when `token > 16 or inter_dim % 128`;
+    # everything else takes the CK branch (fp8 weights, empty kernelName1).
+    Entry(
+        "fp8_per_token",
+        match(quant_type=QuantType.per_Token, w1_dtype=FP8),
+        regions=[
+            Region(when(fmoe_1stage=True, m__gt=16), legacy="1-stage ASM fmoe"),
+            Region(
+                when(fmoe_1stage=True, m__le=16, inter_dim_128=False),
+                legacy="1-stage ASM fmoe",
+            ),
+        ],
+        otherwise=[CK_2STAGE],
+    ),
+    # get_2stage_cfgs without a tuned row, 1x128 fp8: keys in fused_moe_1stage_dict run
+    # 1-stage ASM `fmoe_fp8_blockscale_g1u1` when `token > 32`, `inter_dim % 128 == 0`
+    # and the kernel library has a kernel for the shape; everything else takes the CK
+    # branch, with the 1x128 block_m and split-K defaults. Legacy also requires no
+    # clamping swiglu_limit there, which holds for every key a local path takes.
+    Entry(
+        "fp8_blockscale",
+        match(quant_type=QuantType.per_1x128, w1_dtype=FP8),
+        regions=[
+            Region(
+                when(
+                    fmoe_1stage=True,
+                    m__gt=32,
+                    inter_dim_128=True,
+                    blockscale_1stage_kernel=True,
+                ),
+                legacy="1-stage ASM fmoe_fp8_blockscale_g1u1",
+            ),
+        ],
         otherwise=[CK_2STAGE],
     ),
 )

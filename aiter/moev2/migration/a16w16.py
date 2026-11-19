@@ -33,7 +33,7 @@ SEGMENTS = (Sort(), QuantA1(), CkGemm1(), QuantInter(), CkGemm2(), WholeGraph())
 
 def why_not(call):
     """Why this path does not claim the `fused_moe_` call, or None if it does."""
-    return local.why_not(call, QuantType.No, ARCHS, (dtypes.bf16, dtypes.fp16))
+    return local.why_not(call, (QuantType.No,), ARCHS, (dtypes.bf16, dtypes.fp16))
 
 
 def claims(call) -> bool:

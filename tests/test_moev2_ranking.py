@@ -44,9 +44,9 @@ def _gfx950():
 
 
 def _paths():
-    from aiter.moev2.migration import a8w8_pt, a16w16
+    from aiter.moev2.migration import a8w8_blockscale, a8w8_pt, a8w8_ptok, a16w16
 
-    return [a8w8_pt.PATH, a16w16.PATH]
+    return [a8w8_pt.PATH, a16w16.PATH, a8w8_ptok.PATH, a8w8_blockscale.PATH]
 
 
 def _segments():
@@ -97,7 +97,7 @@ def test_per_tensor_fp8_without_a_tuned_row_ranks_ck_2stage():
     label, plan, legacy = ranking.best(_problem(), plans)
     assert label == "fp8_per_tensor[otherwise]" and legacy is None
     assert " | ".join(s.name for s in plan) == CK
-    assert ranking.best(_problem(quant=QuantType.per_Token), plans) is None
+    assert ranking.best(_problem(quant=QuantType.per_1x32), plans) is None
     assert ranking.best(_problem(), []) == ("fp8_per_tensor[otherwise]", None, None)
 
 
@@ -118,9 +118,9 @@ def test_bf16_and_fp16_without_a_tuned_row_rank_ck_2stage():
 def test_the_1stage_keys_copy_the_legacy_table():
     import aiter.fused_moe as legacy
 
-    assert ranking.FMOE_1STAGE_KEYS == {
-        arch: frozenset(keys) for arch, keys in legacy.fused_moe_1stage_dict.items()
-    }
+    assert set(ranking.FMOE_1STAGE_KEYS) == set(legacy.fused_moe_1stage_dict)
+    for arch, keys in legacy.fused_moe_1stage_dict.items():
+        assert ranking.fmoe_1stage_keys(arch) == frozenset(keys)
 
 
 def test_predicates_are_booleans_in_when():
@@ -135,6 +135,20 @@ def test_predicates_are_booleans_in_when():
     assert not when(fmoe_1stage=True).disjoint(when(m__lt=256))
     with pytest.raises(TypeError):
         when(fmoe_1stage=1)
+
+
+def test_when_checks_its_conditions_in_the_written_order(monkeypatch):
+    asked = []
+
+    def probe(p):
+        asked.append(p.shape.m)
+        return True
+
+    monkeypatch.setitem(ranking.PREDICATES, "blockscale_1stage_kernel", probe)
+    w = when(m__gt=32, blockscale_1stage_kernel=True)
+    assert not w.holds(_problem(token=32)) and asked == []
+    assert w.holds(_problem(token=33)) and asked == [33]
+    assert str(w) == "m>32, blockscale_1stage_kernel"
 
 
 def test_when_thresholds_are_integer_intervals():

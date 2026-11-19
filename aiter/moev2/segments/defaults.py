@@ -12,6 +12,7 @@ owners (@qli88). See aiter/moev2/README.md.
 import functools
 import os
 
+from aiter import QuantType
 from aiter.jit.utils.chip_info import get_cu_num
 
 BLOCK_SIZE_M = 32
@@ -40,6 +41,21 @@ def use_nt(token, topk, e):
     if use_nt != -1:
         return bool(use_nt)
     return (token * topk // e) < 64
+
+
+def default_block_m(quant_type, token, topk, expert, inter_dim, model_dim):
+    """The 2-stage `block_m` of the legacy default branch."""
+    if quant_type == QuantType.per_1x128:
+        # block_m=16 CK stage1 uses KPerBlock=256 (K=model_dim)
+        return 64 if token > 32 else 16 if model_dim % 256 == 0 else 32
+    return get_block_size_M(token, topk, expert, inter_dim)
+
+
+def default_ksplit(quant_type, token, topk, expert, inter_dim, model_dim):
+    """The 2-stage split-K of the legacy default branch."""
+    if quant_type in (QuantType.per_1x128, QuantType.per_1x32):
+        return get_ksplit(token, topk, expert, inter_dim, model_dim)
+    return 0
 
 
 @functools.lru_cache(maxsize=2048)
