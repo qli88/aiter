@@ -324,10 +324,8 @@ _A8W4 = (
     *((m, 3072, 3072, 128, 4, "Swiglu", False, "bf16", False, "fp4", _FP8_A) for m in (128,)),
     *((m, 4096, 256, 256, 6, "Silu", False, "bf16", True, "fp4", _FP8_A) for m in (128,)),
     # Tuned Opus rows: Opus stage 1 into a layout GEMM2 or an Opus stage 2 (atomic,
-    # fp8), FlyDSL stage 1 (quantizing or not) into an Opus stage 2 or an Opus layout
-    # one, and ASM stage 1 under a `cktile_*` kernelName1 into an Opus stage 2 (on
-    # weights the FlyDSL heuristic does not take first). Legacy discards them with
-    # expert_mask or weights not preshuffled.
+    # fp8), and FlyDSL stage 1 (quantizing or not) into an Opus stage 2 or an Opus layout
+    # one. Legacy discards them with expert_mask or weights not preshuffled.
     *((m, 7168, 384, 385, 7, "Silu", False, "bf16", False, "fp4", _FP8_A_STD) for m in (2048,)),
     *((m, 7168, 384, 384, 6, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (1, 2, 512, 2048)),
     *((m, 7168, 384, 384, 6, "Silu", False, "bf16", False, "fp4", _FP8_A) for m in (64,)),

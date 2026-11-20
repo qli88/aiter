@@ -1944,16 +1944,11 @@ def test_a8w4_defaults_and_tuned_rows(monkeypatch):
         res = resolve(_a8w4_problem(**kwargs), opus)
         assert res.plan.source != "tuned"
         assert any("Opus" in m for _, m in res.logs), kwargs
-    # A `cktile_*` kernelName1: ASM stage 1 under that name, unless a default MXFP4
-    # branch takes the row (CK-Tile with the row's split-K).
+    # A `cktile_*` kernelName1 (legacy: ASM stage 1 under that name, todo 5.17, or a
+    # default MXFP4 branch): no segment runs it.
     asm = {**opus, "kernelName1": "cktile_a8w4_bm64"}
-    res = resolve(_a8w4_problem(), asm)
-    assert res.plan.structure()[0][2] == "asm.stage1_cktile"
-    assert res.metadata.stage1.keywords["kernelName"] == "cktile_a8w4_bm64"
-    assert (
-        "default MXFP4 branch"
-        in resolve(_a8w4_problem(), {**asm, "ksplit": 2}).declined
-    )
+    for row in (asm, {**asm, "ksplit": 2}):
+        assert resolve(_a8w4_problem(), row).declined.startswith("no segments run ")
     # MXMOE a8w4 rows: quantizing inline or reading prequantized fp8, into a layout
     # GEMM2; under EP, legacy discards BM16 rows and activations other than SiTUv2.
     mxmoe = {

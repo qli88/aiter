@@ -10,8 +10,8 @@ Segments: `cktile.gemm1` runs legacy's four CK-Tile branches (gate/up interleave
 Relu2, split-K, Swiglu without a kernelName1), which differ in the stage 1 split-K, the
 activation layout and the `block_m`/`ksplit` of the metadata (`cktile_branch`): as a
 default, or for a tuned row named `swiglu_mxfp4_bf16_cktile`, which legacy treats as a
-tuned row without kernels (the branches with its split-K). A tuned `cktile_*`
-kernelName1 runs legacy's ASM stage 1 under that name (`asm.stage1_cktile`).
+tuned row without kernels (the branches with its split-K). No segment owns another
+tuned `cktile_*` kernelName1 (legacy runs ASM stage 1 under that name, todo 5.17).
 `cktile.gemm2` also runs the `cktile_*` stage 2 of tuned rows.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).

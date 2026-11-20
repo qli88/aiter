@@ -403,7 +403,7 @@ class AsmStage1Blockscale(AsmStage1):
     """
 
     name = "asm.stage1_1x128"
-    tuned_only = True
+    reach = "tuned"
     covers = (Op.GEMM1, Op.QUANT_INTER)
     transpose_a1_scale = True
 
@@ -434,43 +434,6 @@ class AsmStage1Blockscale(AsmStage1):
             .view(token_num, -1)
         )
         return a2[:token_num, :, :], a2_scale
-
-
-class AsmStage1Cktile(AsmStage1):
-    """ASM stage 1 under a tuned mxfp8 x MXFP4 row's `cktile_*` kernelName1: legacy's
-    last branch, which the row reaches when no default MXFP4 branch takes it. That
-    branch passes no bias."""
-
-    name = "asm.stage1_cktile"
-    tuned_only = True
-
-    @property
-    def capabilities(self):
-        from .mxfp4 import a8w4_caps
-
-        return tuple(
-            replace(cap, features=cap.features - {"bias1", "bias2"})
-            for cap in a8w4_caps()
-        )
-
-    def owns(self, kernel) -> bool:
-        return (
-            kernel is not None
-            and kernel.family == kernel_names.CKTILE
-            and not kernel["alias"]
-        )
-
-    def declines_row(self, p, row):
-        from .ck_tile import cktile_branch, flydsl_mxfp4
-
-        kn2 = str(row.get("kernelName2", "") or "").strip()
-        if kn2.startswith("flydsl_"):
-            # The tuned FlyDSL branch runs CK stage 1 under the name.
-            return "cktile_* kernelName1 with a FlyDSL stage 2"
-        ksplit = int(row.get("ksplit", 0))
-        if flydsl_mxfp4(p) or cktile_branch(p, ksplit, tuned_row=True) is not None:
-            return "a default MXFP4 branch takes the cktile_* row"
-        return None
 
 
 def fmoe_1stage_caps():

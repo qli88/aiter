@@ -12,8 +12,8 @@ it, for each path that takes it:
   the key;
 - reports the tuned rows that do not run (discarded or declined, by reason), one key per
   row (the `tuned` and `fhmoe` keys of the `base` variant);
-- fails on a segment feasible for some key but in no ranking entry (unless
-  `tuned_only`), and on a `tuned_only` segment in a ranking entry.
+- fails on a segment whose `reach` does not hold (`coverage.segment_errors`); whether a
+  shipped tuned row runs it is checked only when every arch runs.
 
     python tests/moe_dispatch/coverage_checks.py --check [--arch gfx950] [-v]
 
@@ -48,15 +48,15 @@ def _legacy_runs(golden, key, fhmoe):
 
 
 def check_arch(arch, served, verbose=False):
-    """`(errors, report lines, problems)` for one simulated arch; `problems` are the
-    `(label, problem)` pairs for `coverage.segment_errors`."""
+    """`(errors, report lines, used)` for one simulated arch; `used`: the names of the
+    segments in the plan of some tuned row that runs."""
     from aiter.moev2 import api
     from aiter.moev2.dispatch import coverage, tuned
     from moe_dispatch import arch_sim, known_declines, snapshot
     from moe_dispatch.differential import captured_logs
 
     golden = snapshot.read(arch)
-    errors, lines, problems = [], [], []
+    errors, lines, used = [], [], set()
     matrix = defaultdict(Counter)
     known = Counter()
     rows, bad_rows = Counter(), Counter()
@@ -73,7 +73,6 @@ def check_arch(arch, served, verbose=False):
                 continue
             for fhmoe, problem in ((False, base), (True, api.fhmoe_problem(base))):
                 label = f"{arch} {key.label()}" + ("|fhmoe" if fhmoe else "")
-                problems.append((label, problem))
                 is_row = (
                     key.variant == "base" and _ROW_SECTIONS.get(key.section) is fhmoe
                 )
@@ -85,6 +84,12 @@ def check_arch(arch, served, verbose=False):
                     kind, resolution = coverage.classify(problem, path.segments)
                     runs = kind == "plan" or _legacy_runs(golden, key, fhmoe)
                     matrix[path.name][kind, runs] += 1
+                    if (
+                        resolution is not None
+                        and resolution.plan is not None
+                        and resolution.plan.source == "tuned"
+                    ):
+                        used.update(c.segment.name for c in resolution.plan.segments)
                     status = coverage.row_status(problem, resolution)
                     if is_row and status is not None:
                         rows[status != "used"] += 1
@@ -129,7 +134,22 @@ def check_arch(arch, served, verbose=False):
         lines.append(f"    {n:5d} {reason}")
     for name, n in sorted(known.items()):
         lines.append(f"  known gaps: {name}: {n}")
-    return errors, lines, problems
+    return errors, lines, used
+
+
+def _hibernating_tests():
+    """`(segment names, errors)`: the entries of `hibernating.TESTS` whose test exists."""
+    from moe_dispatch import hibernating
+
+    tested, errors = set(), []
+    for name, node in hibernating.TESTS.items():
+        file, _, function = node.partition("::")
+        path = _HERE.parents[1] / file
+        if path.is_file() and f"def {function}(" in path.read_text():
+            tested.add(name)
+        else:
+            errors.append(f"{name}: hibernating test {node} not found")
+    return tested, errors
 
 
 def main(argv=None):
@@ -148,21 +168,26 @@ def main(argv=None):
     from moe_dispatch.ranking_checks import ranked_paths
 
     served = ranked_paths()
-    errors, segment_errors = [], {}
+    errors, used = [], set()
     for arch in args.arch or list(arch_sim.ARCHS):
-        arch_errors, lines, problems = check_arch(arch, served, args.verbose)
+        arch_errors, lines, arch_used = check_arch(arch, served, args.verbose)
         print(f"{arch}: {len(arch_errors)} problems")
         for line in lines:
             print(line)
         errors += arch_errors
-        # `takes` and the caps see the arch's dtypes (fp8) only inside the simulation.
-        with arch_sim.simulated_arch(arch):
-            for error in coverage.segment_errors(served, problems):
-                segment_errors.setdefault(error.split(":")[0], error)
-    segment_errors = list(segment_errors.values())
-    tuned_only = sorted({s.name for p in served for s in p.segments if s.tuned_only})
+        used |= arch_used
+    tested, test_errors = _hibernating_tests()
+    segment_errors = test_errors + coverage.segment_errors(
+        served, used=None if args.arch else used, tested=tested
+    )
+    by_reach = defaultdict(set)
+    for path in served:
+        for s in path.segments:
+            by_reach[s.reach].add(s.name)
     print(
-        f"segments: {len(segment_errors)} problems; tuned_only: {', '.join(tuned_only)}"
+        f"segments: {len(segment_errors)} problems; "
+        f"tuned: {', '.join(sorted(by_reach['tuned']))}; "
+        f"hibernating: {', '.join(sorted(by_reach['hibernating'])) or 'none'}"
     )
     errors += segment_errors
     for line in errors[:60]:

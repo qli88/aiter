@@ -9,14 +9,13 @@ SiTUv2, separated or interleaved gate/up, outside AITER_ONLINE_TUNE, without
 presort. Today these resolve to the FlyDSL heuristic (gate/up interleaved, or separated
 with w1 tagged `gate_up_interleave=False`), CK-Tile (Swiglu; split-K on preshuffled
 weights), CK 2-stage (Silu and SiTUv2 otherwise, which ignores the padding), or a tuned
-FlyDSL, MXMOE or Opus row (FlyDSL, layout-v2, Opus or CK-Tile stage 2), or a tuned row
-with a `cktile_*` kernelName1, which legacy runs as ASM stage 1 under that name (Opus or
-CK-Tile stage 2) when no default MXFP4 branch takes it; legacy discards Opus rows for
-weights not both preshuffled, with expert_mask or a stage 2 bias, and MXMOE rows under
-EP that are BM16, not SiTUv2, or without a layout GEMM2. Interleaved keys outside the
-FlyDSL heuristic and the CK-Tile interleaved Swiglu branch, the padded CK default, Opus
-rows with padding, `cktile_*` rows with bias or a FlyDSL stage 2, and any other tuned row
-are declined back to the legacy code. Interleaved calls that legacy's grouped gfx1250
+FlyDSL, MXMOE or Opus row (FlyDSL, layout-v2, Opus or CK-Tile stage 2); legacy discards
+Opus rows for weights not both preshuffled, with expert_mask or a stage 2 bias, and MXMOE
+rows under EP that are BM16, not SiTUv2, or without a layout GEMM2. Interleaved keys
+outside the FlyDSL heuristic and the CK-Tile interleaved Swiglu branch, the padded CK
+default, Opus rows with padding, rows with a `cktile_*` kernelName1 and a stage 2 other
+than CK-Tile (legacy runs ASM stage 1 under that name; no shipped row has one), and any
+other tuned row are declined back to the legacy code. Interleaved calls that legacy's grouped gfx1250
 branch takes (a gfx1250 build, or AITER_USE_GROUPED_GEMM with gfx1250 named by the build
 variables; both weight scales set, and not expert_mask with `doweight_stage1`; todo
 5.26) are not claimed.
@@ -30,7 +29,6 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import paths
-from ..segments.asm import AsmStage1Cktile
 from ..segments.ck import CkGemm1, CkGemm2
 from ..segments.ck_tile import (
     CktileGemm1,
@@ -61,7 +59,6 @@ SEGMENTS = (
     Sort(),
     SortAux(),
     QuantA1(),
-    AsmStage1Cktile(),
     CkGemm1(),
     CktileGemm1(),
     FlydslGemm1(),
