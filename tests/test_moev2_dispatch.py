@@ -1890,6 +1890,23 @@ def test_a4w4_cktile_alias_rows_follow_the_legacy_branch_order(monkeypatch):
         assert reason in _a4w4_resolve(monkeypatch, silu(), row).declined
 
 
+def test_cktile_alias_rows_keep_the_stage2_bias(monkeypatch):
+    # Legacy's CK-Tile branches pass the key's stage 2 bias whatever the row's stage 2.
+    problem = _a16w4_problem(
+        activation=ActivationType.Swiglu,
+        token=1,
+        shape=(3072, 512, 128, 4),
+        has_stage1_bias=True,
+        has_stage2_bias=True,
+    )
+    for kn2 in (_ALIAS, "cktile_moe2_bm32"):
+        row = {"block_m": 64, "ksplit": 4, "run_1stage": 0}
+        row.update(kernelName1=_ALIAS, kernelName2=kn2)
+        res = _a16w4_resolve(monkeypatch, problem, row)
+        assert res.plan.structure()[0][-1] == "cktile.gemm2"
+        assert res.metadata.stage2_has_bias, kn2
+
+
 def test_a16w4_defaults(monkeypatch):
     # SiTUv2: the FlyDSL a16w4 heuristic.
     res = _a16w4_resolve(monkeypatch, _a16w4_problem())
@@ -2541,14 +2558,15 @@ def test_a4w4_run_warns_then_dispatches_the_fallback_key(monkeypatch, caplog):
     monkeypatch.setattr(local, "get_cu_num", lambda: 256)
     monkeypatch.setattr(local.executor, "prologue", prologue)
     monkeypatch.setattr(local.executor, "a16w4_unsupported", lambda c, q: None)
-    monkeypatch.setattr(local.api, "dispatch_key", lambda c, *_: ((), {}, None))
+    key = {"_exclude_mxmoe": False}  # `dispatch_key` always sets it
+    monkeypatch.setattr(local.api, "dispatch_key", lambda c, *_: ((), key, None))
     warning = "[fused_moe] MXMOE pair is unsupported (r); using default heuristics"
     fallbacks = [
         (
-            {"_disable_inline_sort": True},
+            {**key, "_disable_inline_sort": True},
             lambda call: checked.append(call) or local.logger.warning("check") or "",
         ),
-        ({"_exclude_mxmoe": True}, lambda call: warning),
+        ({**key, "_exclude_mxmoe": True}, lambda call: warning),
     ]
     monkeypatch.setattr(
         local.LocalDispatch,
@@ -2557,13 +2575,12 @@ def test_a4w4_run_warns_then_dispatches_the_fallback_key(monkeypatch, caplog):
     )
 
     def dispatch(args, kwargs, arch, cu_num, token, emit=True):
+        kwargs = {k: v for k, v in kwargs if v}
         if emit:
-            local.logger.warning(f"lookup {dict(kwargs)}")
-        block_m = 64 if dict(kwargs).get("_exclude_mxmoe") else 128
-        return (
-            types.SimpleNamespace(metadata=types.SimpleNamespace(block_m=block_m)),
-            None,
-        )
+            local.logger.warning(f"lookup {kwargs}")
+        block_m = 64 if kwargs.get("_exclude_mxmoe") else 128
+        metadata = types.SimpleNamespace(block_m=block_m, run_1stage=False)
+        return types.SimpleNamespace(metadata=metadata, plan=None), None
 
     monkeypatch.setattr(a4w4.LOCAL, "dispatch", dispatch)
     # caplog listens on the root logger; aiter's logger does not propagate.
@@ -2582,6 +2599,22 @@ def test_a4w4_run_warns_then_dispatches_the_fallback_key(monkeypatch, caplog):
     )
     # The fallbacks are decided on the preview; the warnings read the prepared call.
     assert checked[0] is preview and checked[1] is c and prepares == [False, True]
+    # Only the MXMOE fallback checks the block size, not the inline-sort one.
+    caplog.clear()
+    inline = (
+        "[fused_moe] inline-sort config is unsupported (r); using default heuristics"
+    )
+    fallbacks[:] = [({**key, "_disable_inline_sort": True}, lambda call: inline)]
+    monkeypatch.setattr(local.executor, "run_mxfp4", lambda *a, **kw: "ran")
+    for block_size_M in (None, 32):
+        caplog.clear()
+        c.block_size_M = block_size_M
+        with caplog.at_level(logging.WARNING, logger="aiter"):
+            assert a4w4.LOCAL.run({}) == "ran"
+        assert caplog.messages == [
+            "lookup {}", inline, "lookup {'_disable_inline_sort': True}"
+        ]  # fmt: skip
+    c.block_size_M = 32
     # A declined fallback key sends the call back before anything is logged or the
     # prologue prepares the call.
     caplog.clear()

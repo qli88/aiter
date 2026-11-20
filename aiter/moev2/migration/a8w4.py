@@ -13,12 +13,12 @@ FlyDSL, MXMOE or Opus row (FlyDSL, layout-v2, Opus or CK-Tile stage 2); legacy d
 Opus rows for weights not both preshuffled, with expert_mask or a stage 2 bias, and MXMOE
 rows under EP that are BM16, not SiTUv2, or without a layout GEMM2. Interleaved keys
 outside the FlyDSL heuristic and the CK-Tile interleaved Swiglu branch, the padded CK
-default, Opus rows with padding, rows with a `cktile_*` kernelName1 and a stage 2 other
-than CK-Tile (legacy runs ASM stage 1 under that name; no shipped row has one), and any
-other tuned row are declined back to the legacy code. Interleaved calls that legacy's grouped gfx1250
-branch takes (a gfx1250 build, or AITER_USE_GROUPED_GEMM with gfx1250 named by the build
-variables; both weight scales set, and not expert_mask with `doweight_stage1`; todo
-5.26) are not claimed.
+default, Opus rows with padding, rows with a `cktile_*` kernelName1 (legacy passes them
+to its default branches, past which it runs ASM stage 1 under that name, todo 5.17; no
+shipped row wins a lookup with one), and any other tuned row are declined back to the
+legacy code. Interleaved calls that legacy's grouped gfx1250 branch takes (a gfx1250
+build, or AITER_USE_GROUPED_GEMM with gfx1250 named by the build variables; both weight
+scales set, and not expert_mask with `doweight_stage1`; todo 5.26) are not claimed.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See

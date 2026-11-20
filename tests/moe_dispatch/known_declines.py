@@ -108,8 +108,9 @@ KNOWN = (
         frozenset({"a4w4"}),
         r"CK-Tile split-K MXFP4 or CK 2-stage SiTUv2 is not ported$",
         lambda p: True,
-        "not ported: SiTUv2 outside FlyDSL and MXMOE (reached under "
-        "AITER_BYPASS_TUNE_CONFIG); CK has no SiTUv2 instance",
+        "not ported: SiTUv2 outside FlyDSL and MXMOE (reached without the MXMOE "
+        "fallback: AITER_BYPASS_TUNE_CONFIG, AITER_MXMOE_FALLBACK=0 or a shape it "
+        "rejects); CK has no SiTUv2 instance",
     ),
     Known(
         "a bypassed tuned row turns the MXMOE fallback off (1e.2)",

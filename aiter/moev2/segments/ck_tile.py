@@ -652,8 +652,12 @@ class CktileGemm2(Segment):
         )
 
     def metadata_fields(self, p, params):
-        if not params.kernel or params.kernel1 == params.kernel:
-            # A legacy CK-Tile branch (a default, or an alias row): the key's bias.
+        if not params.kernel or params.kernel1 in (
+            params.kernel,
+            kernel_names.CKTILE_ALIAS,
+        ):
+            # A legacy CK-Tile branch (a default, or an alias kernelName1, whatever
+            # the row's stage 2): the key's bias.
             return {"stage2_has_bias": "bias2" in p.features}
         if params.kernel1.startswith(("flydsl_", "opus_moe1_")):
             # The tuned FlyDSL/Opus branch: `enable_bias`.

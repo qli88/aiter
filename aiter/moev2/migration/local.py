@@ -391,7 +391,7 @@ class LocalDispatch:
                 args, tuple(fallback_kwargs.items()), arch, cu_num, token
             )
             self._check_fhmoe(dispatched[0])
-            if "_exclude_mxmoe" not in fallback_kwargs:
+            if not fallback_kwargs["_exclude_mxmoe"]:
                 continue
             block_m = dispatched[0].metadata.block_m
             if int(block_m) != int(c.block_size_M):
