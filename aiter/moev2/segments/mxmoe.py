@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """FlyDSL MXFP4 kernels (`flydsl_mxmoe_g{1,2}_*`): the stage wrappers, their
 `MOEMetadata`, and the inline-sort checks; aiter/fused_moe.py imports them from here.
+The segments that run these kernels (`mxmoe.gemm1`, `mxmoe.gemm2`) are in `mxfp4.py`.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 This module is shared with the legacy MoE path (re-exported from aiter.fused_moe, run

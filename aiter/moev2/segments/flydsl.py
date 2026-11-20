@@ -3,7 +3,9 @@
 """FlyDSL 2-stage kernels (`flydsl_moe{1,2}_*`, `flydsl_moe2_layout_*`).
 
 The stage wrappers the legacy code builds its `MOEMetadata` from, and the stage-2
-route-reduce queries; aiter/fused_moe.py imports them from here.
+route-reduce queries; aiter/fused_moe.py imports them from here. The segments that run
+these kernels are in `mxfp4.py` (`flydsl.*`, `flydsl_layout.*`, and `mxmoe.gemm2` for
+`flydsl_moe2_layout_*`) and `flydsl_fhmoe.py`.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 This module is shared with the legacy MoE path (re-exported from aiter.fused_moe, run
