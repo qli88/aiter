@@ -28,6 +28,7 @@ from ..dispatch import overrides, resolver, tuned
 from ..execute import executor
 from ..policy import quant_remap, resolve_activation_dtype
 from ..problem import FrozenMap
+from ..segments.flydsl_fhmoe import _validate_fhmoe_metadata_consistency
 from ..segments.mxmoe import (
     _is_mxfp4_inline_sort,
     _mxfp4_a4w4_stage1_fw,
@@ -380,6 +381,7 @@ class LocalDispatch:
         )
         if dispatched is None:
             return paths.DECLINED
+        self._check_fhmoe(dispatched[0])
         for fallback_kwargs, warning in fallbacks:
             message = warning(c)
             if not message:
@@ -388,6 +390,7 @@ class LocalDispatch:
             dispatched = self.dispatch(
                 args, tuple(fallback_kwargs.items()), arch, cu_num, token
             )
+            self._check_fhmoe(dispatched[0])
             if "_exclude_mxmoe" not in fallback_kwargs:
                 continue
             block_m = dispatched[0].metadata.block_m
@@ -421,6 +424,14 @@ class LocalDispatch:
         return run(
             c, resolution.metadata, resolution.plan, q_dtype_a, after_sort=after_sort
         )
+
+    def _check_fhmoe(self, resolution):
+        """`_use_fhmoe_wrappers`, which legacy applies to each `_resolve_metadata`
+        lookup (the first and the MXFP4 fallbacks; it discards the lookup after the sort
+        unchecked): the stage 1 `tile_m` and stage 2 sorting block equal `block_m`, else
+        NotImplementedError."""
+        if self.fhmoe and resolution.plan is not None:
+            _validate_fhmoe_metadata_consistency(resolution.metadata)
 
     def _mxfp4_fallbacks(self, preview, args, kwargs, arch, cu_num, token):
         """`_fused_moe_impl`'s second resolutions, in its order, as `(kwargs, warning)`

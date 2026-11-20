@@ -34,6 +34,18 @@ def _padded(problem):
     return bool(problem.layout.hidden_pad or problem.layout.intermediate_pad)
 
 
+def _g1u0_outside_fmoe_1stage(problem):
+    from aiter.moev2.dispatch.ranking import _fmoe_1stage
+
+    return not problem.layout.g1u1 and not _fmoe_1stage(problem)
+
+
+def _bypass_tuned():
+    from aiter.moev2.dispatch.overrides import bypass_tuned
+
+    return bypass_tuned() != 0
+
+
 def _no_1stage_kernel_for(problem):
     return bool(
         problem.features & {"bias1", "bias2"}
@@ -62,31 +74,39 @@ _MXFP4_PATHS = frozenset({"a16w4", "a16wi4", "a4w4", "a8w4", "mxfp8"})
 
 KNOWN = (
     Known(
-        "g1u0 outside the 1-stage fmoe keys (5.3)",
+        "g1u0 on the CK or ASM 2-stage branch (5.3)",
         frozenset({"a16w16", "a8w8_ptok"}),
-        r"",
+        r"g1u0 is not ported$",
         lambda p: not p.layout.g1u1,
         "legacy runs CK 2-stage (bf16) or ASM stage 1 + CK stage 2 (int8), which read a "
         "g1u0 w1 as half-size gate/up: wrong output, a legacy bug no segment reproduces",
     ),
     Known(
+        "g1u0 keys no segment runs, outside the 1-stage fmoe keys (5.3)",
+        frozenset({"a16w16", "a8w8_ptok"}),
+        r"^no feasible plan$",
+        _g1u0_outside_fmoe_1stage,
+        "as above, on an arch without a g1u0 segment (int8 on gfx950): the resolver "
+        "stops before the ranking region that names the legacy branch",
+    ),
+    Known(
         "CK 2-stage a16w4 (1f.2)",
         frozenset({"a16w4"}),
-        r"CK 2-stage a16w4 is not ported",
+        r"CK 2-stage a16w4 is not ported$",
         lambda p: True,
         "not ported: needs a16w4 caps on ck.gemm1/2 (bf16 x fp4 in their module key)",
     ),
     Known(
         "CK 2-stage, padding ignored (1e.2, 5.10)",
         frozenset({"a4w4", "a8w4", "mxfp8"}),
-        r"CK 2-stage, padding ignored is not ported",
+        r"CK 2-stage, padding ignored is not ported$",
         _padded,
         "legacy runs CK, which takes no padding, on padded weights (a legacy bug)",
     ),
     Known(
         "SiTUv2 on CK-Tile split-K or CK (1e.2)",
         frozenset({"a4w4"}),
-        r"CK-Tile split-K MXFP4 or CK 2-stage SiTUv2 is not ported",
+        r"CK-Tile split-K MXFP4 or CK 2-stage SiTUv2 is not ported$",
         lambda p: True,
         "not ported: SiTUv2 outside FlyDSL and MXMOE (reached under "
         "AITER_BYPASS_TUNE_CONFIG); CK has no SiTUv2 instance",
@@ -94,7 +114,7 @@ KNOWN = (
     Known(
         "a bypassed tuned row turns the MXMOE fallback off (1e.2)",
         frozenset({"a4w4"}),
-        r"the next branch \(a tuned row is bypassed\) is not ported",
+        r"the next branch \(a tuned row is bypassed\) is not ported$",
         lambda p: True,
         "under AITER_BYPASS_TUNE_CONFIG legacy's MXMOE SiTUv2 fallback needs no tuned "
         "row, so a kept row sends the call to the next branch; not ported",
@@ -109,20 +129,27 @@ KNOWN = (
     ),
     Known(
         "CK-Tile alias rows outside the CK-Tile branches (5.12)",
-        frozenset({"a16w4"}),
-        r"alias tuned row outside the CK-Tile branches",
+        frozenset({"a16w4", "a4w4"}),
+        r"^alias tuned row outside the CK-Tile branches$",
         lambda p: True,
         "legacy runs ASM stage 1 under the swiglu_mxfp4_bf16_cktile alias name on "
         "weights not preshuffled (it reads the alias by position)",
     ),
     Known(
-        "FHMoE on rows of kernels it has no segment for (5.28)",
+        "FHMoE on MXMOE rows (5.28)",
+        frozenset({"fhmoe"}),
+        r"^no segments run kernelName1=flydsl_mxmoe_",
+        lambda p: p.shared is not None,
+        "legacy discards the row (MXMOE rows the aux kernels do not cover) and runs the "
+        "FlyDSL heuristic; path fhmoe has no MXMOE segment to apply the discard checks",
+    ),
+    Known(
+        "FHMoE under AITER_BYPASS_TUNE_CONFIG (5.28)",
         frozenset({"fhmoe"}),
         r"^no segments? runs? ",
-        lambda p: p.shared is not None,
-        "legacy discards the row (MXMOE rows the aux kernels do not cover) or, under "
-        "AITER_BYPASS_TUNE_CONFIG, ignores it after its discard checks, and runs the "
-        "FlyDSL heuristic; path fhmoe has no segment of the row's family to apply them",
+        lambda p: p.shared is not None and _bypass_tuned(),
+        "legacy ignores the row after its discard checks and runs the FlyDSL "
+        "heuristic; path fhmoe has no segment of the row's family to apply them",
     ),
     Known(
         "padded a8w4 keys on Opus rows (1h.2)",
@@ -189,8 +216,16 @@ KNOWN = (
 )
 
 
+# `LocalDispatch.relookup_decline`'s wording for a decline of the lookup after the sort.
+_AFTER_SORT = re.compile(r"^the lookup after the sort declines \((.*)\)$")
+
+
 def find(path_name, problem, reason):
-    """The entry covering a decline of `problem` by path `path_name`, or None."""
+    """The entry covering a decline of `problem` by path `path_name`, or None. A decline
+    of the lookup after the sort is matched by that lookup's reason."""
+    after_sort = _AFTER_SORT.match(reason)
+    if after_sort is not None:
+        reason = after_sort.group(1)
     for known in KNOWN:
         if (
             path_name in known.paths

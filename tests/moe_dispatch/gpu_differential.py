@@ -8,8 +8,8 @@ floating-point tensors within 1 ulp or legacy's own spread), give the same outpu
 the GEMM2 atomics, and log the same dispatch lines on a first call (see
 `differential.run_differential`). Besides plain calls, the cases cover inputs `claims`
 accepts (`_VARIANTS`: all of them for a8w8_pt, `_GENERIC_VARIANTS` for the fp8 per-token,
-blockscale and `per_1x32` paths); where legacy raises on one (`_RAISES`), v2 must run the
-call and raise the same error.
+blockscale and `per_1x32` paths); a case may raise only where legacy raises on it
+(`_RAISES`), and v2 must then run the call and raise the same error.
 
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt
     python tests/moe_dispatch/gpu_differential.py --path a16w16 --synth-table
@@ -23,7 +23,8 @@ gfx942 only, the arch's own CK rows are also added with stage 1 swapped for the 
 ASM kernel of the same tile M (when it ships one), so that branch runs too; for a8w8_pt,
 the gfx942 int8 rows whose ASM kernel the arch ships are copied as well.
 
-A case that does not fit in the free GPU memory is reported as skipped.
+A case that does not fit in the free GPU memory is reported as skipped and fails the run
+(it was not compared).
 
 NOTE: part of the aiter.moev2 migration (under active development, not graduated).
 Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
@@ -908,8 +909,12 @@ def _clear_dispatch_caches():
 
 
 def _raised(fn):
+    import torch
+
     try:
         fn()
+    except torch.OutOfMemoryError:
+        raise  # the case is skipped, not compared
     except Exception as exc:  # noqa: BLE001
         return f"{type(exc).__name__}: {exc}"
     return None
@@ -1029,9 +1034,9 @@ def _child(args):
     for line in problems:
         print("  " + line)
     if skipped:
-        print(f"{len(skipped)} cases skipped: out of GPU memory")
+        print(f"{len(skipped)} cases not compared (out of GPU memory): rerun them")
     print(f"{len(problems)} problems")
-    return 1 if problems else 0
+    return 1 if problems or skipped else 0
 
 
 def main(argv=None):

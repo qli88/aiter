@@ -434,6 +434,11 @@ def cktile_split_k(p, ksplit=None) -> bool:
     )
 
 
+def tuned_ksplit(row) -> int:
+    """The split-K legacy's branches see for a tuned row (`AITER_KSPLIT=-1`: 0)."""
+    return 0 if overrides.ksplit_disabled() else int(row.get("ksplit", 0))
+
+
 def cktile_default_kernels(p) -> DefaultKernels:
     """The legacy CK-Tile branches of `get_2stage_cfgs` without a tuned row, in its
     order. The ranking reaches CK-Tile only where one of them is legacy's choice."""
@@ -543,9 +548,18 @@ class CktileGemm1(Segment):
         )
 
     def declines_row(self, p, row):
+        kn2 = str(row.get("kernelName2", "") or "").strip()
+        if kn2.startswith("flydsl_"):
+            # The tuned FlyDSL branch runs CK stage 1 under the alias name.
+            return "alias kernelName1 with a FlyDSL stage 2"
+        if kn2 != kernel_names.CKTILE_ALIAS and not kn2.startswith("cktile_"):
+            # Legacy's CK-Tile branches run CK-Tile stage 2 whatever the row names.
+            return "alias kernelName1 with a stage 2 that is not CK-Tile"
         if cktile_mxfp4_unsafe(p):
             return None  # `cktile.gemm2` discards it
-        if cktile_branch(p, int(row.get("ksplit", 0)), tuned_row=True) is None:
+        if not (cktile_interleaved_swiglu(p) or cktile_relu2(p)) and flydsl_mxfp4(p):
+            return "the heuristic FlyDSL branch takes the alias tuned row"
+        if cktile_branch(p, tuned_ksplit(row), tuned_row=True) is None:
             # Past the CK-Tile branches legacy runs ASM stage 1 under the alias name.
             return "alias tuned row outside the CK-Tile branches"
         return None

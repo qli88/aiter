@@ -43,6 +43,7 @@ from ..segments.flydsl_fhmoe import (
     _is_dsv4_i384_metadata,
     _is_fhmoe_metadata_compatible,
     _validate_fhmoe_contract,
+    _validate_fhmoe_metadata_consistency,
 )
 from ..segments.mxfp4 import mxfp4, mxfp8
 from ..segments.quant import QuantA1, QuantInter
@@ -152,7 +153,7 @@ def _probe_metadata(
 ):
     """The FHMoE metadata of a probe key (the legacy `get_2stage_cfgs` arguments the
     capability checks pass); raises NotImplementedError where `_use_fhmoe_wrappers`
-    does (no FHMoE plan)."""
+    does (no FHMoE plan, or stage tiles that differ from `block_m`)."""
     args = (
         token,
         model_dim,
@@ -179,7 +180,9 @@ def _probe_metadata(
             "Heterogeneous MXFP4/FP8 and MXFP8/FP8 experts require the "
             "two-stage FlyDSL path"
         )
-    return dispatched[0].metadata
+    metadata = dispatched[0].metadata
+    _validate_fhmoe_metadata_consistency(metadata)
+    return metadata
 
 
 @tuned.cached
