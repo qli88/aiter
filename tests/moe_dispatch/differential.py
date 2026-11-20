@@ -2,11 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Differential test of aiter.moev2 against the legacy MoE code.
 
-CPU (`--check`): for every key of the legacy snapshot that a registered v2 path takes,
+CPU (`--check`): for every key of the legacy snapshot that a registered v2 path claims,
 the v2 plan (in the snapshot record format) must equal the legacy golden record, and the
 log lines v2 dispatch emits must equal the ones `get_2stage_cfgs` emits for the key. There
-is no allowlist: the revamp keeps today's behavior, and a bug
-fix lands in the legacy code first, with the snapshot regenerated.
+is no allowlist for claimed keys: the revamp keeps today's behavior, and a bug fix lands
+in the legacy code first, with the snapshot regenerated. A key a path takes and declines
+although legacy runs it must be listed in `known_declines.py`.
 
     python tests/moe_dispatch/differential.py --check [--arch gfx950]
     python tests/moe_dispatch/differential.py --check --env AITER_FLYDSL_FORCE=0
@@ -108,27 +109,47 @@ _LEGACY_2STAGE = {
 }
 
 
-def legacy_decline(path, key):
-    """`(reason, stage-1 functions)` when `path` hands `key` back to a named legacy
-    branch, else None; the functions are None for a 1-stage branch.
-
-    A 1-stage tuned row the path does not run and a ranking region marked `legacy=`
-    name the branch.
-    """
+def v2_decline(path, key, fhmoe=False):
+    """`(problem, reason)` when `path` takes `key` (as `fhmoe_` dispatches it if
+    `fhmoe`), else None; `reason` is why v2 declines it (the resolver, or the second
+    lookup after the sort as `dispatch_record` checks it), None when it runs it."""
     from aiter.moev2 import api
     from aiter.moev2.dispatch import resolver
 
     if path.takes is None:
         return None
     try:
-        problem = api.problem_from_key(key.args, key.call_kwargs())
+        problem = api.problem_from_key(key.args, key.call_kwargs(), fhmoe=fhmoe)
     except Exception:  # noqa: BLE001 - key_checks.py reports these
         return None
     if not path.takes(problem):
         return None
-    reason = resolver.resolve(problem, path.segments).declined or ""
+    reason = resolver.resolve(problem, path.segments).declined
+    # `dispatch_record` is bound to the path's `LocalDispatch`.
+    relookup = getattr(
+        getattr(path.dispatch_record, "__self__", None), "relookup_decline", None
+    )
+    if reason is None and relookup is not None:
+        reason = relookup(problem, problem.shape.m)
+    return problem, reason
+
+
+def legacy_decline(path, key, declined=None):
+    """`(reason, stage-1 functions)` when `path` hands `key` back to a named legacy
+    branch, else None; the functions are None for a 1-stage branch.
+
+    A 1-stage tuned row the path does not run and a ranking region marked `legacy=`
+    name the branch. Under AITER_BYPASS_TUNE_CONFIG legacy runs no tuned row, so such a
+    row names none. `declined`: `v2_decline(path, key)`, if already known.
+    """
+    from aiter.moev2.dispatch import overrides
+
+    declined = declined or v2_decline(path, key)
+    reason = None if declined is None else declined[1]
+    if reason is None:
+        return None
     if reason.startswith(("1-stage row with ", "no segment runs 1-stage ")):
-        return reason, None
+        return None if overrides.bypass_tuned() else (reason, None)
     if reason.startswith("ranking ") and reason.endswith(" is not ported"):
         legacy = reason.split(": ", 1)[1].removesuffix(" is not ported")
         if legacy.startswith("1-stage "):
@@ -198,24 +219,27 @@ OUTCOMES = {
     "one_stage": "handed back as legacy 1-stage",
     "two_stage": "as a legacy 2-stage branch",
     "raises": "declined where legacy raises",
-    "declined": "declined where legacy runs",
+    "declined": "otherwise declined where legacy runs",
 }
+# The outcomes of keys legacy runs and v2 declines: each must be in known_declines.py.
+_LEGACY_RUNS = ("one_stage", "two_stage", "declined")
 
 
 def compare(arch, check_logs=True, live=False):
-    """`(outcomes, problems)`: `{outcome: {label: path name}}` for each of `OUTCOMES`,
-    and a list of strings. `live`: generate the legacy records instead of reading
-    golden/.
+    """`(outcomes, problems, known)`: `{outcome: {label: path name}}` for each of
+    `OUTCOMES`, a list of strings, and the count of declines per `known_declines.py`
+    entry. `live`: generate the legacy records instead of reading golden/.
 
     `one_stage`: keys a path hands back as legacy 1-stage keys, which must be 1-stage
     in the legacy record. `two_stage`: keys a ranking region hands back to a named legacy
     2-stage branch, whose stage 1 the legacy record must run. Paths of the `fhmoe` entry
     see every key with the shared expert added (`compare_fhmoe`; labels end in `|fhmoe`,
-    the legacy records are generated).
+    the legacy records are generated). Every decline of a key legacy runs must be in
+    `known_declines.py`.
     """
     from aiter.moev2 import paths
     from aiter.moev2.dispatch import tuned
-    from moe_dispatch import arch_sim, record, snapshot
+    from moe_dispatch import arch_sim, known_declines, record, snapshot
 
     if live:
         import logging
@@ -236,6 +260,26 @@ def compare(arch, check_logs=True, live=False):
     claimed = outcomes["claimed"]
     one_stage, two_stage = outcomes["one_stage"], outcomes["two_stage"]
     problems = []
+    known = Counter()
+    seen = set()
+
+    def check_known(label, path, declined):
+        problem, reason = declined
+        if reason is None:
+            problems.append(
+                f"{label} [{path.name}] declined without a reason where legacy runs "
+                "it; known_declines.py cannot list it"
+            )
+            return
+        entry = known_declines.find(path.name, problem, reason)
+        if entry is None:
+            problems.append(
+                f"{label} [{path.name}] declined ({reason}) where legacy runs it, and "
+                "known_declines.py does not list it"
+            )
+        else:
+            known[entry.name] += 1
+
     with arch_sim.simulated_arch(arch) as (gfx, cu_num):
         keys = snapshot.dispatch_keys(gfx, cu_num)
         # Load the tuned table once up front so no key's logs include the load warnings.
@@ -245,8 +289,9 @@ def compare(arch, check_logs=True, live=False):
             tuned._default_table()
         for key in keys:
             label = key.label()
-            if label in claimed:
+            if label in seen:  # a row repeated in the tuned table
                 continue
+            seen.add(label)
             for path in checkers:
                 with captured_logs() as v2_logs:
                     try:
@@ -255,11 +300,19 @@ def compare(arch, check_logs=True, live=False):
                         plan = record.error_record(exc)
                 if plan is None:
                     with captured_logs():
-                        handed_back = legacy_decline(path, key)
+                        declined = v2_decline(path, key)
+                        handed_back = legacy_decline(path, key, declined)
+                    if declined is None:
+                        continue
+                    expected = snapshot.resolve_same_as_base(golden, label)
                     if handed_back is None:
+                        if "error" in expected:
+                            outcomes["raises"][label] = path.name
+                        else:
+                            outcomes["declined"][label] = path.name
+                            check_known(label, path, declined)
                         continue
                     reason, stage1 = handed_back
-                    expected = snapshot.resolve_same_as_base(golden, label)
                     if stage1 is None:
                         one_stage[label] = path.name
                         if not expected.get("run_1stage"):
@@ -267,15 +320,19 @@ def compare(arch, check_logs=True, live=False):
                                 f"{label} [{path.name}] declined ({reason}) but legacy "
                                 f"runs it 2-stage: {json.dumps(expected, sort_keys=True)}"
                             )
-                        continue
-                    two_stage[label] = path.name
-                    got = expected.get("stage1")
-                    got = got.get("fn") if isinstance(got, dict) else got
-                    if expected.get("run_1stage") or got not in stage1:
-                        problems.append(
-                            f"{label} [{path.name}] declined ({reason}) but legacy "
-                            f"does not run {stage1}: {json.dumps(expected, sort_keys=True)}"
-                        )
+                            continue
+                    else:
+                        two_stage[label] = path.name
+                        got = expected.get("stage1")
+                        got = got.get("fn") if isinstance(got, dict) else got
+                        if expected.get("run_1stage") or got not in stage1:
+                            problems.append(
+                                f"{label} [{path.name}] declined ({reason}) but legacy "
+                                f"does not run {stage1}: "
+                                f"{json.dumps(expected, sort_keys=True)}"
+                            )
+                            continue
+                    check_known(label, path, declined)
                     continue
                 if check_logs:
                     legacy_logs = _legacy_logs(key)
@@ -301,14 +358,18 @@ def compare(arch, check_logs=True, live=False):
                     )
             fhmoe_label = f"{label}|fhmoe"
             for path in fhmoe_paths:
-                if any(fhmoe_label in seen for seen in outcomes.values()):
+                if any(fhmoe_label in by_label for by_label in outcomes.values()):
                     break
                 outcome, problem = compare_fhmoe(path, key, check_logs)
                 if outcome is not None:
                     outcomes[outcome][fhmoe_label] = path.name
                 if problem is not None:
                     problems.append(problem)
-    return outcomes, problems
+                if outcome == "declined":
+                    with captured_logs():
+                        declined = v2_decline(path, key, fhmoe=True)
+                    check_known(fhmoe_label, path, declined)
+    return outcomes, problems, known
 
 
 def main(argv=None):
@@ -342,7 +403,7 @@ def main(argv=None):
 
     failed = False
     for arch in args.arch or list(arch_sim.ARCHS):
-        outcomes, problems = compare(
+        outcomes, problems, known = compare(
             arch, check_logs=not args.no_logs, live=bool(args.env)
         )
 
@@ -355,6 +416,12 @@ def main(argv=None):
             for name, what in OUTCOMES.items()
         )
         print(f"{arch}: {counts}, {len(problems)} problems")
+        runs = sum(len(outcomes[name]) for name in _LEGACY_RUNS)
+        print(
+            f"  {runs} declined where legacy runs, {sum(known.values())} of them known:"
+        )
+        for name, n in sorted(known.items()):
+            print(f"    {n:6d} {name}")
         for line in problems[:40]:
             print("  " + line)
         failed |= bool(problems)

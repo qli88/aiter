@@ -106,6 +106,27 @@ def test_a_segment_in_no_ranking_entry_fails_unless_tuned_only():
     ]
 
 
+def test_known_declines_match_path_reason_and_problem():
+    sys.path.insert(0, str(_HERE))
+    from moe_dispatch import known_declines
+
+    from aiter.moev2 import paths
+
+    registered = set(paths.registered())
+    for known in known_declines.KNOWN:
+        assert known.paths <= registered and known.why, known.name
+    g1u0 = _problem(QuantType.No, dtypes.bf16, g1u1=False)
+    reason = "ranking a16w16_g1u0[not fmoe_1stage]: CK 2-stage g1u0 is not ported"
+    found = known_declines.find("a16w16", g1u0, reason)
+    assert found is not None and "5.3" in found.name
+    assert known_declines.find("a8w8_pt", g1u0, reason) is None
+    assert (
+        known_declines.find("a16w16", _problem(QuantType.No, dtypes.bf16), "x") is None
+    )
+    padding = "ranking a4w4[...]: CK 2-stage, padding ignored is not ported"
+    assert known_declines.find("a4w4", _problem(), padding) is None
+
+
 def test_the_ranking_names_no_tuned_only_segment():
     from aiter.moev2 import paths
 
