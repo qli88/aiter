@@ -135,10 +135,13 @@ class Segment:
     last op of the chain it implements. `capabilities`: the `Cap`s it supports.
     `structure_params`: parameters that change the boundary buffers (e.g. `block_m`), so
     every segment of a plan must agree on them. `reach` (`REACHES`, checked by
-    `coverage.segment_errors`): how dispatch gets to the segment. "ranked": in some
-    ranking entry. "tuned": in none, run only through tuned rows, as in legacy; some
-    shipped tuned row runs it. "hibernating": in no ranking entry and run by no shipped
-    row, only by a table passed with AITER_CONFIG_FMOE or by a test; it needs a GPU test
+    `coverage.segment_errors`): how dispatch gets to the segment without a tuned row. A
+    tuned row runs the segment that owns its kernel name whatever its reach. "ranked":
+    in some ranking entry; tuned rows may run it too, and are not checked (a retune that
+    drops its last row leaves it reachable). "tuned": in no ranking entry, so run only
+    through tuned rows, as in legacy; some shipped tuned row runs it. "hibernating": in
+    no ranking entry and run by no shipped row, only by a table passed with
+    AITER_CONFIG_FMOE or by a test; it needs a GPU test
     (tests/moe_dispatch/hibernating.py). The remaining attributes describe stateful and
     collective segments; no ported segment sets them yet.
     """
