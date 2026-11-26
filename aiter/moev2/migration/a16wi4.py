@@ -8,9 +8,10 @@ and gfx950 whose activations stay bf16: Silu and SiTUv2, g1u1, separated gate/up
 outside AITER_ONLINE_TUNE, without `quant_dtype_a2`, global scales, scatter, HERD
 routing, deterministic mode or registered presort. These resolve to the legacy untuned
 a16wi4 FlyDSL fallback or a tuned FlyDSL `abf16_wint4` row; neither stage quantizes.
-Interleaved gate/up (legacy runs the same kernels, todo 5.8), 1-stage tuned rows legacy
-keeps (the ones it discards, v2 discards too) and any other tuned row are declined back
-to the legacy code.
+Calls with `doweight_stage1` (no a16wi4 segment applies the routing weights in stage
+1), 1-stage tuned rows legacy keeps (the ones it discards, v2 discards too) and any
+other tuned row are declined back to the legacy code. Interleaved gate/up is not
+claimed (legacy runs the same kernels, todo 5.8).
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See

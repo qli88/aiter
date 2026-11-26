@@ -86,9 +86,9 @@ class QuantA1(Segment):
 
 
 def _keeps_bf16(dtype, w1_dtype, q_dtype_a, activation, ksplit, is_shuffled):
-    """The legacy condition under which neither GEMM input is quantized: bf16/fp16
-    activations into fp4 weights with Swiglu, SiTUv2 or Relu2, or fp4 activations into
-    a split-K GEMM on preshuffled weights (both quantize inline)."""
+    """The legacy condition under which the GEMM2 input is not quantized: bf16/fp16
+    activations into fp4 weights with Swiglu, SiTUv2 or Relu2, or any activations into
+    a split-K GEMM on preshuffled fp4 weights (both quantize inline)."""
     return (
         dtype in [dtypes.bf16, dtypes.fp16]
         and w1_dtype == dtypes.fp4x2

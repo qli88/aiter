@@ -11,7 +11,9 @@ separated), the dedicated table for the DSV4 I384 contract and for MXFP8 geometr
 declares (raising where legacy raises), then the `_fused_moe_impl` dispatch with the
 FHMoE stages and the selected block size enforced. Legacy runs only FlyDSL 2-stage plans
 and raises on any other; v2 has no other plan for these keys, so it declines them and
-legacy raises.
+legacy raises. v2 also declines keys legacy runs with the FlyDSL heuristic after
+discarding the tuned row: MXMOE rows, and rows of other families under
+AITER_BYPASS_TUNE_CONFIG (todo 5.28).
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).
 Please do not modify this code without coordinating with the moev2 owners (@qli88). See

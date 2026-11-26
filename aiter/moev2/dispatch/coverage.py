@@ -7,7 +7,8 @@ tests/moe_dispatch/coverage_checks.py):
 
 - `classify`: how the resolver serves a problem a path takes: a plan, a gap (no plan
   from the path's segments), a ranking region that hands it to a named legacy branch,
-  a decline caused by its tuned row, or a raise (where legacy raises).
+  a decline caused by its tuned row or by the plan it resolves to (a 1-stage plan with a
+  SiLU limit, tuned or default), or a raise (where legacy raises).
 - `row_status`: what the resolver does with the problem's exact tuned row: used, or
   why not (legacy's discard warning, or the decline).
 - `segment_errors`: segments whose `reach` does not hold: "ranked" in no ranking entry,
@@ -48,7 +49,7 @@ def classify(problem, segments):
     resolution.
     """
     try:
-        resolution = resolve(problem, segments)
+        resolution = resolve(problem, segments, emit_on_raise=False)
     except (RuntimeError, ValueError):
         return "raises", None
     reason = resolution.declined

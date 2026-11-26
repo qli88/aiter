@@ -327,8 +327,8 @@ class LocalDispatch:
         """`(resolution, problem)` for a key, or None when not taken or declined.
 
         `token` is the bucketed `hidden_states` row count; None for a lookup that no
-        call follows (the FHMoE capability checks). `problem` is None when no second
-        lookup follows (whole-graph plans). With `emit` False nothing is logged, and a
+        call follows (the FHMoE capability checks). `problem` is None for whole-graph
+        plans, which no second lookup follows (1-stage plans return it unused). With `emit` False nothing is logged, and a
         key whose resolution raises gives `_UNRESOLVED`.
         """
         problem = api.problem_from_key(

@@ -1423,6 +1423,37 @@ def test_v2_reads_and_resets_with_the_legacy_table(monkeypatch):
     assert a8w8_pt.LOCAL.resolve.cache_info().currsize == 0
 
 
+@pytest.mark.parametrize("quant", [QuantType.per_Tensor, QuantType.per_Token])
+def test_an_empty_kernel_name1_on_int8_weights_is_declined(monkeypatch, quant):
+    from moe_dispatch import arch_sim
+
+    from aiter.moev2.migration import a8w8_pt, a8w8_ptok
+
+    path = a8w8_pt if quant == QuantType.per_Tensor else a8w8_ptok
+    row = {"kernelName1": "", "kernelName2": "", "block_m": 48, "ksplit": 0}
+    with arch_sim.simulated_arch("gfx942") as (gfx, cu_num):
+        # Bypassing the row, legacy and v2 run the same default plan.
+        for w, bypass, legacy_stage1, v2_stage1 in (
+            (dtypes.i8, "0", "asm_stage1", None),
+            (dtypes.i8, "1", None, "legacy"),
+            (dtypes.fp8, "0", "ck_moe_stage1", "ck_moe_stage1"),
+        ):
+            monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", bypass)
+            args, kwargs = _key(quant=quant, fp8=w, w=w)
+            p = MoeProblem.from_legacy_key(*args, **kwargs, arch=gfx, cu_num=cu_num)
+            keys, _ = tuned.lookup_keys(p)
+            key = keys[:7] + (str(p.activation.activation),) + keys[8:]
+            monkeypatch.setattr(legacy, "cfg_2stages", ({key: row}, {}))
+            legacy.get_2stage_cfgs.cache_clear()
+            ref = legacy.get_2stage_cfgs(*args)
+            assert legacy_stage1 in (None, ref.stage1.func.__name__)
+            v2 = path.LOCAL.dispatch_record(args, kwargs)
+            if v2_stage1 == "legacy":
+                v2_stage1 = ref.stage1.func.__name__
+            assert (v2 and v2.stage1.func.__name__) == v2_stage1, (w, bypass)
+            assert v2 is None or v2.block_m == ref.block_m
+
+
 def test_the_log_only_relookup_runs_after_the_sort(monkeypatch, caplog):
     from aiter.moev2 import hooks
     from aiter.moev2.migration import a8w8_pt, local

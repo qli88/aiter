@@ -19,7 +19,7 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.ops.moe_limits import RUNTIME_SILU_LIMIT_QUANT_TYPES, normalize_swiglu_limit
 
-from ..dispatch import kernel_names
+from ..dispatch import kernel_names, overrides
 from ..dispatch.buf import Buf
 from ..dispatch.ops import Op
 from ..policy import quant_remap
@@ -286,6 +286,17 @@ class CkGemm1(Segment):
 
     def declines_row(self, p, row):
         kernel_name2 = str(row.get("kernelName2", "") or "")
+        if (
+            not row.get("kernelName1")
+            and not overrides.bypass_tuned()
+            and p.w1.dtype
+            not in (dtypes.bf16, dtypes.fp16, torch.uint32, dtypes.fp4x2, dtypes.fp8)
+            and not (
+                p.quant_type == QuantType.per_1x128 and "doweight_stage1" in p.features
+            )
+        ):
+            # get_2stage_cfgs runs ASM stage 1 under the empty name for these weights.
+            return f"tuned row with an empty kernelName1 for {p.w1.dtype} weights"
         if (
             p.quant_type == QuantType.per_1x32
             and p.any_shuffled

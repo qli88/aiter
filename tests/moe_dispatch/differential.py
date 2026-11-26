@@ -399,13 +399,15 @@ def main(argv=None):
     for item in args.env:
         name, _, value = item.partition("=")
         os.environ[name] = value
-    from moe_dispatch import arch_sim
+    from moe_dispatch import arch_sim, known_declines
 
     failed = False
+    unmatched = {entry.name for entry in known_declines.KNOWN}
     for arch in args.arch or list(arch_sim.ARCHS):
         outcomes, problems, known = compare(
             arch, check_logs=not args.no_logs, live=bool(args.env)
         )
+        unmatched -= set(known)
 
         def summary(by_label):
             counts = Counter(by_label.values())
@@ -425,6 +427,11 @@ def main(argv=None):
         for line in problems[:40]:
             print("  " + line)
         failed |= bool(problems)
+    if not args.arch:
+        # Not a failure: some entries hold only under an environment (e.g.
+        # AITER_BYPASS_TUNE_CONFIG), but a stale entry shows up here.
+        for name in sorted(unmatched):
+            print(f"known entry matching no decline here: {name}")
     return 1 if failed else 0
 
 
@@ -538,21 +545,22 @@ def _sorted_scale_defined(sorted_ids, token_num, groups, padded_groups):
 def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
     """`{(stage, argument): problem}` between two `kernel_bench_callable` recordings.
 
-        Same stages, same functions, equal non-tensor arguments, and tensors over what the
-        kernels define: the sort buffers up to `num_valid_ids` (the rest is `torch.empty`),
-        MX scales in sorted order at the routed rows and the `K / 32` groups
-        (`_sorted_scale_defined`), other buffers in sorted order at the routed rows (stage 1
-        skips block padding), `[token, topk, inter]` buffers at the routed slots that are
-        local (stage 1 skips the others), and nothing for the output buffer, for the `out`
-        argument of a stage 1 that writes a buffer of its own (`_own_stage1_buffer`), nor
-        for the output of a split-K stage 1 (accumulated with atomics). The sort buffers, MX
-        scales, fp4 values and every integer tensor must be bitwise equal. Other
-        floating-point tensors (activations, intermediates and their scales) may differ by 1
-        ulp of their dtype, or by twice what the same argument differs between `legacy` and
-        `legacy2`, a second legacy run: some stage-1 kernels are not repeatable. A
-        non-finite value must equal one of legacy's runs. A 1-stage ASM launch writes the
-        output to its `moe_buf`, and the FLAT one takes the topk ids and weights unsorted, which
-    are compared as inputs.
+    Same stages, same functions, equal non-tensor arguments, and tensors over what the
+    kernels define: the sort buffers up to `num_valid_ids` (the rest is `torch.empty`),
+    MX scales in sorted order at the routed rows and the `K / 32` groups
+    (`_sorted_scale_defined`), other buffers in sorted order at the routed rows (stage 1
+    skips block padding), `[token, topk, inter]` buffers at the routed slots that are
+    local (stage 1 skips the others), and nothing for the output buffer, for the `out`
+    argument of a stage 1 that writes a buffer of its own (`_own_stage1_buffer`), nor
+    for the output of a split-K stage 1 (accumulated with atomics). The sort buffers, MX
+    scales, fp4 values and every integer tensor must be bitwise equal. Other
+    floating-point tensors (activations, intermediates and their scales) may differ by 1
+    ulp of their dtype, or by twice what the same argument differs between `legacy` and
+    `legacy2`, a second legacy run: some stage-1 kernels are not repeatable. `legacy2`
+    counts only where its sort buffers equal `legacy`'s (its arguments are read in
+    `legacy`'s sorted order). A non-finite value must equal one of legacy's runs. A
+    1-stage ASM launch writes the output to its `moe_buf`, and the FLAT one takes the
+    topk ids and weights unsorted, which are compared as inputs.
     """
     import torch
 
@@ -599,6 +607,15 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
                     roles[v2_stage1.args[i].data_ptr()] = role
             sorted_ids = stage1.args[at["ids"]]
             routed_rows = (sorted_ids[:num_valid] & 0xFFFFFF) < topk_ids.shape[0]
+            if legacy2 is not None:
+                again = dict(legacy2)["stage1"].args
+                if int(again[at["num_valid"]][0]) != num_valid or not all(
+                    torch.equal(_bits(stage1.args[i][:n]), _bits(again[i][:n]))
+                    for role, i in at.items()
+                    if role != "num_valid"
+                    for n in [num_valid // block_m if role == "blocks" else num_valid]
+                ):
+                    legacy2 = None
         for _, launch in legacy + v2:
             for name in ("sorted_weights", "m_indices"):
                 if launch.keywords.get(name) is not None:
@@ -731,6 +748,9 @@ def _own_stage1_buffer(launch) -> bool:
     )
 
 
+_NOISE_ULPS = 16
+
+
 def _ulp(t):
     import torch
 
@@ -750,7 +770,7 @@ def run_differential(path_name, call, *, bitwise=False):
     floating-point tensors), and produce the same output: bitwise with
     `bitwise=True`, else within the larger of 4 ulps of the output's peak and twice the
     difference between two legacy runs (atomic accumulation in GEMM2 and in a split-K
-    stage 1 is not deterministic).
+    stage 1 is not deterministic), which fails above `_NOISE_ULPS` ulps of the peak.
     """
     import dataclasses
     import inspect
@@ -773,7 +793,7 @@ def run_differential(path_name, call, *, bitwise=False):
     ](bound.arguments)
 
     def launch(mode):
-        bench = []
+        bench, previous = [], fm.kernel_bench_callable
         fm.kernel_bench_callable = bench
         if call.get("output") is not None:
             # Legacy and v2 share the caller's buffer: what one leaves unwritten must
@@ -783,7 +803,7 @@ def run_differential(path_name, call, *, bitwise=False):
             with moev2_mode(mode):
                 out = fm.fused_moe(**call)
         finally:
-            fm.kernel_bench_callable = None
+            fm.kernel_bench_callable = previous
         torch.cuda.synchronize()
         if call.get("output") is not None and out is not call["output"]:
             raise AssertionError(f"{mode}: the result is not the caller's output=")
@@ -821,32 +841,46 @@ def run_differential(path_name, call, *, bitwise=False):
             f"{path_name}: launches differ: " + "; ".join(list(problems.values())[:6])
         )
     if bitwise:
-        assert torch.equal(ref, out), f"{path_name}: output differs from legacy"
+        assert torch.equal(
+            _bits(ref), _bits(out)
+        ), f"{path_name}: output differs from legacy"
         return ref, out
     _check_output(path_name, ref, ref2, out)
     return ref, out
 
 
-def _check_output(path_name, ref, ref2, out):
-    """`out` matches legacy `ref` within the noise between two legacy runs."""
+def _same_non_finite(a, b):
+    """The values of `a` and `b` agree where `a` is not finite: NaN for NaN (any
+    payload), the same infinity."""
     import torch
 
+    where = ~a.isfinite()
+    if not torch.equal(where, ~b.isfinite()):
+        return False
+    x, y = a[where].float(), b[where].float()
+    return bool(((x.isnan() & y.isnan()) | (x == y)).all())
+
+
+def _check_output(path_name, ref, ref2, out):
+    """`out` matches legacy `ref` within the noise between two legacy runs, which may
+    not exceed `_NOISE_ULPS` ulps of the output's peak."""
     finite = ref.isfinite()
 
     def gap(x):
         diff = (x.float()[finite] - ref.float()[finite]).abs()
         return diff.max().item() if diff.numel() else 0.0
 
-    noise = gap(ref2) if torch.equal(finite, ref2.isfinite()) else float("inf")
-    peak = ref.float()[finite].abs().max().item() if finite.any() else 0.0
-    assert (
-        noise <= peak
-    ), f"{path_name}: legacy output not reproducible (noise {noise}, peak {peak})"
-    assert torch.equal(finite, out.isfinite()) and torch.equal(
-        ref[~finite], out[~finite]
+    noise = gap(ref2) if _same_non_finite(ref, ref2) else float("inf")
+    ulp = _ulp(ref)
+    assert noise <= _NOISE_ULPS * ulp, (
+        f"{path_name}: legacy output not repeatable (noise {noise}, "
+        f"{_NOISE_ULPS} ulps of the peak {_NOISE_ULPS * ulp})"
+    )
+    assert _same_non_finite(
+        ref, out
     ), f"{path_name}: non-finite outputs differ from legacy"
     err = gap(out)
-    tol = max(4 * _ulp(ref), 2 * noise)
+    tol = max(4 * ulp, 2 * noise)
     assert (
         err <= tol
     ), f"{path_name}: max |v2 - legacy| {err} > {tol} (legacy noise {noise})"

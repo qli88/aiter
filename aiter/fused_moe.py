@@ -23,7 +23,10 @@ from aiter import (
     mxfp4_moe_sort_fwd,
 )
 from aiter import get_hip_quant as get_quant
-from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
+from aiter.fhmoe_contract import (  # noqa: F401
+    FHMOE_BUFFER_MAX_BYTES,
+    fhmoe_reduce_output_nbytes,
+)
 from aiter.fused_moe_registry import (  # noqa: F401
     BoundFusedMoeImpl,
     FusedMoeImplResolutionError,
@@ -170,14 +173,19 @@ from aiter.ops.flydsl.moe_common import (
     _mxfp4_intermediate_enabled,
     get_flydsl_activation_name,
 )
-from aiter.ops.flydsl.mxfp4_kname import (
+from aiter.ops.flydsl.mxfp4_kname import (  # noqa: F401
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
+    _parse_mxfp4_g2_kname,
+    native_scale_layout_for,
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
 from aiter.ops.moe_limits import RUNTIME_SILU_LIMIT_QUANT_TYPES, normalize_swiglu_limit
-from aiter.ops.moe_mxfp4_aux import _MissingMxfp4MoeAuxInstances
+from aiter.ops.moe_mxfp4_aux import (  # noqa: F401
+    _MissingMxfp4MoeAuxInstances,
+    is_mxfp4_moe_scatter_supported,
+)
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,

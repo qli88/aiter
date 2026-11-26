@@ -8,8 +8,10 @@ floating-point tensors within 1 ulp or legacy's own spread), give the same outpu
 the GEMM2 atomics, and log the same dispatch lines on a first call (see
 `differential.run_differential`). Besides plain calls, the cases cover inputs `claims`
 accepts (`_VARIANTS`: all of them for a8w8_pt, `_GENERIC_VARIANTS` for the fp8 per-token,
-blockscale and `per_1x32` paths); a case may raise only where legacy raises on it
-(`_RAISES`), and v2 must then run the call and raise the same error.
+blockscale and `per_1x32` paths). Where legacy raises, v2 must raise the same error,
+either running the call or declining it to legacy (the outcome is printed); for the
+variants in `_RAISES` both must raise the listed error, and v2 must run the call. These
+cases (`RAIS`) are counted at the end, with the ones that follow a failed JIT build.
 
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt
     python tests/moe_dispatch/gpu_differential.py --path a16w16 --synth-table
@@ -947,6 +949,10 @@ def _v2_outcome(path_name, call):
     return outcome[0]
 
 
+# Cases where legacy and v2 raised the same error: only the errors were compared.
+_BOTH_RAISE = []
+
+
 def run_case(path_name, case):
     """Return a problem string, or None when legacy and v2 agree."""
     env = case[10].get("env", {}) if len(case) > 10 else {}
@@ -974,6 +980,7 @@ def _run_case(path_name, case):
     from moe_dispatch.differential import captured_logs, moev2_mode, run_differential
 
     call = _make_call(path_name, case)
+    _clear_dispatch_caches()
     with moev2_mode("off"), captured_logs():
         legacy_error = _raised(lambda: fm.fused_moe(**call))  # warm-up: JIT logs here
     torch.cuda.synchronize()
@@ -986,24 +993,33 @@ def _run_case(path_name, case):
     if _without_build_output(legacy_logs) != _without_build_output(v2_logs):
         return f"{case}: log lines differ\n    legacy: {legacy_logs}\n    v2:     {v2_logs}"
     expected = _RAISES.get(case_variant(case))
-    if expected is not None:
-        if not (legacy_error and legacy_error == v2_error and expected in v2_error):
-            return (
-                f"{case}: expected both to raise {expected!r}; "
-                f"legacy raises {legacy_error}; v2 raises {v2_error}"
-            )
-        _clear_dispatch_caches()
-        outcome = _v2_outcome(path_name, call)
-        return None if outcome == "raised" else f"{case}: v2 {outcome}, not raised"
-    if legacy_error or v2_error:
+    if expected is not None and not (v2_error and expected in v2_error):
         return (
-            f"{case}: expected successful execution; "
+            f"{case}: expected both to raise {expected!r}; "
             f"legacy raises {legacy_error}; v2 raises {v2_error}"
         )
+    if legacy_error or v2_error:
+        if legacy_error != v2_error:
+            return f"{case}: legacy raises {legacy_error}; v2 raises {v2_error}"
+        _clear_dispatch_caches()
+        outcome = _v2_outcome(path_name, call)
+        allowed = ("raised",) if expected is not None else ("raised", "declined")
+        if outcome not in allowed:
+            return f"{case}: both raise {legacy_error}, but v2 {outcome}"
+        build_failed = any(
+            "failed jit build" in msg for _, msg in legacy_logs + v2_logs
+        )
+        _BOTH_RAISE.append((case, build_failed))
+        print(f"     both raise (v2 {outcome}): {legacy_error[:160]}")
+        return None
     try:
         run_differential(path_name, call)
+    except torch.OutOfMemoryError:
+        raise
     except AssertionError as exc:
         return f"{case}: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"{case}: the comparison raised {type(exc).__name__}: {exc}"
     return None
 
 
@@ -1025,8 +1041,11 @@ def _child(args):
             problem = None
             skipped.append(case)
         torch.cuda.empty_cache()
+        raised = bool(_BOTH_RAISE) and _BOTH_RAISE[-1][0] is case
         status = (
-            "SKIP" if skipped and skipped[-1] is case else "FAIL" if problem else "ok  "
+            "SKIP"
+            if skipped and skipped[-1] is case
+            else "FAIL" if problem else "RAIS" if raised else "ok  "
         )
         print(f"{status} {case}", flush=True)
         if problem:
@@ -1035,6 +1054,14 @@ def _child(args):
         print("  " + line)
     if skipped:
         print(f"{len(skipped)} cases not compared (out of GPU memory): rerun them")
+    if _BOTH_RAISE:
+        builds = [case for case, build_failed in _BOTH_RAISE if build_failed]
+        print(
+            f"{len(_BOTH_RAISE)} of {len(todo)} cases raise the same error on both "
+            f"(errors compared, outputs not), {len(builds)} after a failed JIT build"
+        )
+        for case in builds:
+            print(f"  WARNING: a JIT module failed to build for {case}")
     print(f"{len(problems)} problems")
     return 1 if problems or skipped else 0
 

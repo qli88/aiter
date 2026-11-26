@@ -7,9 +7,9 @@ activations are fp8 (the `policy.py` choice or `quant_dtype_a`), Silu or Swiglu,
 separated or interleaved gate/up, outside AITER_ONLINE_TUNE, without `quant_dtype_a2`,
 global scales, scatter, HERD routing, deterministic mode or registered presort. Today
 these resolve to the FlyDSL heuristic (gate/up interleaved, or separated with w1 tagged
-`gate_up_interleave=False`), CK 2-stage otherwise (which ignores the padding), or a
-tuned FlyDSL row (FlyDSL or layout-v2 stage 2). Interleaved keys outside the FlyDSL
-heuristic, the padded CK default and any other tuned row are declined back to the legacy
+`gate_up_interleave=False`), CK 2-stage otherwise (unpadded), or a tuned FlyDSL row
+(FlyDSL or layout-v2 stage 2). Interleaved keys outside the FlyDSL heuristic, the padded
+CK default (legacy's CK ignores the padding) and any other tuned row are declined back to the legacy
 code.
 
 NOTE: aiter.moev2 is under active development (MoE v2 migration, not graduated).

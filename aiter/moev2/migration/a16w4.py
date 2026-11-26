@@ -4,14 +4,14 @@
 
 Claims `fused_moe_` calls with `QuantType.per_1x32` and fp4x2 weights on gfx942 and
 gfx950 whose activations stay bf16 (the `policy.py` choice or `quant_dtype_a`): Swiglu
-and SiTUv2 (g1u1) and gate-only Relu2, separated gate/up (Swiglu also interleaved),
-outside AITER_ONLINE_TUNE, without `quant_dtype_a2`, global scales, scatter, HERD
+and SiTUv2 (g1u1) and gate-only Relu2, separated or interleaved gate/up, outside AITER_ONLINE_TUNE, without `quant_dtype_a2`, global scales, scatter, HERD
 routing, deterministic mode or registered presort. Today these resolve to CK-Tile
 (Swiglu: interleaved, split-K, or without a kernelName1; Relu2; split-K for SiTUv2 keys
 with `doweight_stage1`, whose calls the a16w4 SiTUv2 guard of the executor rejects as
 legacy does), the FlyDSL a16w4 heuristic (SiTUv2; Swiglu where CK-Tile is unsafe), or a
-tuned FlyDSL a16w4 row or `swiglu_mxfp4_bf16_cktile` row. The CK branch (gfx942 Relu2
-and SiTUv2 outside FlyDSL and CK-Tile), interleaved calls outside the CK-Tile
+tuned FlyDSL a16w4 row or `swiglu_mxfp4_bf16_cktile` row. The CK branch (Relu2 outside
+the CK-Tile Relu2 branch, i.e. on gfx942, with fp16 output or weights not both
+preshuffled, and without split-K; gfx942 SiTUv2 outside FlyDSL and CK-Tile), interleaved calls outside the CK-Tile
 interleaved branch (legacy runs FlyDSL kernels for separated weights there, todo 5.8),
 Relu2 with g1u1, bias or `doweight_stage1` (legacy raises), the alias rows outside the
 CK-Tile branches (ASM stage 1 + CK stage 2) and any other tuned row are declined back to
