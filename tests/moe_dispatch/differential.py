@@ -969,6 +969,8 @@ def run_differential(path_name, call, *, bitwise=False):
     `bitwise=True`, else within the larger of 4 ulps of the output's peak and twice the
     difference between two legacy runs (atomic accumulation in GEMM2 and in a split-K
     stage 1 is not deterministic), which fails above `_NOISE_ULPS` ulps of the peak.
+    The path runs the call twice, the second time from the call cache, and both runs
+    must pass.
     """
     import dataclasses
 
@@ -980,27 +982,31 @@ def run_differential(path_name, call, *, bitwise=False):
     path = paths.registered()[path_name]
     entry = entry_call(path, call)
 
-    def launch(mode):
-        bench, previous = [], fm.kernel_bench_callable
-        fm.kernel_bench_callable = bench
-        if call.get("output") is not None:
-            # Legacy and v2 share the caller's buffer: what one leaves unwritten must
-            # not pass as the other's result.
-            call["output"].fill_(float("nan"))
-        try:
-            with moev2_mode(mode):
-                out = fm.fused_moe(**call)
-        finally:
-            fm.kernel_bench_callable = previous
-        torch.cuda.synchronize()
-        if call.get("output") is not None and out is not call["output"]:
-            raise AssertionError(f"{mode}: the result is not the caller's output=")
-        return out, bench
+    def launch(mode, runs=1):
+        """`(raw output, its copy, launches)` per run."""
+        done = []
+        with moev2_mode(mode):
+            for _ in range(runs):
+                bench, previous = [], fm.kernel_bench_callable
+                fm.kernel_bench_callable = bench
+                if call.get("output") is not None:
+                    # Legacy and v2 share the caller's buffer: what one leaves unwritten
+                    # must not pass as the other's result.
+                    call["output"].fill_(float("nan"))
+                try:
+                    out = fm.fused_moe(**call)
+                finally:
+                    fm.kernel_bench_callable = previous
+                torch.cuda.synchronize()
+                if call.get("output") is not None and out is not call["output"]:
+                    raise AssertionError(
+                        f"{mode}: the result is not the caller's output="
+                    )
+                done.append((out, out.clone(), bench))
+        return done
 
-    ref_raw, legacy_launches = launch("off")
-    ref = ref_raw.clone()
-    ref2_raw, legacy2_launches = launch("off")
-    ref2 = ref2_raw.clone()
+    [(ref_raw, ref, legacy_launches)] = launch("off")
+    [(_, ref2, legacy2_launches)] = launch("off")
     results = []
 
     def run(c):
@@ -1014,30 +1020,30 @@ def run_differential(path_name, call, *, bitwise=False):
             routed = paths.route_to_v2(entry, path.entry)
             if routed is None or routed.name != path_name:
                 raise AssertionError(f"path {path_name} does not claim this call")
-        out_raw, v2_launches = launch(path_name)
-        out = out_raw.clone()
+        v2_runs = launch(path_name, runs=2)
     finally:
         paths._REGISTRY[path_name] = path
         paths.reload()
-    if len(results) != 1 or results[0] is paths.DECLINED:
+    if len(results) != 2 or any(r is paths.DECLINED for r in results):
         raise AssertionError(f"path {path_name} did not run this call: {results}")
     stage1 = dict(legacy_launches).get("stage1")
     unrepeatable = stage1 is not None and _unrepeatable_stage1(stage1)
     try:
-        problems = compare_launches(
-            legacy_launches, v2_launches, call, ref_raw, out_raw, legacy2_launches
-        )
-        if problems:
-            raise AssertionError(
-                f"{path_name}: launches differ: "
-                + "; ".join(list(problems.values())[:6])
+        for run_name, (out_raw, out, v2_launches) in zip(("", "cached: "), v2_runs):
+            problems = compare_launches(
+                legacy_launches, v2_launches, call, ref_raw, out_raw, legacy2_launches
             )
-        if bitwise:
-            assert ref.dtype == out.dtype and torch.equal(
-                _bits(ref), _bits(out)
-            ), f"{path_name}: output differs from legacy"
-        else:
-            _check_output(path_name, ref, ref2, out)
+            if problems:
+                raise AssertionError(
+                    f"{run_name}{path_name}: launches differ: "
+                    + "; ".join(list(problems.values())[:6])
+                )
+            if bitwise:
+                assert ref.dtype == out.dtype and torch.equal(
+                    _bits(ref), _bits(out)
+                ), f"{run_name}{path_name}: output differs from legacy"
+            else:
+                _check_output(f"{run_name}{path_name}", ref, ref2, out)
     except Exception as exc:
         if not unrepeatable or isinstance(exc, torch.OutOfMemoryError):
             raise

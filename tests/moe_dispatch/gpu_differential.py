@@ -45,6 +45,9 @@ before step 5.1l) are dropped, and listed, before the cases are counted.
 A case that does not fit in the free GPU memory is reported as skipped and fails the run
 (it was not compared).
 
+The path runs each case twice, the second time from the call cache, under
+AITER_MOEV2_CALL_CACHE=check unless the caller sets it.
+
 NOTE: part of the aiter.moev2 migration (under active development, not graduated).
 Please coordinate changes with the moev2 owners (@qli88). See aiter/moev2/README.md.
 
@@ -1162,6 +1165,7 @@ def main(argv=None):
     # this checkout rather than an installed copy, even one earlier on the path.
     front = [str(_HERE.parent), str(_HERE.parents[1])]
     sys.path[:] = front + [p for p in sys.path if p not in front]
+    os.environ.setdefault("AITER_MOEV2_CALL_CACHE", "check")
     if args.child or not args.synth_table:
         return _child(args)
 

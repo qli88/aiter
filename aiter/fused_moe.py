@@ -400,7 +400,7 @@ def fused_moe(
     # Entry "api": an enabled path may run this call on aiter.moev2.
     # aiter.moev2.api.op_call copies how this function calls fused_moe_; mirror
     # changes to those arguments there.
-    if not torch.compiler.is_compiling() and moev2_paths.any_active():
+    if not torch.compiler.is_compiling() and moev2_paths.any_active("api"):
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "api")
         if v2_path is not None:
@@ -876,7 +876,7 @@ def fused_moe_(
     # (@qli88). See aiter/moev2/README.md.
     # Entry "op": an enabled path may run this call on aiter.moev2 instead of
     # _fused_moe_impl; DECLINED hands it back.
-    if moev2_paths.any_active():
+    if moev2_paths.any_active("op"):
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "op")
         if v2_path is not None:

@@ -41,11 +41,20 @@ def legacy_kernel_bench(calls: list | None):
     return set_kernel_bench_callable(calls)
 
 
-@contextlib.contextmanager
+_UNSET = contextlib.nullcontext()
+
+
 def legacy_globals(kernel_calls: list | None, fused_decode_sort_quant_off: bool):
     """The legacy code wraps v2 runs in this with its `kernel_bench_callable` and
     `_fused_decode_sort_quant_disabled` globals, so code that sets them drives v2 too.
     """
+    if kernel_calls is None and not fused_decode_sort_quant_off:
+        return _UNSET
+    return _legacy_globals(kernel_calls, fused_decode_sort_quant_off)
+
+
+@contextlib.contextmanager
+def _legacy_globals(kernel_calls, fused_decode_sort_quant_off):
     off = (
         disable_fused_decode_sort_quant()
         if fused_decode_sort_quant_off

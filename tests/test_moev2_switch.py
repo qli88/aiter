@@ -23,6 +23,7 @@ import pytest
 
 import aiter.fused_moe as legacy
 from aiter.moev2 import api, envs, paths
+from aiter.moev2.dispatch import call_cache
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -90,6 +91,23 @@ def test_nothing_registered_routes_nothing(monkeypatch):
         _set(monkeypatch, value)
         assert not paths.any_active()
         assert paths.route_to_v2({}) is None
+
+
+def test_entry_hooks_build_no_call_where_no_path_is_active(monkeypatch):
+    import aiter.fhmoe
+
+    _fake_path("a4w4", entry="op")
+    _set(monkeypatch, "a4w4")
+    assert paths.any_active() and paths.any_active("op")
+    assert not paths.any_active("api") and not paths.any_active("fhmoe")
+    hooks = 0
+    for module in (legacy, aiter.fhmoe):
+        source = inspect.getsource(module)
+        for entry in ("api", "op", "fhmoe"):
+            if f'route_to_v2(call, "{entry}")' in source:
+                hooks += 1
+                assert f'any_active("{entry}")' in source, entry
+    assert hooks == 3
 
 
 def test_unknown_path_name_is_an_error(monkeypatch):
@@ -187,7 +205,8 @@ def test_legacy_fused_moe_routes_claimed_calls(monkeypatch):
     assert out == ("v2", "a16w16")
     (call,) = calls
     assert call["splitk"] == 3 and call["w1"] == "w1"
-    assert set(call) == set(inspect.signature(legacy.fused_moe).parameters)
+    params = inspect.signature(legacy.fused_moe).parameters
+    assert set(call) == {*params, call_cache.SIGNATURE}
 
 
 def test_op_entry_sees_the_custom_op_arguments(monkeypatch):
@@ -201,7 +220,8 @@ def test_op_entry_sees_the_custom_op_arguments(monkeypatch):
     out = legacy.fused_moe(*_cpu_moe_args(), activation=ActivationType.Gelu)
     assert torch.equal(out, marker)
     (call,) = calls
-    assert set(call) == set(inspect.signature(legacy.fused_moe_fake).parameters)
+    params = inspect.signature(legacy.fused_moe_fake).parameters
+    assert set(call) == {*params, call_cache.SIGNATURE}
     assert call["activation"] == ActivationType.Gelu.value
     assert call["quant_type"] == QuantType.No.value
     assert call["block_size_M"] == -1 and call["ep_source_token_map"] is None

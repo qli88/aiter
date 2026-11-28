@@ -514,7 +514,7 @@ def _fhmoe_impl(
     # (@qli88). See aiter/moev2/README.md.
     # Entry "fhmoe": an enabled path may run this call on aiter.moev2 instead of the
     # code below; DECLINED hands it back.
-    if moev2_paths.any_active():
+    if moev2_paths.any_active("fhmoe"):
         call = dict(locals())
         v2_path = moev2_paths.route_to_v2(call, "fhmoe")
         if v2_path is not None:

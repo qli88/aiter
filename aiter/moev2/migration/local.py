@@ -17,14 +17,14 @@ aiter/moev2/README.md.
 import functools
 import math
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from aiter import ActivationType, QuantType, dtypes, logger, presorted_moe
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import api, paths
-from ..dispatch import overrides, resolver, tuned
+from ..dispatch import call_cache, overrides, resolver, tuned
 from ..execute import executor
 from ..policy import quant_remap, resolve_activation_dtype
 from ..problem import FrozenMap
@@ -42,6 +42,7 @@ from ..shapes import get_inter_dim, get_padded_M
 _RELOOKUP_DROPS = frozenset({"act_scales", "num_local_tokens", "scatter"})
 _RELOOKUP_DROPS_EXTRAS = frozenset({"disable_inline_sort", "exclude_mxmoe"})
 _UNRESOLVED = object()
+_UNCACHED = (call_cache.OFF, None, None)
 
 # `fused_moe_` arguments no local path supports yet.
 _UNSUPPORTED_ARGS = (
@@ -186,14 +187,20 @@ def why_not(
     return None
 
 
+@functools.cache
+def _grouped_gfx1250():
+    from aiter.ops.flydsl import grouped_moe_gfx1250
+
+    return grouped_moe_gfx1250
+
+
 def legacy_grouped_gfx1250(call) -> bool:
     """`grouped_gemm_gfx1250_a8w4` runs the call instead of returning None (its checks
     before the launch, for a per_1x32 g1u1 call of fp8 activations into MXFP4 weights
     with Silu, Swiglu or SiTUv2, or a call legacy rejects before that branch)."""
-    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
-
     if GateMode(call["gate_mode"]) != GateMode.INTERLEAVE:
         return False
+    grouped = _grouped_gfx1250()
     if not grouped._use_grouped_gemm_enabled():
         return False
     if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
@@ -259,6 +266,17 @@ def key_args_supported(
             problem.w1.dtype == dtypes.i8 and "doweight_stage1" in problem.features
         )
     )
+
+
+@dataclass(frozen=True)
+class _Decision:
+    """`where`: the `dispatch` key; `dispatched`: its result; `fallbacks`: the
+    `mxfp4_fallbacks`."""
+
+    where: tuple
+    q_dtype_a: object
+    dispatched: tuple
+    fallbacks: tuple
 
 
 def _relookup_problem(problem, token):
@@ -353,8 +371,30 @@ class LocalDispatch:
         return primary, problem
 
     def run(self, call, q_dtype_a=None, config_file=None):
-        """`q_dtype_a`, `config_file`: as `api.dispatch_key` takes them."""
+        """`q_dtype_a`, `config_file`: as `api.dispatch_key` takes them.
+
+        `_decide` is cached per call signature (`call_cache`, left in `call` by
+        `route_to_v2`); `_execute` runs on every call."""
         forced = (q_dtype_a, config_file)
+        mode, key, cached = call.get(call_cache.SIGNATURE, _UNCACHED)
+        decisions = {} if cached is None else cached.decisions
+        slot = (self, forced)
+        decision = decisions.get(slot, call_cache.MISS)
+        first = decision is call_cache.MISS
+        if first:
+            decision = self._decide(call, forced)
+        elif mode == call_cache.CHECK:
+            fresh = self._decide(call, forced)
+            call_cache.check((key, forced), "dispatch", decision, fresh)
+        if decision is not paths.DECLINED:
+            return self._execute(call, decision, decisions, slot, first)
+        if first:
+            decisions[slot] = decision
+        return paths.DECLINED
+
+    def _decide(self, call, forced):
+        """DECLINED, or the `_Decision` for the call; nothing is logged but a decline's
+        lines. Reads only what `call_cache.signature` keys."""
         # A declined call goes back to legacy before the prologue copies anything.
         preview = executor.prologue(call, quant_remap, prepare=False)
         args, kwargs, q_dtype_a = api.dispatch_key(preview, *forced)
@@ -362,9 +402,9 @@ class LocalDispatch:
             # Legacy raises NotImplementedError before its dispatch.
             return paths.DECLINED
         token = get_padded_M(preview["hidden_states"].shape[0])
-        arch, cu_num = get_gfx_runtime(), get_cu_num()
-        where = (args, tuple(kwargs.items()), arch, cu_num, token)
-        if self.dispatch(*where, emit=False) is None:
+        where = (args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num(), token)
+        dispatched = self.dispatch(*where, emit=False)
+        if dispatched is None:
             self.dispatch(*where, emit=True)
             return paths.DECLINED
         fallbacks = ()
@@ -372,16 +412,24 @@ class LocalDispatch:
             fallbacks = self.mxfp4_fallbacks(*where, preview.block_size_M)
             if fallbacks is None:
                 return paths.DECLINED
+        return _Decision(where, q_dtype_a, dispatched, fallbacks)
 
+    def _execute(self, call, decision, decisions, slot, first):
+        """The per-call steps of `run`. `first`: the decision is new, so the first
+        lookup logs now, as legacy's does on the call that resolves the key; it goes
+        into `decisions[slot]` once its checks pass."""
         c = executor.prologue(call, quant_remap)
-        args, kwargs, q_dtype_a = api.dispatch_key(c, *forced)
-        dispatched = self.dispatch(
-            args, tuple(kwargs.items()), arch, cu_num, token, emit=True
-        )
-        if dispatched is None:
-            return paths.DECLINED
+        args, _, arch, cu_num, token = decision.where
+        q_dtype_a = decision.q_dtype_a
+        dispatched = decision.dispatched
+        if first:
+            dispatched = self.dispatch(*decision.where, emit=True)
+            if dispatched is None:
+                return paths.DECLINED
         self._check_fhmoe(dispatched[0])
-        for fallback_kwargs, warning in fallbacks:
+        if first:
+            decisions[slot] = replace(decision, dispatched=dispatched)
+        for fallback_kwargs, warning in decision.fallbacks:
             message = warning(c)
             if not message:
                 continue

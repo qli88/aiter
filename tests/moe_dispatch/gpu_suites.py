@@ -12,7 +12,8 @@ suites run for every path.
     python tests/moe_dispatch/gpu_suites.py --path a8w8_pt --compare  # off, then the path
 
 `--run` and `--compare` set AITER_MOEV2 themselves; a value in the caller's environment
-is ignored. `--compare` runs each suite with `AITER_MOEV2=off` and with the path, writes
+is ignored. They run with AITER_MOEV2_CALL_CACHE=check unless the caller sets it.
+`--compare` runs each suite with `AITER_MOEV2=off` and with the path, writes
 the output to `--log-dir` (default: a new temporary directory), and fails where v2 fails
 and legacy passes. It also prints the checkAllclose outcomes of both runs and the checks
 whose outcome differs; these do not set the exit status (a failed check need not fail
@@ -172,6 +173,7 @@ def _passes(suite, mode, log=None):
     """Whether `suite` exits 0 with AITER_MOEV2=`mode`; its output goes to `log` if given."""
     env = os.environ.copy()
     env["AITER_MOEV2"] = mode
+    env.setdefault("AITER_MOEV2_CALL_CACHE", "check")
     # A script's own directory heads its sys.path, so without this `aiter` would be
     # whatever is installed.
     env["PYTHONPATH"] = os.pathsep.join(

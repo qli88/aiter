@@ -34,7 +34,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from . import envs
-from .dispatch import overrides
+from .dispatch import call_cache, overrides
 
 logger = logging.getLogger("aiter")
 
@@ -80,7 +80,8 @@ class Path:
     """One migration path.
 
     `claims(call)` / `run(call)`: `call` maps the parameter names of the path's `entry`
-    function to the call's arguments. `run` returns the output, or `DECLINED`.
+    function to the call's arguments; `route_to_v2` adds `call_cache.SIGNATURE`. `run`
+    returns the output, or `DECLINED`.
     `graduated`: True, or the archs (`get_gfx_runtime()` values) the path runs on by
     default; the default needs a passed GPU gate on that arch.
     `graduated_claims(call)`: when the path runs by default (AITER_MOEV2 unset), it
@@ -203,6 +204,7 @@ def registered():
 
 
 _active: tuple | None = None
+_active_entries: frozenset | None = None
 # Bumped by reload(): a selection computed across a reload is returned but not cached.
 _generation = 0
 # The last selection logged, and the (path, reason) pairs AITER_MOE_EXPLAIN has logged.
@@ -214,7 +216,7 @@ _explained: set = set()
 
 def active() -> tuple:
     """Registered paths selected by AITER_MOEV2, in registration order."""
-    global _active
+    global _active, _active_entries
     selected = _active
     if selected is not None:
         return selected
@@ -223,6 +225,7 @@ def active() -> tuple:
     selected = _select()
     with _lock:
         if generation == _generation:
+            _active_entries = frozenset(p.entry for p in selected)
             _active = selected
     _announce(selected)
     return selected
@@ -290,12 +293,42 @@ def _select() -> tuple:
     return tuple(p for p in registry.values() if p.name in selection)
 
 
-def any_active() -> bool:
-    return bool(active())
+def any_active(entry: str | None = None) -> bool:
+    """Whether a path is active (at `entry`, if given)."""
+    if entry is None:
+        return bool(active())
+    return entry in _entries(active())
 
 
-def route_to_v2(call: Mapping, entry: str = "api"):
-    """The active path at `entry` that claims this call, or None for the legacy code."""
+_ROUTES = call_cache.Store()
+
+
+def route_to_v2(call: dict, entry: str = "api"):
+    """The active path at `entry` that claims this call, or None for the legacy code.
+
+    Cached per call signature (`call_cache`), which it leaves in `call` for the path's
+    `run`."""
+    if entry not in _entries(active()):
+        return None
+    mode = call_cache.mode()
+    key = None if mode == call_cache.OFF else call_cache.signature(call, entry)
+    cached = _ROUTES.get(key)
+    if cached is call_cache.MISS:
+        cached = call_cache.Entry(_route(call, entry))
+        _ROUTES.put(key, cached)
+    elif mode == call_cache.CHECK:
+        call_cache.check(key, "route", cached.path, _route(call, entry))
+    call[call_cache.SIGNATURE] = (mode, key, None if key is None else cached)
+    return cached.path
+
+
+def _entries(selected) -> frozenset:
+    if selected is _active and _active_entries is not None:
+        return _active_entries
+    return frozenset(p.entry for p in selected)
+
+
+def _route(call, entry):
     by_default = envs.moev2_selection() == "default"
     for path in active():
         if path.entry != entry or not path.claims(call):
@@ -342,9 +375,11 @@ def _explain_unclaimed(call, entry, by_default=False):
 
 
 def reload():
-    global _active, _generation, _announced
+    global _active, _active_entries, _generation, _announced
     with _lock:
         _active = None
+        _active_entries = None
         _generation += 1
         _announced = None
         _explained.clear()
+        call_cache.clear()

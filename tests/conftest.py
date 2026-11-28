@@ -23,9 +23,14 @@ red -- which is the property worth protecting.
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import sys
 import types
+
+# Every aiter.moev2 call cache hit is also decided afresh, and a difference raises
+# (aiter/moev2/dispatch/call_cache.py).
+os.environ.setdefault("AITER_MOEV2_CALL_CACHE", "check")
 
 _PLUGIN = (
     pathlib.Path(__file__).resolve().parents[1] / "aiter" / "plugin" / "__init__.py"
