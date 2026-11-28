@@ -282,6 +282,7 @@ class LocalDispatch:
         self.resolve = tuned.cached(maxsize=2048)(self._resolve)
         self.relookup = tuned.cached(maxsize=2048)(self._relookup)
         self.dispatch = tuned.cached(maxsize=2048)(self._dispatch)
+        self.mxfp4_fallbacks = tuned.cached(maxsize=2048)(self._mxfp4_fallbacks)
 
     def _peek(self, problem):
         """The resolution, with nothing emitted; None where resolving raises."""
@@ -368,9 +369,7 @@ class LocalDispatch:
             return paths.DECLINED
         fallbacks = ()
         if preview.quant_type == QuantType.per_1x32:
-            fallbacks = self._mxfp4_fallbacks(
-                preview, args, kwargs, arch, cu_num, token
-            )
+            fallbacks = self.mxfp4_fallbacks(*where, preview.block_size_M)
             if fallbacks is None:
                 return paths.DECLINED
 
@@ -433,22 +432,24 @@ class LocalDispatch:
         if self.fhmoe and resolution.plan is not None:
             _validate_fhmoe_metadata_consistency(resolution.metadata)
 
-    def _mxfp4_fallbacks(self, preview, args, kwargs, arch, cu_num, token):
+    def _mxfp4_fallbacks(self, args, kwargs_items, arch, cu_num, token, block_size_M):
         """`_fused_moe_impl`'s second resolutions, in its order, as `(kwargs, warning)`
-        pairs: an MXMOE row whose block size the caller overrides, then a tuned
-        inline-sort row this call cannot run, are discarded and the key resolved again.
-        `warning(c)` gives the line to log for the prepared call, or "" where the row
-        runs after all; `run` calls it after the first lookup has logged, as legacy
-        checks then.
+        pairs: an MXMOE row whose block size the caller (`block_size_M`) overrides,
+        then a tuned inline-sort row this call cannot run, are discarded and the key
+        resolved again. `warning(c)` gives the line to log for the prepared call, or ""
+        where the row runs after all; `run` calls it after the first lookup has logged,
+        as legacy checks then.
 
         None where v2 declines a key resolved again; decided before anything is logged.
+        `run` reads it through the `mxfp4_fallbacks` cache, so it must depend on its
+        arguments alone.
         """
+        kwargs = dict(kwargs_items)
         fallbacks = []
         first = self._peek_key(args, kwargs, arch, cu_num, token)
         if first is None or first is paths.DECLINED:
-            return fallbacks
+            return ()
         metadata = first.metadata
-        block_size_M = preview.block_size_M
         if (
             getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
             and not _is_mxfp4_inline_sort(metadata)
@@ -470,10 +471,10 @@ class LocalDispatch:
             fallbacks.append((fallback_kwargs, lambda c: message))
             # `run` raises where resolving raises or the block size still differs.
             if first is None or int(block_size_M) != int(first.metadata.block_m):
-                return fallbacks
+                return tuple(fallbacks)
             metadata = first.metadata
         if not _is_mxfp4_inline_sort(metadata):
-            return fallbacks
+            return tuple(fallbacks)
         fallback_kwargs = {**kwargs, "_disable_inline_sort": True}
         # Declined even if the row could run: the check probes a JIT module, which
         # legacy loads only after the first lookup has logged.
@@ -508,7 +509,7 @@ class LocalDispatch:
             )
 
         fallbacks.append((fallback_kwargs, inline_sort_warning))
-        return fallbacks
+        return tuple(fallbacks)
 
     def _peek_key(self, args, kwargs, arch, cu_num, token):
         """A key's first resolution, with nothing emitted: DECLINED where `dispatch`

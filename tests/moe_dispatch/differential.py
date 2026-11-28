@@ -522,45 +522,130 @@ def _float_gap(x, y, noise, z=None):
     )
 
 
-def _sorted_scale_defined(sorted_ids, token_num, groups, padded_groups):
+def _sorted_scale_defined(rows, groups, padded_groups, native=False):
     """Flat indices of the bytes the sorted MX quant kernels write in their swizzled
-    e8m0 scale (`mx_scale_shuffle_idx` in csrc/include/mx_quant_utils.h): the rows of
-    routed tokens (not block padding), the `groups` columns (not the pad to 8)."""
+    e8m0 scale (`mx_scale_shuffle_idx` in csrc/include/mx_quant_utils.h): the sorted
+    positions `rows` (routed rows, not block padding, in the order given), the `groups`
+    columns (not the pad to 8). `native`: the FlyDSL a4w4 stage 1 `native_scale_layout`
+    (`store_scales` in aiter/ops/flydsl/kernels/mxfp4_gemm1.py), one chunk per 16 rows
+    instead of 32, each scale written to both bytes of its 16-bit half."""
     import torch
 
-    rows = ((sorted_ids & 0xFFFFFF) < token_num).nonzero().flatten()
     x = rows[:, None]
     y = torch.arange(groups, device=rows.device)[None, :]
+    chunk = 16 if native else 32
     idx = (
-        (x // 32 * padded_groups) * 32
+        (x // chunk * padded_groups) * 32
         + (y // 8) * 256
         + (y % 4) * 64
         + (x % 16) * 4
         + (y % 8) // 4 * 2
-        + (x % 32) // 16
     )
-    return idx.flatten()
+    if native:
+        return torch.stack([idx, idx + 1], -1).flatten()
+    return (idx + (x % 32) // 16).flatten()
+
+
+def _sort_view(stage1, at, block_m, token_num):
+    """One run's sort, read so that sorted-order buffers compare without depending on
+    the order of the rows inside an expert.
+
+    A sort lays out one segment per expert, in expert order, each padded to `block_m`
+    rows; the expert's routed rows fill the start of its segment and the rest is
+    padding. That layout (`sorted_expert_ids`, `num_valid_ids`, which positions are
+    padding, the expert at each position) is fixed by the routing and compared exactly.
+    The order of the routed rows inside a segment is not: the adaptive aux sort of
+    a4w4 / a8w4 claims positions with atomics, and two legacy runs order them
+    differently about half the time. So each run's routed rows are read in `order`, its
+    own positions sorted by the row's (token, slot) id (`token | slot << 24`, unique per
+    routed row): the same row of each run lines up, whatever position its sort gave it.
+    """
+    num_valid = int(stage1.args[at["num_valid"]][0])
+    ids = stage1.args[at["ids"]][:num_valid]
+    blocks = stage1.args[at["blocks"]][: num_valid // block_m]
+    routed = (ids & 0xFFFFFF) < token_num
+    positions = routed.nonzero().flatten()
+    return {
+        "num_valid": num_valid,
+        "ids": ids,
+        "routed": routed,
+        "order": positions[ids[positions].argsort()],
+        "padding": (~routed).nonzero().flatten(),
+        "experts": blocks.repeat_interleave(block_m)[:num_valid],
+    }
+
+
+def _unrepeatable_stage1(launch):
+    """Why legacy does not repeat this stage-1 launch on the same inputs, or None.
+
+    The kernels listed here give a different output from run to run (todo 5.128).
+    `compare_launches` then compares stage 1's integer output and the integer arguments
+    of the launches after it (bitwise otherwise; not the sort buffers or stage 1's
+    inputs) like the floating-point ones: within twice what legacy's two runs differ,
+    and at least one step. The final output is not relaxed (`_check_output`): a case
+    where legacy's output does not repeat still fails. A failure of such a case is
+    marked (`may_be_legacy_noise`) so the GPU differential may rerun it."""
+    from aiter import QuantType
+    from aiter.moev2.segments.asm import asm_stage1
+    from aiter.moev2.segments.flydsl import _flydsl_stage1_wrapper
+
+    if (
+        launch.func is asm_stage1
+        and launch.keywords.get("quant_type") != QuantType.per_1x128
+    ):
+        # gfx950, int8 per-tensor Gelu (32, 4096, 384, E128 top8), legacy alone: stage 1
+        # differs by up to 2.1 between clean runs (the int8 GEMM2 input by up to 29
+        # steps), and some runs write garbage (1e32..2e38) into a few values.
+        return "ASM stage 1 fmoe_stage1_bf16_pertoken{Int8,Fp8}_g1u1_*"
+    if launch.func is _flydsl_stage1_wrapper and str(
+        launch.keywords.get("kernelName", "")
+    ).startswith("flydsl_moe1_abf16_wint4"):
+        # gfx950, fp16 (40, 2048, 768, E128 top8), legacy alone: the output differs by
+        # up to 1.6 at a peak of 1.9 on every run; that case fails on the output.
+        return "FlyDSL stage 1 flydsl_moe1_abf16_wint4_*"
+    return None
+
+
+def _int_gap(x, y, noise):
+    """Why integer `x` (legacy) and `y` (v2) are not close, or None: within twice
+    `noise` (how far legacy's two runs differ on the same argument), at least 1."""
+    gap = (x.int() - y.int()).abs()
+    allowed = max(1, 2 * noise)
+    if bool((gap <= allowed).all()):
+        return None
+    return (
+        f"differ beyond twice legacy's own spread ({noise}, at least 1): "
+        f"{int((gap > allowed).sum())} of {gap.numel()} values, worst {gap.max().item()}"
+    )
 
 
 def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
     """`{(stage, argument): problem}` between two `kernel_bench_callable` recordings.
 
     Same stages, same functions, equal non-tensor arguments, and tensors over what the
-    kernels define: the sort buffers up to `num_valid_ids` (the rest is `torch.empty`),
-    MX scales in sorted order at the routed rows and the `K / 32` groups
-    (`_sorted_scale_defined`), other buffers in sorted order at the routed rows (stage 1
-    skips block padding), `[token, topk, inter]` buffers at the routed slots that are
-    local (stage 1 skips the others), and nothing for the output buffer, for the `out`
-    argument of a stage 1 that writes a buffer of its own (`_own_stage1_buffer`), nor
-    for the output of a split-K stage 1 (accumulated with atomics). The sort buffers, MX
-    scales, fp4 values and every integer tensor must be bitwise equal. Other
-    floating-point tensors (activations, intermediates and their scales) may differ by 1
-    ulp of their dtype, or by twice what the same argument differs between `legacy` and
-    `legacy2`, a second legacy run: some stage-1 kernels are not repeatable. `legacy2`
-    counts only where its sort buffers equal `legacy`'s (its arguments are read in
-    `legacy`'s sorted order). A non-finite value must equal one of legacy's runs. A
-    1-stage ASM launch writes the output to its `moe_buf`, and the FLAT one takes the
-    topk ids and weights unsorted, which are compared as inputs.
+    kernels define. Sorted order is compared independently of the order of the rows
+    inside an expert (`_sort_view`): the sort layout exactly (`sorted_expert_ids`,
+    `num_valid_ids`, the padding positions, the expert of each row), and every buffer in
+    sorted order row by row, each run's rows taken in (token, slot) order: the sort
+    buffers (`sorted_ids`, `sorted_weights`, `m_indices`: routed rows, then padding;
+    the rest past `num_valid_ids` is `torch.empty`), `reverse_sorted` as the id at each
+    position it gives, MX scales at the routed rows and the `K / 32` groups
+    (`_sorted_scale_defined`), and other sorted buffers at the routed rows (stage 1
+    skips block padding). `[token, topk, inter]` buffers are compared at the routed
+    slots that are local (stage 1 skips the others), the fp8 rows and fp32 scales of
+    the ASM 1x128 stage 1 buffer each in its own dtype (`_split_1x128_out`), and nothing
+    for the output buffer, for the `out` argument of a stage 1 that writes a buffer of
+    its own (`_own_stage1_buffer`), nor for the output of a split-K stage 1 (accumulated
+    with atomics). The sort buffers, MX scales, fp4 values and every integer tensor must
+    be bitwise equal, but for the integer tensors after a stage 1 legacy does not repeat
+    (`_unrepeatable_stage1`), compared like floating-point ones. Floating-point tensors
+    (activations, intermediates and their scales) may differ by 1 ulp of their dtype,
+    or by twice what the same argument differs between `legacy` and `legacy2`, a second
+    legacy run: some stage-1 kernels are not repeatable. `legacy2` counts only where its
+    sort layout equals `legacy`'s. A non-finite value must equal one of legacy's runs.
+    The caller's own tensors (weights and their scales) compare whole. A 1-stage ASM
+    launch writes the output to its `moe_buf`, and the FLAT one takes the topk ids and
+    weights unsorted, which are compared as inputs.
     """
     import torch
 
@@ -575,9 +660,19 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
     if legacy2 is not None and [n for n, _ in legacy2] != [n for n, _ in legacy]:
         legacy2 = None
     roles = {}
-    block_m = num_valid = sorted_ids = routed_rows = model_dim = inter_dim = None
+    block_m = num_valid = sorted_len = model_dim = inter_dim = relaxed = None
+    native = False
+    views = {}  # "legacy" / "v2" / "legacy2": `_sort_view` of that run
+    # The caller's tensors (weights and their scales, ...) compare whole, whatever
+    # their shape.
+    inputs = {
+        v.untyped_storage().data_ptr()
+        for v in call.values()
+        if isinstance(v, torch.Tensor) and v.numel()
+    }
     topk_ids, expert_mask = call["topk_ids"], call.get("expert_mask")
     skip = {out_legacy.data_ptr(), out_v2.data_ptr()}
+    problems = {}
     if "stage1" in dict(legacy):
         stage1 = dict(legacy)["stage1"]
         v2_stage1 = dict(v2)["stage1"]
@@ -598,28 +693,50 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
             at = {"ids": 3, "blocks": 4, "num_valid": 5}
         else:
             return {("stage1", ""): f"stage1: {stage1.func} is not a known launch"}
+        relaxed = _unrepeatable_stage1(stage1)
+        native = bool(stage1.keywords.get("native_scale_layout"))
         if at:
-            num_valid = int(stage1.args[at["num_valid"]][0])
             for role, i in at.items():
-                if role != "num_valid":
-                    role = "ids" if role == "weights" else role
-                    roles[stage1.args[i].data_ptr()] = role
-                    roles[v2_stage1.args[i].data_ptr()] = role
-            sorted_ids = stage1.args[at["ids"]]
-            routed_rows = (sorted_ids[:num_valid] & 0xFFFFFF) < topk_ids.shape[0]
+                role = "ids" if role == "weights" else role
+                roles[stage1.args[i].data_ptr()] = role
+                roles[v2_stage1.args[i].data_ptr()] = role
+            sorted_len = len(stage1.args[at["ids"]])
+            token_num = topk_ids.shape[0]
+            views["legacy"] = _sort_view(stage1, at, block_m, token_num)
+            views["v2"] = _sort_view(v2_stage1, at, block_m, token_num)
+            num_valid = views["legacy"]["num_valid"]
             if legacy2 is not None:
-                again = dict(legacy2)["stage1"].args
-                if int(again[at["num_valid"]][0]) != num_valid or not all(
-                    torch.equal(_bits(stage1.args[i][:n]), _bits(again[i][:n]))
-                    for role, i in at.items()
-                    if role != "num_valid"
-                    for n in [num_valid // block_m if role == "blocks" else num_valid]
-                ):
+                views["legacy2"] = _sort_view(
+                    dict(legacy2)["stage1"], at, block_m, token_num
+                )
+            # The layout must match exactly; only the order inside a segment may not.
+            for run in [r for r in ("v2", "legacy2") if r in views]:
+                mine, ref = views[run], views["legacy"]
+                same = (
+                    mine["num_valid"] == num_valid
+                    and torch.equal(mine["routed"], ref["routed"])
+                    and torch.equal(
+                        mine["experts"][mine["order"]], ref["experts"][ref["order"]]
+                    )
+                )
+                if same:
+                    continue
+                if run == "legacy2":
                     legacy2 = None
-        for _, launch in legacy + v2:
-            for name in ("sorted_weights", "m_indices"):
-                if launch.keywords.get(name) is not None:
-                    roles[launch.keywords[name].data_ptr()] = "ids"
+                    del views["legacy2"]
+                else:
+                    return {
+                        ("stage1", "sort"): (
+                            "stage1: sort layouts differ (num_valid_ids, padding "
+                            "positions or the expert of a (token, slot))"
+                        )
+                    }
+            for _, launch in legacy + v2 + (legacy2 or []):
+                for name in ("sorted_weights", "m_indices"):
+                    if launch.keywords.get(name) is not None:
+                        roles[launch.keywords[name].data_ptr()] = "ids"
+                if launch.keywords.get("reverse_sorted") is not None:
+                    roles[launch.keywords["reverse_sorted"].data_ptr()] = "reverse"
         model_dim = call["hidden_states"].shape[-1]
         _, _, inter_dim = get_inter_dim(call["w1"].shape, call["w2"].shape)
     slots = None if expert_mask is None else expert_mask[topk_ids.long()].bool()
@@ -637,34 +754,50 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
         finite = xf.isfinite() & zf.isfinite()
         return (xf - zf).abs()[finite].max().item() if finite.any() else 0.0
 
-    def defined(name, where, role, t):
-        """The part of argument `t` the kernels define, and whether it must be bitwise
-        equal."""
+    def defined(name, where, role, t, run):
+        """The part of argument `t` of `run` ("legacy", "v2" or "legacy2") the kernels
+        define, rows in sorted order taken in that run's `_sort_view` order, and whether
+        it must be bitwise equal."""
+        view = views.get(run)
         rows = t.shape[0] if t.dim() == 2 else 0
-        sorted_rows = sorted_ids is not None and rows >= len(sorted_ids)
+        sorted_rows = view is not None and rows >= sorted_len
         scale = t.element_size() == 1 and (
             t.dtype == dtypes.fp8_e8m0 or where in ("a1_scale", "a2_scale")
         )
         if role == "ids":
-            return t[:num_valid], True
+            # Routed rows by (token, slot), then the padding (same positions each run).
+            t = _bits(t[:num_valid])
+            return torch.cat([t[view["order"]], t[view["padding"]]]), True
         if role == "blocks":
             return t[: num_valid // block_m], True
+        if role == "num_valid":
+            return t, True
+        if role == "input":
+            return t, not t.is_floating_point() or t.dtype == dtypes.fp4x2
+        if role == "reverse":
+            # The sorted position of each (token, slot): compared as the id the run's
+            # own sort holds there, which does not depend on the order.
+            outside = torch.full_like(t, -1)
+            if not num_valid:
+                return outside, True
+            inside = (t >= 0) & (t < num_valid)
+            at_id = view["ids"][t.clamp(0, num_valid - 1).long()]
+            return torch.where(inside, at_id, outside), True
         if scale and sorted_rows and rows % 32 == 0:
             groups = (model_dim if name == "stage1" else inter_dim) // 32
             index = _sorted_scale_defined(
-                sorted_ids[:num_valid], topk_ids.shape[0], groups, -groups // 8 * -8
+                view["order"], groups, -groups // 8 * -8, native and name != "stage1"
             )
             return _bits(t).reshape(-1)[index], True
-        if sorted_rows and rows == len(sorted_ids):
-            t = _bits(t)[:num_valid][routed_rows].view(t.dtype)
+        if sorted_rows and rows == sorted_len:
+            t = _bits(t)[:num_valid][view["order"]].view(t.dtype)
         else:
             t = routed(t)
         return t, not t.is_floating_point() or t.dtype == dtypes.fp4x2
 
-    problems = {}
     seconds = [None] * len(legacy) if legacy2 is None else [l for _, l in legacy2]
-    for (name, a), (_, b), second in zip(legacy, v2, seconds):
-        second = {} if second is None else _expand(second)
+    for (name, a), (_, b), second_launch in zip(legacy, v2, seconds):
+        second = {} if second_launch is None else _expand(second_launch)
         if a.func != b.func:
             problems[name, ""] = f"{name}: {a.func} vs {b.func}"
             continue
@@ -675,6 +808,13 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
         pairs += [(k, a.keywords[k], b.keywords[k]) for k in a.keywords]
         if name == "stage1" and _own_stage1_buffer(a):
             pairs = [pair for pair in pairs if pair[0] != 6]
+        split = name == "stage1" and _split_1x128_out(a, topk_ids.shape[0])
+        if split:
+            other = dict(_split_1x128_out(b, topk_ids.shape[0]))
+            pairs = [pair for pair in pairs if pair[0] != 6]
+            pairs += [(where, x, other[where]) for where, x in split]
+            if second_launch is not None:
+                second.update(_split_1x128_out(second_launch, topk_ids.shape[0]))
         if name == "stage1" and (a.keywords.get("split_k") or 1) > 1:
             skip |= {a.args[6].data_ptr(), b.args[6].data_ptr()}
         expanded = []
@@ -709,27 +849,70 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2, legacy2=None):
                 )
                 continue
             role = roles.get(x.data_ptr())
-            dx, exact = defined(name, where, role, x)
-            dy, _ = defined(name, where, role, y)
+            if role is None and x.numel() and x.untyped_storage().data_ptr() in inputs:
+                role = "input"
+            dx, exact = defined(name, where, role, x, "legacy")
+            dy, _ = defined(name, where, role, y, "v2")
             if torch.equal(_bits(dx), _bits(dy)):
                 continue
             reason = "values differ"
-            if not exact:
+            # After a stage 1 legacy does not repeat, the integer tensors quantized
+            # from its output get the floating-point rule (`_unrepeatable_stage1`);
+            # stage 1's inputs are not its output.
+            loose_int = (
+                exact
+                and relaxed
+                and role is None
+                and (name != "stage1" or where == 6)
+                and dx.dtype == x.dtype
+                and not dx.is_floating_point()
+                and dx.dtype != dtypes.fp4x2
+            )
+            if not exact or loose_int:
                 z = second.get(where)
                 like_x = isinstance(z, torch.Tensor) and z.dtype == x.dtype
                 z = (
-                    defined(name, where, role, z)[0]
+                    defined(name, where, role, z, "legacy2")[0]
                     if like_x and z.shape == x.shape
                     else None
                 )
-                noise = 0.0 if z is None else spread(dx, z)
-                reason = _float_gap(dx, dy, noise, z)
+                if loose_int:
+                    noise = 0 if z is None else (dx.int() - z.int()).abs().max().item()
+                    reason = _int_gap(dx, dy, noise)
+                    if reason is not None:
+                        reason += f" (after {relaxed}, which legacy does not repeat)"
+                else:
+                    noise = 0.0 if z is None else spread(dx, z)
+                    reason = _float_gap(dx, dy, noise, z)
                 if reason is None:
                     continue
             problems[name, where] = (
                 f"{name}[{where}]: {x.dtype}{tuple(x.shape)} {reason}"
             )
     return problems
+
+
+def _split_1x128_out(launch, token_num):
+    """`[("6.rows", fp8 rows), ("6.scales", fp32 scales)]` of the `out` buffer of an ASM
+    1x128 stage 1, or None for another launch. That kernel writes its fp8 rows, then
+    their fp32 scales as raw bytes, into one buffer (`AsmStage1Blockscale.out_buffer`),
+    and the bytes after the scales are never written: each part is compared in its own
+    dtype, the way `split_out` hands them to stage 2."""
+    from aiter import QuantType
+    from aiter.moev2.segments.asm import AsmStage1Blockscale, asm_stage1
+
+    out = launch.args[6] if len(launch.args) > 6 else None
+    if (
+        launch.func is not asm_stage1
+        or launch.keywords.get("quant_type") != QuantType.per_1x128
+        or out is None
+    ):
+        return None
+    _, topk, inter_dim = out.shape
+    rows, scales = AsmStage1Blockscale.split_out(
+        out, launch.args[0], launch.keywords["a1_scale"], token_num, topk, inter_dim
+    )
+    return [("6.rows", rows), ("6.scales", scales)]
 
 
 def _own_stage1_buffer(launch) -> bool:
@@ -762,6 +945,21 @@ def _ulp(t):
     return 2.0 ** (int(torch.tensor(peak).log2().floor()) - mantissa)
 
 
+def entry_call(path, call):
+    """`call` (legacy fused_moe arguments by name) as the mapping `path.claims` reads.
+    The legacy hooks pass every parameter, defaults included."""
+    import inspect
+
+    import aiter.fused_moe as fm
+    from aiter.moev2 import api
+
+    bound = inspect.signature(fm.fused_moe).bind(**call)
+    bound.apply_defaults()
+    return {"api": dict, "op": api.op_call, "fhmoe": api.fhmoe_call}[path.entry](
+        bound.arguments
+    )
+
+
 def run_differential(path_name, call, *, bitwise=False):
     """Run `call` (legacy fused_moe arguments by name) on legacy and on `path_name`.
 
@@ -773,24 +971,14 @@ def run_differential(path_name, call, *, bitwise=False):
     stage 1 is not deterministic), which fails above `_NOISE_ULPS` ulps of the peak.
     """
     import dataclasses
-    import inspect
 
     import torch
 
     import aiter.fused_moe as fm
-    from aiter.moev2 import api, paths
+    from aiter.moev2 import paths
 
     path = paths.registered()[path_name]
-    bound = inspect.signature(fm.fused_moe).bind(**call)
-    bound.apply_defaults()
-    # The legacy hooks pass every parameter, defaults included; check the same mapping.
-    entry_call = {
-        "api": dict,
-        "op": api.op_call,
-        "fhmoe": api.fhmoe_call,
-    }[
-        path.entry
-    ](bound.arguments)
+    entry = entry_call(path, call)
 
     def launch(mode):
         bench, previous = [], fm.kernel_bench_callable
@@ -823,7 +1011,7 @@ def run_differential(path_name, call, *, bitwise=False):
     paths._REGISTRY[path_name] = dataclasses.replace(path, run=run)
     try:
         with moev2_mode(path_name):
-            routed = paths.route_to_v2(entry_call, path.entry)
+            routed = paths.route_to_v2(entry, path.entry)
             if routed is None or routed.name != path_name:
                 raise AssertionError(f"path {path_name} does not claim this call")
         out_raw, v2_launches = launch(path_name)
@@ -833,20 +1021,39 @@ def run_differential(path_name, call, *, bitwise=False):
         paths.reload()
     if len(results) != 1 or results[0] is paths.DECLINED:
         raise AssertionError(f"path {path_name} did not run this call: {results}")
-    problems = compare_launches(
-        legacy_launches, v2_launches, call, ref_raw, out_raw, legacy2_launches
-    )
-    if problems:
-        raise AssertionError(
-            f"{path_name}: launches differ: " + "; ".join(list(problems.values())[:6])
+    stage1 = dict(legacy_launches).get("stage1")
+    unrepeatable = stage1 is not None and _unrepeatable_stage1(stage1)
+    try:
+        problems = compare_launches(
+            legacy_launches, v2_launches, call, ref_raw, out_raw, legacy2_launches
         )
-    if bitwise:
-        assert torch.equal(
-            _bits(ref), _bits(out)
-        ), f"{path_name}: output differs from legacy"
-        return ref, out
-    _check_output(path_name, ref, ref2, out)
+        if problems:
+            raise AssertionError(
+                f"{path_name}: launches differ: "
+                + "; ".join(list(problems.values())[:6])
+            )
+        if bitwise:
+            assert ref.dtype == out.dtype and torch.equal(
+                _bits(ref), _bits(out)
+            ), f"{path_name}: output differs from legacy"
+        else:
+            _check_output(path_name, ref, ref2, out)
+    except Exception as exc:
+        if not unrepeatable or isinstance(exc, torch.OutOfMemoryError):
+            raise
+        raise AssertionError(
+            f"{type(exc).__name__}: {exc} {_LEGACY_NOISE}{unrepeatable}]"
+        ) from exc
     return ref, out
+
+
+_LEGACY_NOISE = "[legacy does not repeat "
+
+
+def may_be_legacy_noise(problem):
+    """Whether a failure may come from legacy not repeating itself: its stage 1 is in
+    `_unrepeatable_stage1`, or its two runs already differ too much."""
+    return _LEGACY_NOISE in problem or "legacy output not repeatable" in problem
 
 
 def _same_non_finite(a, b):
@@ -873,8 +1080,9 @@ def _check_output(path_name, ref, ref2, out):
     noise = gap(ref2) if _same_non_finite(ref, ref2) else float("inf")
     ulp = _ulp(ref)
     assert noise <= _NOISE_ULPS * ulp, (
-        f"{path_name}: legacy output not repeatable (noise {noise}, "
-        f"{_NOISE_ULPS} ulps of the peak {_NOISE_ULPS * ulp})"
+        f"{path_name}: legacy output not repeatable: two legacy runs differ by {noise}, "
+        f"above {_NOISE_ULPS} ulps of the peak ({_NOISE_ULPS * ulp}); a legacy problem, "
+        "v2 cannot be validated on this case"
     )
     assert _same_non_finite(
         ref, out

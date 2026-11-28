@@ -11,19 +11,36 @@ accepts (`_VARIANTS`: all of them for a8w8_pt, `_GENERIC_VARIANTS` for the fp8 p
 blockscale and `per_1x32` paths). Where legacy raises, v2 must raise the same error,
 either running the call or declining it to legacy (the outcome is printed); for the
 variants in `_RAISES` both must raise the listed error, and v2 must run the call. These
-cases (`RAIS`) are counted at the end, with the ones that follow a failed JIT build.
+cases (`RAIS`) are counted at the end. A JIT build that fails is a problem unless its
+module is in `_KNOWN_BUILD_FAILS` (legacy modules that never build).
+
+Kernels legacy does not repeat are listed in `differential._unrepeatable_stage1`: the
+integer tensors quantized from their output are compared within legacy's own spread
+instead of bitwise. A sort that orders the rows inside an expert differently on each run
+is compared independently of that order (`differential._sort_view`). A case failing on
+legacy noise (`differential.may_be_legacy_noise`: such a stage 1, or two legacy runs
+too far apart) runs up to `_RERUNS` more times: some of those kernels also write a few
+garbage values now and then (ASM stage 1, todo 5.128), and v2 runs the same kernels. A
+case that passes on a rerun is printed as `FLKY` and listed at the end as a warning
+with its first failure; it fails the run only if every run fails. Other failures are
+not rerun: a v2 race must not pass on a lucky run. A case where two legacy runs always
+differ beyond `differential._NOISE_ULPS` fails ("legacy output not repeatable"): v2
+cannot be validated there.
 
     python tests/moe_dispatch/gpu_differential.py --path a8w8_pt
     python tests/moe_dispatch/gpu_differential.py --path a16w16 --synth-table
 
 Shipped tables have per-tensor rows for gfx942 only (and bf16 rows for gfx942 and a few
 gfx950 shapes). `--synth-table` adds the path's gfx942 CK rows, copied to the running
-arch, to the arch's own rows in a temporary AITER_CONFIG_FMOE, so the tuned CK branch runs
-on a gfx950 too. ASM and FlyDSL rows are not copied: their gfx942 configs give garbage on
-gfx950 (legacy and v2 alike). For a8w8_blockscale, whose shipped ASM stage-1 rows are
-gfx942 only, the arch's own CK rows are also added with stage 1 swapped for the arch's
-ASM kernel of the same tile M (when it ships one), so that branch runs too; for a8w8_pt,
-the gfx942 int8 rows whose ASM kernel the arch ships are copied as well.
+arch, to the arch's own rows in a temporary AITER_CONFIG_FMOE, so the tuned CK branch
+runs on a gfx950 too. ASM and FlyDSL rows are not copied: their gfx942 configs give
+garbage on gfx950 (legacy and v2 alike). For a8w8_blockscale, whose shipped ASM stage-1
+rows are gfx942 only, the arch's own CK rows are also added with stage 1 swapped for the
+arch's ASM kernel of the same tile M (when it ships one), so that branch runs too, but
+not on gfx950, where legacy's ASM 1x128 stage 1 does not repeat itself (todo 5.128); for
+a8w8_pt, the gfx942 int8 rows whose ASM kernel the arch ships are copied as well. Copied
+rows the path does not claim (a format it does not take yet, e.g. per-token Swiglu
+before step 5.1l) are dropped, and listed, before the cases are counted.
 
 A case that does not fit in the free GPU memory is reported as skipped and fails the run
 (it was not compared).
@@ -301,6 +318,9 @@ _A16WI4 = (
     *((300, 2048, 768, 128, 8, "Silu", False, "bf16", False, "wi4", {"variant": v})
       for v in _GENERIC_VARIANTS),
     *((m, 2048, 768, 128, 8, "Situv2", False, "bf16", False, "wi4") for m in (64,)),
+    # Fails on purpose: legacy's FlyDSL wint4 stages give a different output on every
+    # run of this case (gfx950: up to 1.6 at a peak of 1.9), so v2 cannot be validated
+    # on it ("legacy output not repeatable", todo 5.128). Kept to show the legacy bug.
     *((m, 2048, 768, 128, 8, "Silu", False, "fp16", False, "wi4") for m in (40,)),
     *((m, 2048, 768, 128, 8, "Silu", False, "bf16", True, "wi4") for m in (64,)),
     *((m, 2048, 768, 128, 8, "Silu", False, "bf16", False, "wi4", _BIAS) for m in (64,)),
@@ -693,6 +713,14 @@ _RAISES = {
     "num_local_tokens": "num_rows is not supported for per_tensor_quant_hip",
     "num_local_tokens_fp8_input": "num_rows is not supported for per_tensor_quant_hip",
 }
+# Legacy modules that never build: CK 2-stage MX fp8 x fp8/fp4 per_1x32 (todo 5.20) and
+# 1x128 Swiglu (5.62). A case that raises after any other failed build is a problem: a
+# broken toolchain would otherwise make both sides raise the same error and pass every
+# case.
+_KNOWN_BUILD_FAILS = re.compile(
+    r"module_moe_ck2stages_(abi\d+_)?f8_(f8|fp4x2)_preshuffle_on_b16_"
+    r"(\w+_per_1x32|swiglu_per_1x128)_"
+)
 
 
 _FHMOE_WEIGHTS = {}
@@ -813,6 +841,12 @@ def _asm_blockscale_rows(df, gfx, cu_num):
     tile M: shipped ASM rows for this format exist for gfx942 only."""
     import pandas as pd
 
+    if gfx == "gfx950":
+        # Not on gfx950: there legacy's ASM 1x128 stage 1 does not repeat itself (fp8
+        # rows and scales differ on every run, the output by up to ~0.2 at a peak of
+        # 1.4), so no case could validate v2 on it, and no shipped gfx950 row or default
+        # plan runs it (todo 5.128).
+        return df.iloc[:0]
     listing = (
         _REPO / "hsa" / gfx / "fmoe_2stages"
         / "fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1.csv"
@@ -952,6 +986,21 @@ def _v2_outcome(path_name, call):
 # Cases where legacy and v2 raised the same error: only the errors were compared.
 _BOTH_RAISE = []
 
+# More runs of a failing case before it counts as failed (see the module docstring).
+_RERUNS = 2
+
+
+def _why_not(path_name, case):
+    """Why `path_name` does not claim `case`, or None if it does."""
+    from aiter.moev2 import paths
+    from moe_dispatch.differential import entry_call
+
+    path = paths.registered()[path_name]
+    call = entry_call(path, _make_call(path_name, case))
+    if path.claims(call):
+        return None
+    return (path.why_not(call) if path.why_not else None) or "not claimed"
+
 
 def run_case(path_name, case):
     """Return a problem string, or None when legacy and v2 agree."""
@@ -1006,10 +1055,15 @@ def _run_case(path_name, case):
         allowed = ("raised",) if expected is not None else ("raised", "declined")
         if outcome not in allowed:
             return f"{case}: both raise {legacy_error}, but v2 {outcome}"
-        build_failed = any(
-            "failed jit build" in msg for _, msg in legacy_logs + v2_logs
-        )
-        _BOTH_RAISE.append((case, build_failed))
+        builds = {
+            m.group(1)
+            for _, msg in legacy_logs + v2_logs
+            if (m := re.search(r"failed jit build \[(\w+)\]", msg))
+        }
+        unknown = sorted(b for b in builds if not _KNOWN_BUILD_FAILS.match(b))
+        if unknown:
+            return f"{case}: both raise after a failed JIT build of {unknown}"
+        _BOTH_RAISE.append((case, bool(builds)))
         print(f"     both raise (v2 {outcome}): {legacy_error[:160]}")
         return None
     try:
@@ -1027,41 +1081,72 @@ def _child(args):
     import torch
 
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+    from moe_dispatch.differential import may_be_legacy_noise
 
-    synth_cases = json.loads(os.environ.get("_MOEV2_SYNTH_CASES", "[]"))
+    synth_cases = [
+        tuple(c) for c in json.loads(os.environ.get("_MOEV2_SYNTH_CASES", "[]"))
+    ]
     gfx, cu_num = get_gfx_runtime(), get_cu_num()
-    todo = cases(args.path, [tuple(c) for c in synth_cases], gfx=gfx, cu_num=cu_num)
+    unclaimed = {case: _why_not(args.path, case) for case in synth_cases}
+    unclaimed = {case: why for case, why in unclaimed.items() if why}
+    if unclaimed:
+        print(f"dropped {len(unclaimed)} synthesized cases {args.path} does not claim:")
+        for case, why in unclaimed.items():
+            print(f"  {case}: {why}")
+    synth_cases = [case for case in synth_cases if case not in unclaimed]
+    todo = cases(args.path, synth_cases, gfx=gfx, cu_num=cu_num)
     print(f"{gfx} cu{cu_num} torch {torch.__version__}: {len(todo)} cases")
-    problems, skipped = [], []
+    problems, skipped, flaky = [], [], []
     for case in todo:
+        failures, oom = [], False
         try:
             problem = run_case(args.path, case)
+            while problem and may_be_legacy_noise(problem) and len(failures) < _RERUNS:
+                failures.append(problem)
+                torch.cuda.empty_cache()
+                problem = run_case(args.path, case)
         except torch.OutOfMemoryError:
-            # The GPU may be shared; a case that does not fit is reported, not compared.
-            problem = None
-            skipped.append(case)
+            if failures:
+                problem = failures.pop()
+            else:
+                # The GPU may be shared; a case that does not fit is reported, not
+                # compared.
+                problem, oom = None, True
+                skipped.append(case)
         torch.cuda.empty_cache()
+        if failures and not problem and not oom:
+            flaky.append((case, len(failures), failures[0]))
         raised = bool(_BOTH_RAISE) and _BOTH_RAISE[-1][0] is case
         status = (
             "SKIP"
-            if skipped and skipped[-1] is case
-            else "FAIL" if problem else "RAIS" if raised else "ok  "
+            if oom
+            else (
+                "FAIL"
+                if problem
+                else "FLKY" if failures else "RAIS" if raised else "ok  "
+            )
         )
         print(f"{status} {case}", flush=True)
         if problem:
-            problems.append(problem)
+            problems.append(f"{problem} (failed all {len(failures) + 1} runs)")
     for line in problems:
         print("  " + line)
     if skipped:
         print(f"{len(skipped)} cases not compared (out of GPU memory): rerun them")
+    if flaky:
+        print(
+            f"WARNING: {len(flaky)} cases failed, then passed on a rerun (legacy kernels "
+            "that are not repeatable, todo 5.128; v2 runs the same kernels):"
+        )
+        for case, n, first in flaky:
+            print(f"  {case}: {n} failed run(s), the first: {first}")
     if _BOTH_RAISE:
         builds = [case for case, build_failed in _BOTH_RAISE if build_failed]
         print(
             f"{len(_BOTH_RAISE)} of {len(todo)} cases raise the same error on both "
-            f"(errors compared, outputs not), {len(builds)} after a failed JIT build"
+            f"(errors compared, outputs not), {len(builds)} after a known failed JIT "
+            "build (_KNOWN_BUILD_FAILS)"
         )
-        for case in builds:
-            print(f"  WARNING: a JIT module failed to build for {case}")
     print(f"{len(problems)} problems")
     return 1 if problems or skipped else 0
 

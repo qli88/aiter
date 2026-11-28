@@ -2525,7 +2525,9 @@ def test_a4w4_mxmoe_block_override_resolves_again_without_mxmoe(monkeypatch):
 
     def fallbacks(block_size_M):
         call = _FallbackCall(block_size_M)
-        got = a4w4.LOCAL._mxfp4_fallbacks(call, (), kwargs, "gfx950", 256, 32)
+        got = a4w4.LOCAL._mxfp4_fallbacks(
+            (), tuple(kwargs.items()), "gfx950", 256, 32, block_size_M
+        )
         return [(k, w(call)) for k, w in got]
 
     # The fallback key's row goes on to the inline-sort check only where its block
@@ -2540,7 +2542,7 @@ def test_a4w4_mxmoe_block_override_resolves_again_without_mxmoe(monkeypatch):
         assert fallbacks(block_size_M) == []
     # A fallback key v2 declines sends the call back before anything is logged.
     _stub_peeks(monkeypatch, local, {None: 128, "_exclude_mxmoe": paths.DECLINED})
-    got = a4w4.LOCAL._mxfp4_fallbacks(_FallbackCall(32), (), kwargs, "gfx950", 256, 32)
+    got = a4w4.LOCAL._mxfp4_fallbacks((), tuple(kwargs.items()), "gfx950", 256, 32, 32)
     assert got is None
 
 
@@ -2556,10 +2558,10 @@ def test_a4w4_inline_sort_fallback_resolves_again_without_inline_sort(monkeypatc
 
     monkeypatch.setattr(local, "_is_mxfp4_inline_sort", lambda metadata: True)
     monkeypatch.setattr(local, "_mxfp4_inline_sort_unsupported", unsupported)
-    kwargs = {"_disable_inline_sort": False}
+    key = ((), (("_disable_inline_sort", False),), "gfx950", 256, 32, None)
     fallbacks = a4w4.LOCAL._mxfp4_fallbacks
     _stub_peeks(monkeypatch, local, {None: 16, "_disable_inline_sort": 32})
-    got = fallbacks(_FallbackCall(), (), kwargs, "gfx950", 256, 32)
+    got = fallbacks(*key)
     # The check (a JIT probe) waits for `run`, after the first lookup has logged.
     assert [k for k, _ in got] == [{"_disable_inline_sort": True}] and reasons == []
     reason = "x"
@@ -2570,7 +2572,7 @@ def test_a4w4_inline_sort_fallback_resolves_again_without_inline_sort(monkeypatc
     assert got[0][1](_FallbackCall()) == "" and reasons == [16, 16]
     # A fallback key v2 declines sends the call back, whether or not the row runs.
     _stub_peeks(monkeypatch, local, {None: 16, "_disable_inline_sort": paths.DECLINED})
-    assert fallbacks(_FallbackCall(), (), kwargs, "gfx950", 256, 32) is None
+    assert fallbacks(*key) is None
     assert reasons == [16, 16]
 
 
@@ -2600,9 +2602,9 @@ def test_a4w4_run_warns_then_dispatches_the_fallback_key(monkeypatch, caplog):
         ({**key, "_exclude_mxmoe": True}, lambda call: warning),
     ]
     monkeypatch.setattr(
-        local.LocalDispatch,
-        "_mxfp4_fallbacks",
-        lambda self, call, *a: checked.append(call) or fallbacks,
+        a4w4.LOCAL,
+        "mxfp4_fallbacks",
+        lambda *key: checked.append(key[-1]) or fallbacks,
     )
 
     def dispatch(args, kwargs, arch, cu_num, token, emit=True):
@@ -2628,8 +2630,9 @@ def test_a4w4_run_warns_then_dispatches_the_fallback_key(monkeypatch, caplog):
         "No fallback backend supports block_size_M=32; resolved backend requires "
         "block_m=64"
     )
-    # The fallbacks are decided on the preview; the warnings read the prepared call.
-    assert checked[0] is preview and checked[1] is c and prepares == [False, True]
+    # The fallbacks are decided on the preview's block size; the warnings read the
+    # prepared call.
+    assert checked[0] == 32 and checked[1] is c and prepares == [False, True]
     # Only the MXMOE fallback checks the block size, not the inline-sort one.
     caplog.clear()
     inline = (
@@ -2650,7 +2653,7 @@ def test_a4w4_run_warns_then_dispatches_the_fallback_key(monkeypatch, caplog):
     # prologue prepares the call.
     caplog.clear()
     prepares.clear()
-    monkeypatch.setattr(local.LocalDispatch, "_mxfp4_fallbacks", lambda self, *a: None)
+    monkeypatch.setattr(a4w4.LOCAL, "mxfp4_fallbacks", lambda *a: None)
     with caplog.at_level(logging.WARNING, logger="aiter"):
         assert a4w4.LOCAL.run({}) is paths.DECLINED
     assert caplog.messages == [] and prepares == [False]
@@ -2671,7 +2674,7 @@ def test_a4w4_mxmoe_fallback_key_resolves_without_the_row(monkeypatch):
     first = dispatch._peek_key((), {}, "gfx950", 256, 4096)
     assert first.plan.structure()[0][2] == "mxmoe.gemm1"
     assert first.metadata.block_m == 128
-    got = dispatch._mxfp4_fallbacks(_FallbackCall(32), (), {}, "gfx950", 256, 4096)
+    got = dispatch._mxfp4_fallbacks((), (), "gfx950", 256, 4096, 32)
     assert [k for k, _ in got] == [{"_exclude_mxmoe": True}]
     fallback = dispatch._peek_key((), got[0][0], "gfx950", 256, 4096)
     assert fallback.plan.structure()[0][2] == "flydsl.gemm1"
@@ -2681,10 +2684,31 @@ def test_a4w4_mxmoe_fallback_key_resolves_without_the_row(monkeypatch):
     dispatch = local.LocalDispatch(
         a4w4.SEGMENTS, lambda p: a4w4.LOCAL.takes(p) and not p.extras
     )
-    assert (
-        dispatch._mxfp4_fallbacks(_FallbackCall(32), (), {}, "gfx950", 256, 4096)
-        is None
+    assert dispatch._mxfp4_fallbacks((), (), "gfx950", 256, 4096, 32) is None
+
+
+def test_a4w4_fallbacks_are_resolved_once_per_key(monkeypatch):
+    from aiter.moev2.migration import a4w4, local
+
+    peeks = []
+    monkeypatch.setattr(local, "_is_mxfp4_inline_sort", lambda m: False)
+    _stub_peeks(monkeypatch, local, {None: 128, "_exclude_mxmoe": 32})
+    stub = local.LocalDispatch._peek_key
+    monkeypatch.setattr(
+        local.LocalDispatch,
+        "_peek_key",
+        lambda self, *a: peeks.append(a[1]) or stub(self, *a),
     )
+    dispatch = local.LocalDispatch(a4w4.SEGMENTS, a4w4.LOCAL.takes)
+    key = ((), (("_exclude_mxmoe", False),), "gfx950", 256, 32)
+    got = dispatch.mxfp4_fallbacks(*key, 32)
+    assert [k for k, _ in got] == [{"_exclude_mxmoe": True}] and len(peeks) == 2
+    assert dispatch.mxfp4_fallbacks(*key, 32) is got and len(peeks) == 2
+    assert dispatch.mxfp4_fallbacks(*key, 128) == () and len(peeks) == 3
+    tuned.clear_cache()
+    again = dispatch.mxfp4_fallbacks(*key, 32)
+    assert again is not got and [k for k, _ in again] == [k for k, _ in got]
+    assert len(peeks) == 5
 
 
 def test_the_relookup_ignores_disable_inline_sort(monkeypatch):

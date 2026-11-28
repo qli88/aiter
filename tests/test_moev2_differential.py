@@ -163,30 +163,42 @@ def test_launch_equal_nans_pass_and_legacy_noise_excuses_no_new_ones():
     ) == [("stage2", 0)]
 
 
-def _sorted_launches(inter, a1_scale):
-    """A 2-stage recording over 4 tokens x topk 2 in blocks of 4: 8 routed rows, then a
-    block of padding (token id 4)."""
+_SLOTS = [(k << 24) | t for t in range(4) for k in range(2)]
+
+
+def _sorted_launches(
+    inter,
+    a1_scale,
+    slots=_SLOTS,
+    func=_kernel,
+    a1=None,
+    out=None,
+    num_valid=(12,),
+    **stage1_kw,
+):
+    """A 2-stage recording over 4 tokens x topk 2 in blocks of 4: 8 routed rows of
+    expert 0 (in the order of `slots`), then a block of padding (token id 4)."""
     import torch
 
-    slots = [(k << 24) | t for t in range(4) for k in range(2)]
-    sorted_ids = torch.tensor(slots + [4] * 4, dtype=torch.int32)
+    sorted_ids = torch.tensor(list(slots) + [4] * 4, dtype=torch.int32)
     stage1 = partial(
-        _kernel,
-        torch.ones(4, 64, dtype=torch.bfloat16),
+        func,
+        torch.ones(4, 64, dtype=torch.bfloat16) if a1 is None else a1,
         None,
         None,
         sorted_ids,
         torch.zeros(3, dtype=torch.int32),
-        torch.tensor([12], dtype=torch.int32),
-        None,
+        torch.tensor(num_valid, dtype=torch.int32),
+        out,
         2,
         block_m=4,
         a1_scale=a1_scale,
+        **stage1_kw,
     )
     return [("stage1", stage1), ("stage2", partial(_kernel, inter, block_m=4))]
 
 
-def _compare_sorted(legacy, v2):
+def _compare_sorted(legacy, v2, legacy2=None, **inputs):
     import torch
     from moe_dispatch.differential import compare_launches
 
@@ -196,9 +208,167 @@ def _compare_sorted(legacy, v2):
         "hidden_states": torch.empty(4, 64),
         "w1": torch.empty(2, 64, 64),
         "w2": torch.empty(2, 64, 32),
+        **inputs,
     }
     out = torch.empty(1)
-    return compare_launches(legacy, v2, call, out, out)
+    return compare_launches(legacy, v2, call, out, out, legacy2)
+
+
+def test_sorted_rows_compare_in_any_order_inside_an_expert():
+    import torch
+
+    from aiter import dtypes
+
+    scale = torch.zeros(32, 8, dtype=torch.uint8).view(dtypes.fp8_e8m0)
+    raw = torch.randint(0, 256, (12, 16), dtype=torch.uint8)
+    inter = raw.view(dtypes.fp4x2)
+    # v2's sort put rows 0 and 5 of the expert the other way round, and stage 1 wrote
+    # its sorted rows in that order: the same rows, so no difference.
+    order = [5, 1, 2, 3, 4, 0, 6, 7]
+    swapped = [_SLOTS[i] for i in order]
+    moved = raw.clone()
+    moved[:8] = raw[order]
+    moved = moved.view(dtypes.fp4x2)
+    legacy = _sorted_launches(inter, scale)
+    assert not _compare_sorted(legacy, _sorted_launches(moved, scale, swapped))
+    # The same sort, but the rows written in legacy's order: row 0 and 5 differ.
+    problems = _compare_sorted(legacy, _sorted_launches(inter, scale, swapped))
+    assert list(problems) == [("stage2", 0)], problems
+
+
+def test_caller_weight_scales_compare_whole_whatever_the_sort_order():
+    import torch
+
+    from aiter import dtypes
+
+    scale = torch.zeros(32, 8, dtype=torch.uint8).view(dtypes.fp8_e8m0)
+    inter = torch.zeros(12, 16, dtype=torch.bfloat16)
+    # As many rows as a sorted MX scale, but the caller's: not read in sorted order.
+    w1_scale = torch.randint(0, 256, (32, 8), dtype=torch.uint8).view(dtypes.fp8_e8m0)
+    swapped = [_SLOTS[i] for i in [5, 1, 2, 3, 4, 0, 6, 7]]
+    legacy = _sorted_launches(inter, scale, w1_scale=w1_scale)
+    v2 = _sorted_launches(inter, scale, swapped, w1_scale=w1_scale)
+    assert not _compare_sorted(legacy, v2, w1_scale=w1_scale)
+
+
+def test_sort_layout_differences_are_still_reported():
+    import torch
+
+    from aiter import dtypes
+
+    scale = torch.zeros(32, 8, dtype=torch.uint8).view(dtypes.fp8_e8m0)
+    inter = torch.zeros(12, 16, dtype=torch.bfloat16)
+    # A routed row at a padding position: the layout differs, whatever the order.
+    shifted = list(_SLOTS[:7]) + [4]
+    legacy = _sorted_launches(inter, scale)
+    v2 = _sorted_launches(inter, scale, shifted)
+    v2[0][1].args[3][8] = _SLOTS[7]
+    assert list(_compare_sorted(legacy, v2)) == [("stage1", "sort")]
+
+
+def _int8_runs(stage1_func):
+    """`run(n)`: a recording whose stage 2 reads an int8 tensor of zeros but one value
+    `n`, after a stage 1 launched as `stage1_func`."""
+    import torch
+
+    from aiter import QuantType
+
+    def run(n):
+        a2 = torch.zeros(4, 2, 8, dtype=torch.int8)
+        a2[1, 0, 3] = n
+        stage1 = _sorted_launches(
+            None, None, func=stage1_func, quant_type=QuantType.per_Token
+        )[0]
+        return [stage1, ("stage2", partial(_kernel, a2, block_m=4))]
+
+    return run
+
+
+def test_integers_after_an_unrepeatable_stage1_follow_legacy_spread():
+    from aiter.moev2.segments.asm import asm_stage1
+
+    run = _int8_runs(asm_stage1)
+    # Legacy's two runs 3 apart: v2 may be up to 6 off.
+    assert not _compare_sorted(run(0), run(6), run(3))
+    assert list(_compare_sorted(run(0), run(7), run(3))) == [("stage2", 0)]
+    # Legacy repeats itself on this case: one step.
+    assert not _compare_sorted(run(0), run(1), run(0))
+    assert list(_compare_sorted(run(0), run(2), run(0))) == [("stage2", 0)]
+
+
+def test_integers_after_other_stage1_kernels_stay_bitwise_equal():
+    run = _int8_runs(_kernel)
+    assert list(_compare_sorted(run(0), run(1), run(1))) == [("stage2", 0)]
+
+
+def test_unrepeatable_stage1_inputs_and_num_valid_ids_stay_bitwise_equal():
+    import torch
+
+    from aiter import QuantType
+    from aiter.moev2.segments.asm import asm_stage1
+
+    def run(a1_value, num_valid=(12, 4)):
+        a1 = torch.zeros(4, 64, dtype=torch.int8)
+        a1[0, 0] = a1_value
+        return _sorted_launches(
+            None,
+            None,
+            func=asm_stage1,
+            a1=a1,
+            num_valid=num_valid,
+            quant_type=QuantType.per_Token,
+        )[:1]
+
+    # The int8 activations stage 1 reads are its input, not its output.
+    assert list(_compare_sorted(run(0), run(1), run(0))) == [("stage1", 0)]
+    # num_valid_ids is compared whole (the sort layout reads only its first value).
+    problems = _compare_sorted(run(0), run(0, (12, 5)), run(0))
+    assert list(problems) == [("stage1", 5)], problems
+
+
+def test_only_failures_of_unrepeatable_legacy_cases_may_be_rerun():
+    from moe_dispatch.differential import _LEGACY_NOISE, may_be_legacy_noise
+
+    assert may_be_legacy_noise(f"a8w8_pt: values differ {_LEGACY_NOISE}ASM stage 1]")
+    assert may_be_legacy_noise("a16wi4: legacy output not repeatable: ...")
+    assert not may_be_legacy_noise("a4w4: launches differ: stage1[3]: values differ")
+
+
+def test_asm_1x128_stage1_buffer_compares_rows_and_scales_in_their_own_dtypes():
+    import torch
+
+    from aiter import QuantType, dtypes
+    from aiter.moev2.segments.asm import asm_stage1
+
+    # 4 tokens x topk 2 x inter 128 fp8 rows, then 1 row holding 4 x 2 x 128 / 128 fp32
+    # scales (32 bytes) and 224 bytes nobody writes.
+    a1 = torch.zeros(4, 64, dtype=torch.uint8).view(dtypes.fp8)
+    a1_scale = torch.ones(4, 1, dtype=torch.float32)
+    rows = torch.randint(0, 100, (4, 2, 128), dtype=torch.uint8)
+    scales = torch.linspace(0.5, 2.0, 8, dtype=torch.float32)
+
+    def buffer(tail, scale_values=scales):
+        extra = torch.cat([scale_values.view(torch.uint8), tail]).view(1, 2, 128)
+        return torch.cat([rows, extra]).view(dtypes.fp8)
+
+    def run(out):
+        return _sorted_launches(
+            torch.zeros(1),
+            a1_scale,
+            func=asm_stage1,
+            a1=a1,
+            out=out,
+            quant_type=QuantType.per_1x128,
+        )
+
+    tail = torch.randint(0, 256, (224,), dtype=torch.uint8)
+    garbage = tail.clone()
+    garbage[:16] = 0x7F  # NaN as fp8, in bytes nobody writes
+    assert not _compare_sorted(run(buffer(tail)), run(buffer(garbage)))
+    far = scales.clone()
+    far[3] *= 1.5
+    problems = _compare_sorted(run(buffer(tail)), run(buffer(tail, far)))
+    assert list(problems) == [("stage1", "6.scales")], problems
 
 
 def test_sorted_fp4_rows_compare_bitwise_at_the_routed_rows_only():
@@ -234,10 +404,8 @@ def test_sorted_mx_scales_compare_only_the_bytes_the_quant_kernels_write():
 
     inter = torch.zeros(12, 16, dtype=torch.bfloat16)
     raw = torch.randint(0, 256, (32, 8), dtype=torch.uint8)
-    slots = [(k << 24) | t for t in range(4) for k in range(2)]
-    sorted_ids = torch.tensor(slots + [4] * 4, dtype=torch.int32)
-    # model_dim 64: 2 groups of 32, padded to 8 columns.
-    defined = set(_sorted_scale_defined(sorted_ids, 4, 2, 8).tolist())
+    # model_dim 64: 2 groups of 32, padded to 8 columns; the 8 routed rows.
+    defined = set(_sorted_scale_defined(torch.arange(8), 2, 8).tolist())
     unwritten = next(i for i in range(raw.numel()) if i not in defined)
     written = min(defined)
 
@@ -250,6 +418,41 @@ def test_sorted_mx_scales_compare_only_the_bytes_the_quant_kernels_write():
     assert not _compare_sorted(legacy, _sorted_launches(inter, flipped(unwritten)))
     problems = _compare_sorted(legacy, _sorted_launches(inter, flipped(written)))
     assert list(problems) == [("stage1", "a1_scale")], problems
+
+
+def test_native_a4w4_scale_layout_has_16_row_chunks_and_duplicated_bytes():
+    import torch
+    from moe_dispatch.differential import _sorted_scale_defined
+
+    # Sorted row 17, scale column 5, 16 padded columns: chunk 1 (128 dwords each),
+    # lane 1, column group (ku 0, wave group 1) at dword 1 * 128 + 1 * 16 + 1, its
+    # 16-bit half 1 (bytes 2 and 3). The generic layout: chunk 0, row half 1, byte 71.
+    native = _sorted_scale_defined(torch.tensor([17]), 6, 16, native=True)
+    assert native[10:12].tolist() == [145 * 4 + 2, 145 * 4 + 3]
+    assert _sorted_scale_defined(torch.tensor([17]), 6, 16)[5].item() == 71
+
+
+def test_native_a4w4_stage2_scale_compares_both_bytes_in_sorted_order():
+    import torch
+
+    inter = torch.zeros(12, 16, dtype=torch.bfloat16)
+    raw = torch.randint(0, 256, (32, 8), dtype=torch.uint8)
+
+    def run(a2_scale, slots=_SLOTS):
+        stage1, (_, stage2) = _sorted_launches(
+            inter, None, slots, native_scale_layout=True
+        )
+        return [stage1, ("stage2", partial(stage2, a2_scale=a2_scale))]
+
+    # Inter dim 32: one scale column, the bytes 4 * row and 4 * row + 1 of chunk 0.
+    swapped = [_SLOTS[i] for i in [5, 1, 2, 3, 4, 0, 6, 7]]
+    moved = raw.clone().view(-1)
+    moved[[0, 1, 20, 21]] = moved[[20, 21, 0, 1]]
+    assert not _compare_sorted(run(raw), run(moved.view(32, 8), swapped))
+    second_byte = raw.clone().view(-1)
+    second_byte[1] ^= 1
+    problems = _compare_sorted(run(raw), run(second_byte.view(32, 8)))
+    assert list(problems) == [("stage2", "a2_scale")], problems
 
 
 def test_every_gpu_case_variant_is_defined():
@@ -268,6 +471,23 @@ def test_every_gpu_case_variant_is_defined():
             assert len(case) < 10 or case[9] not in gpu_differential._VARIANTS, case
             assert len(case) < 11 or isinstance(case[10], dict), case
     assert set(gpu_differential._RAISES) <= variants
+
+
+@pytest.mark.parametrize(
+    "module, known",
+    [
+        ("module_moe_ck2stages_abi2_f8_f8_preshuffle_on_b16_silu_per_1x32_mulWeightStage2", True),
+        ("module_moe_ck2stages_abi2_f8_fp4x2_preshuffle_on_b16_situv2_per_1x32_mulWeightStage2", True),
+        ("module_moe_ck2stages_f8_f8_preshuffle_on_b16_swiglu_per_1x128_mulWeightStage2", True),
+        ("module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_mulWeightStage2", False),
+        ("module_moe_ck2stages_abi2_bf16_bf16_preshuffle_off_b16_silu_no_mulWeightStage2", False),
+        ("module_moe_asm", False),
+    ],
+)  # fmt: skip
+def test_only_legacy_modules_that_never_build_may_fail_to_build(module, known):
+    from moe_dispatch import gpu_differential
+
+    assert bool(gpu_differential._KNOWN_BUILD_FAILS.match(module)) is known
 
 
 def test_perf_baseline_rejects_partial_token_results(monkeypatch):

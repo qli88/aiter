@@ -1376,6 +1376,18 @@ def compile_mixed_moe_gemm1_common(
                         return (a0, a1)
 
                 single_b_pipe = mock_gate_only or gate_up_interleave
+                # Must equal the VMEM loads interleaved_half issues after its async
+                # A copy (A and B scales, then one load per B cell): a larger count
+                # lets its barrier pass with the copy still in flight.
+                async_loads_after_copy = (
+                    sum(pp_has_scale)
+                    * k_unroll_packed
+                    * (
+                        (0 if a_scale_one else m_repeat_packed)
+                        + num_acc_n_packed * (1 if single_b_pipe else 2)
+                    )
+                    + sum(len(loads) for loads in pp_b_loads) * b_cells_per_ku
+                )
 
                 def compute_bmajor_mfma_phase(
                     all_a_tiles,
@@ -1483,14 +1495,21 @@ def compile_mixed_moe_gemm1_common(
                     rocdl.sched_barrier(0)
                     if const_expr(heterogeneous_b and use_async_copy):
                         barrier(vmcnt=0)
+                    elif const_expr(use_async_copy):
+                        # The last half's async copy into lds_read has landed once
+                        # at most the loads issued after it are outstanding; the
+                        # sched_barrier after the copy keeps them after it.
+                        barrier(vmcnt=min(async_loads_after_copy, 63), lgkmcnt=0)
                     else:
                         rocdl.s_waitcnt(body_vmcnt_before_barrier)
                         barrier()
                     rocdl.sched_barrier(0)
 
                     abs_k_dma = body_k_base_idx + next_k_dma_py
-                    if const_expr(use_async_copy and next_k_dma_py < int(k_dim)):
+                    if const_expr(use_async_copy and next_k_dma_py < int(klen)):
                         prefetch_x_to_lds(abs_k_dma, lds_write)
+                    if const_expr(use_async_copy and not heterogeneous_b):
+                        rocdl.sched_barrier(0)
                     if const_expr(not use_async_copy):
                         x_regs = load_x_tile(abs_k_dma)
 
